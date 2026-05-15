@@ -27,8 +27,6 @@ set STEALTHWIRE_HOST=0.0.0.0
 set STEALTHWIRE_PORT=%SERVER_PORT%
 set OLLAMA_URL=http://127.0.0.1:11434/api/chat
 if "%STEALTHWIRE_MODE%"=="" set STEALTHWIRE_MODE=fast
-if "%ANSWER_MODEL%"=="" set ANSWER_MODEL=qwen3.6:latest
-if "%RECOVERY_MODEL%"=="" set RECOVERY_MODEL=qwen3.6:latest
 if "%OLLAMA_NUM_CTX%"=="" set OLLAMA_NUM_CTX=4096
 if "%OLLAMA_RECOVERY_NUM_PREDICT%"=="" set OLLAMA_RECOVERY_NUM_PREDICT=320
 if "%OLLAMA_ANSWER_NUM_PREDICT%"=="" set OLLAMA_ANSWER_NUM_PREDICT=900
@@ -42,6 +40,12 @@ set https_proxy=
 set all_proxy=
 set NO_PROXY=127.0.0.1,localhost
 set no_proxy=127.0.0.1,localhost
+
+for /f "tokens=1,* delims==" %%A in ('python -c "from app.llm import MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL)"') do (
+  set "%%A=%%B"
+)
+if "%ANSWER_MODEL%"=="" set "ANSWER_MODEL=%ANSWER_MODEL_RESOLVED%"
+if "%RECOVERY_MODEL%"=="" set "RECOVERY_MODEL=%RECOVERY_MODEL_RESOLVED%"
 
 if not "%SERVER_IP%"=="" (
   set PUBLIC_IP=%SERVER_IP%
@@ -84,15 +88,11 @@ if errorlevel 1 (
   goto check_ollama
 )
 
-ollama list | findstr /i "qwen3.6" >nul
-if errorlevel 1 (
-  echo qwen3.6:latest is not installed. Pulling model...
-  ollama pull qwen3.6:latest
-  if errorlevel 1 (
-    echo Failed to pull qwen3.6:latest.
-    pause
-    exit /b 1
-  )
+call :ensure_ollama_model "%ANSWER_MODEL%"
+if errorlevel 1 exit /b 1
+if /i not "%RECOVERY_MODEL%"=="%ANSWER_MODEL%" (
+  call :ensure_ollama_model "%RECOVERY_MODEL%"
+  if errorlevel 1 exit /b 1
 )
 
 echo.
@@ -113,5 +113,20 @@ exit /b 0
 :load_config
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
   if not "%%A"=="" set "%%A=%%B"
+)
+exit /b 0
+
+:ensure_ollama_model
+set "REQUIRED_MODEL=%~1"
+if "%REQUIRED_MODEL%"=="" exit /b 0
+ollama list | findstr /i /l /c:"%REQUIRED_MODEL%" >nul
+if errorlevel 1 (
+  echo %REQUIRED_MODEL% is not installed. Pulling model...
+  ollama pull "%REQUIRED_MODEL%"
+  if errorlevel 1 (
+    echo Failed to pull %REQUIRED_MODEL%.
+    pause
+    exit /b 1
+  )
 )
 exit /b 0
