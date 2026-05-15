@@ -26,6 +26,14 @@ set OLLAMA_RECOVERY_NUM_PREDICT=180
 set OLLAMA_ANSWER_NUM_PREDICT=220
 set WHISPER_DEVICE=cuda
 set WHISPER_COMPUTE_TYPE=float16
+set HTTP_PROXY=
+set HTTPS_PROXY=
+set ALL_PROXY=
+set http_proxy=
+set https_proxy=
+set all_proxy=
+set NO_PROXY=127.0.0.1,localhost
+set no_proxy=127.0.0.1,localhost
 
 if not "%~1"=="" (
   set PUBLIC_IP=%~1
@@ -39,6 +47,8 @@ if not "%~1"=="" (
 :ip_found
 set PUBLIC_IP=%PUBLIC_IP: =%
 if "%PUBLIC_IP%"=="" set PUBLIC_IP=THIS_PC_IP
+set NO_PROXY=%NO_PROXY%,%PUBLIC_IP%
+set no_proxy=%no_proxy%,%PUBLIC_IP%
 
 echo.
 echo StealthWire API:
@@ -59,7 +69,7 @@ if errorlevel 1 (
 :check_ollama
 echo.
 echo Checking Ollama on 127.0.0.1:11434...
-curl.exe -s http://127.0.0.1:11434/api/tags >nul
+curl.exe --noproxy "*" -s http://127.0.0.1:11434/api/tags >nul
 if errorlevel 1 (
   echo Ollama is not available. Start Ollama, then this script will continue.
   timeout /t 5 /nobreak >nul

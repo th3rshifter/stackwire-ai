@@ -30,10 +30,18 @@ call venv\Scripts\activate.bat
 set STEALTHWIRE_API_URL=http://%SERVER_IP%:8000
 set STEALTHWIRE_REMOTE_STT=1
 set STT_BACKEND=whisper
+set HTTP_PROXY=
+set HTTPS_PROXY=
+set ALL_PROXY=
+set http_proxy=
+set https_proxy=
+set all_proxy=
+set NO_PROXY=%SERVER_IP%,127.0.0.1,localhost
+set no_proxy=%SERVER_IP%,127.0.0.1,localhost
 
 echo.
 echo Checking %STEALTHWIRE_API_URL%/status ...
-curl.exe -s "%STEALTHWIRE_API_URL%/status"
+curl.exe --noproxy "*" -f -sS "%STEALTHWIRE_API_URL%/status"
 if errorlevel 1 (
   echo.
   echo Cannot reach server.
