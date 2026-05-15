@@ -3,6 +3,8 @@ venv_broken_*/
 __pycache__/
 *.pyc
 .env
+*.local.env
+stealthwire.local.env
 models/
 *.md
 logs/
