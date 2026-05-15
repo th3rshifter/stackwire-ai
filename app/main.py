@@ -22,9 +22,48 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 WHISPER_INITIAL_PROMPT = (
-    "This is a Russian technical interview with mixed Russian and English IT terminology. "
+    "This is a Russian DevOps/SRE technical interview with mixed Russian and English terminology. "
+    
     "Preserve English product names, commands, file paths, acronyms, protocols, config keys, "
-    "CLI tools and technology names in English."
+    "CLI tools, cloud services and technology names in English. "
+    
+    "Linux/system: systemd, journald, Bash, permissions, users, groups, sudo, SSH, cron, "
+    "logs, processes, signals, namespaces, cgroups, /dev, /proc, /etc, /var/log. "
+    
+    "Networking: DNS, TCP, UDP, HTTP, HTTPS, TLS, mTLS, ICMP, ports, routing, NAT, "
+    "load balancing, proxy, ingress, firewall, certificates. "
+    
+    "Containers: Docker, Dockerfile, image, container, volume, network, registry, "
+    "layer cache, multi-stage build, Compose, containerd, OCI. "
+    
+    "Kubernetes: Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, "
+    "Service, Ingress, ConfigMap, Secret, Volume, PVC, PV, StorageClass, Namespace, "
+    "RBAC, ServiceAccount, probes, requests, limits, HPA, rolling update. "
+    
+    "Helm and GitOps: Helm, chart, values.yaml, templates, release, Argo CD, GitOps, "
+    "sync, drift, rollback. "
+    
+    "CI/CD: GitLab CI, GitHub Actions, Jenkins, pipeline, declarative pipeline, "
+    "scripted pipeline, runner, artifact, cache, stages, jobs, variables, environment, registry. "
+    
+    "Infrastructure as Code: Ansible, playbook, role, task, handler, template, inventory, "
+    "collection, Terraform, provider, resource, module, state, plan, apply, workspace. "
+    
+    "Observability: Prometheus, Grafana, Alertmanager, metrics, logs, traces, dashboards, "
+    "alerts, SLI, SLO, OpenTelemetry, Loki, ELK, OpenSearch, Jaeger, Tempo. "
+    
+    "Security: Vault, secrets, RBAC, least privilege, SonarQube, SAST, dependency scanning, "
+    "image scanning, SSH keys, certificates, TLS. "
+    
+    "Databases: PostgreSQL, replication, backup, restore, Patroni, Redis, MongoDB, "
+    "MariaDB, ClickHouse, migrations, Liquibase. "
+    
+    "Messaging: Kafka, topic, partition, consumer group, offset, ZooKeeper, RabbitMQ, "
+    "queue, exchange. "
+    
+    "Storage: NFS, S3, Ceph, Harbor, Nexus, Artifactory, GitLab Registry. "
+    
+    "Web servers: Nginx, HAProxy, Apache, WebLogic, upstream, reverse proxy, rate limiting."
 )
 _whisper_model: Any | None = None
 _whisper_model_lock = Lock()
@@ -34,6 +73,7 @@ _whisper_transcribe_lock = Lock()
 class Question(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
     context: list[str] = Field(default_factory=list, max_length=20)
+    trusted_text: bool = False
 
 
 class TranscribeRequest(BaseModel):
@@ -96,7 +136,7 @@ def transcribe(request: TranscribeRequest):
 @app.post("/ask")
 def ask(question: Question):
     try:
-        result = client.ask(question.text, question.context)
+        result = client.ask(question.text, question.context, trusted_text=question.trusted_text)
         payload = {
             "answer": result.answer,
             "answered": result.answered,

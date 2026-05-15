@@ -27,11 +27,11 @@ set STEALTHWIRE_HOST=0.0.0.0
 set STEALTHWIRE_PORT=%SERVER_PORT%
 set OLLAMA_URL=http://127.0.0.1:11434/api/chat
 if "%STEALTHWIRE_MODE%"=="" set STEALTHWIRE_MODE=fast
-if "%ANSWER_MODEL%"=="" set ANSWER_MODEL=qwen2.5-coder:7b
-if "%RECOVERY_MODEL%"=="" set RECOVERY_MODEL=qwen2.5-coder:7b
-if "%OLLAMA_NUM_CTX%"=="" set OLLAMA_NUM_CTX=2048
-if "%OLLAMA_RECOVERY_NUM_PREDICT%"=="" set OLLAMA_RECOVERY_NUM_PREDICT=180
-if "%OLLAMA_ANSWER_NUM_PREDICT%"=="" set OLLAMA_ANSWER_NUM_PREDICT=220
+if "%ANSWER_MODEL%"=="" set ANSWER_MODEL=qwen3.6:latest
+if "%RECOVERY_MODEL%"=="" set RECOVERY_MODEL=qwen3.6:latest
+if "%OLLAMA_NUM_CTX%"=="" set OLLAMA_NUM_CTX=4096
+if "%OLLAMA_RECOVERY_NUM_PREDICT%"=="" set OLLAMA_RECOVERY_NUM_PREDICT=320
+if "%OLLAMA_ANSWER_NUM_PREDICT%"=="" set OLLAMA_ANSWER_NUM_PREDICT=900
 if "%WHISPER_DEVICE%"=="" set WHISPER_DEVICE=cuda
 if "%WHISPER_COMPUTE_TYPE%"=="" set WHISPER_COMPUTE_TYPE=float16
 set HTTP_PROXY=
@@ -84,12 +84,12 @@ if errorlevel 1 (
   goto check_ollama
 )
 
-ollama list | findstr /i "qwen2.5-coder:7b" >nul
+ollama list | findstr /i "qwen3.6" >nul
 if errorlevel 1 (
-  echo qwen2.5-coder:7b is not installed. Pulling model...
-  ollama pull qwen2.5-coder:7b
+  echo qwen3.6:latest is not installed. Pulling model...
+  ollama pull qwen3.6:latest
   if errorlevel 1 (
-    echo Failed to pull qwen2.5-coder:7b.
+    echo Failed to pull qwen3.6:latest.
     pause
     exit /b 1
   )
