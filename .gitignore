@@ -1,0 +1,9 @@
+venv/
+venv_broken_*/
+__pycache__/
+*.pyc
+.env
+models/
+*.md
+logs/
+tests/
