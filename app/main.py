@@ -5,6 +5,7 @@ import time
 from threading import Lock
 from typing import Any
 
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from requests import RequestException
@@ -96,7 +97,7 @@ def transcribe(request: TranscribeRequest):
 def ask(question: Question):
     try:
         result = client.ask(question.text, question.context)
-        return {
+        payload = {
             "answer": result.answer,
             "answered": result.answered,
             "raw_text": result.raw_text,
@@ -116,12 +117,16 @@ def ask(question: Question):
             "answer_latency": result.answer_latency,
             "total_latency": result.total_latency,
         }
+        return JSONResponse(
+            content=payload,
+            media_type="application/json; charset=utf-8",
+        )
     except RequestException as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Ollama request failed: {exc}",
         ) from exc
-
+        
 
 @app.get("/status")
 def status():
