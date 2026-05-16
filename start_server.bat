@@ -12,16 +12,30 @@ if exist "%CONFIG_FILE%" (
 if not "%~1"=="" set SERVER_IP=%~1
 if not "%~2"=="" set SERVER_PORT=%~2
 
-if not exist "venv\Scripts\activate.bat" (
-  echo venv not found. Create it first:
-  echo python -m venv venv
-  echo venv\Scripts\activate.bat
-  echo python -m pip install -r requirements.txt
+call :ensure_venv
+if errorlevel 1 exit /b 1
+
+call venv\Scripts\activate.bat
+
+echo.
+echo Checking Python dependencies...
+python -m pip install --disable-pip-version-check -r requirements.txt
+if errorlevel 1 (
+  echo Failed to install Python dependencies from requirements.txt.
   pause
   exit /b 1
 )
 
-call venv\Scripts\activate.bat
+python -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy" >nul
+if errorlevel 1 (
+  echo Dependency import check failed. Reinstalling requirements...
+  python -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt
+  if errorlevel 1 (
+    echo Failed to repair Python dependencies.
+    pause
+    exit /b 1
+  )
+)
 
 set STEALTHWIRE_HOST=0.0.0.0
 set STEALTHWIRE_PORT=%SERVER_PORT%
@@ -41,11 +55,12 @@ set all_proxy=
 set NO_PROXY=127.0.0.1,localhost
 set no_proxy=127.0.0.1,localhost
 
-for /f "tokens=1,* delims==" %%A in ('python -c "from app.llm import MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL)"') do (
+for /f "tokens=1,* delims==" %%A in ('python -c "from app.llm import MODEL, VISION_MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL); print('VISION_MODEL_RESOLVED=' + VISION_MODEL)"') do (
   set "%%A=%%B"
 )
 if "%ANSWER_MODEL%"=="" set "ANSWER_MODEL=%ANSWER_MODEL_RESOLVED%"
 if "%RECOVERY_MODEL%"=="" set "RECOVERY_MODEL=%RECOVERY_MODEL_RESOLVED%"
+if "%VISION_MODEL%"=="" set "VISION_MODEL=%VISION_MODEL_RESOLVED%"
 
 if not "%SERVER_IP%"=="" (
   set PUBLIC_IP=%SERVER_IP%
@@ -94,6 +109,11 @@ if /i not "%RECOVERY_MODEL%"=="%ANSWER_MODEL%" (
   call :ensure_ollama_model "%RECOVERY_MODEL%"
   if errorlevel 1 exit /b 1
 )
+if /i "%VISION_MODEL%"=="%ANSWER_MODEL%" goto vision_model_ready
+if /i "%VISION_MODEL%"=="%RECOVERY_MODEL%" goto vision_model_ready
+call :ensure_ollama_model "%VISION_MODEL%"
+if errorlevel 1 exit /b 1
+:vision_model_ready
 
 echo.
 echo Start laptop with:
@@ -113,6 +133,30 @@ exit /b 0
 :load_config
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
   if not "%%A"=="" set "%%A=%%B"
+)
+exit /b 0
+
+:ensure_venv
+set "PYTHON_LAUNCHER=python"
+where python >nul 2>&1
+if errorlevel 1 (
+  where py >nul 2>&1
+  if errorlevel 1 (
+    echo Python was not found. Install Python 3.11+ and run this script again.
+    pause
+    exit /b 1
+  )
+  set "PYTHON_LAUNCHER=py -3"
+)
+
+if not exist "venv\Scripts\python.exe" (
+  echo Creating virtual environment in %CD%\venv ...
+  %PYTHON_LAUNCHER% -m venv venv
+  if errorlevel 1 (
+    echo Failed to create virtual environment.
+    pause
+    exit /b 1
+  )
 )
 exit /b 0
 

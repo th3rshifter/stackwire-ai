@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from requests import RequestException
 
-from app.llm import MODEL, OLLAMA_URL, OllamaClient
+from app.llm import MODEL, OLLAMA_URL, VISION_MODEL, OllamaClient
 from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL
 from app.question_recovery import STEALTHWIRE_MODE
 
@@ -72,13 +72,18 @@ _whisper_transcribe_lock = Lock()
 
 class Question(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
-    context: list[str] = Field(default_factory=list, max_length=20)
+    context: list[str] = Field(default_factory=list, max_length=30)
     trusted_text: bool = False
 
 
 class TranscribeRequest(BaseModel):
     audio_b64: str = Field(..., min_length=1, max_length=20_000_000)
     sample_rate: int = Field(default=16000, ge=8000, le=48000)
+
+
+class ImageAnalysisRequest(BaseModel):
+    image_b64: str = Field(..., min_length=1, max_length=20_000_000)
+    prompt: str = Field(default="", max_length=3000)
 
 
 def _get_whisper_model() -> Any:
@@ -166,6 +171,25 @@ def ask(question: Question):
             status_code=502,
             detail=f"Ollama request failed: {exc}",
         ) from exc
+
+
+@app.post("/analyze-image")
+def analyze_image(request: ImageAnalysisRequest):
+    try:
+        started = time.perf_counter()
+        answer = client.analyze_image(request.image_b64, request.prompt)
+        return JSONResponse(
+            content={
+                "answer": answer,
+                "latency": time.perf_counter() - started,
+            },
+            media_type="application/json; charset=utf-8",
+        )
+    except RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama vision request failed: {exc}",
+        ) from exc
         
 
 @app.get("/status")
@@ -173,6 +197,7 @@ def status():
     return {
         "status": "working",
         "answer_model": MODEL,
+        "vision_model": VISION_MODEL,
         "recovery_model": RECOVERY_MODEL,
         "mode": STEALTHWIRE_MODE,
         "confidence_threshold": CONFIDENCE_THRESHOLD,

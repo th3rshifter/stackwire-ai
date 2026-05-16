@@ -5,7 +5,7 @@
 IP сервера берется из `stealthwire.local.env`:
 
 ```env
-SERVER_IP=192.168.0.117
+SERVER_IP=[IP]
 SERVER_PORT=8000
 ```
 
