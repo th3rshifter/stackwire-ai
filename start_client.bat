@@ -36,7 +36,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -c "import requests, PySide6, sounddevice, soundcard, numpy" >nul
+python -c "import requests, PySide6, sounddevice, soundcard, numpy, rapidfuzz, rich" >nul
 if errorlevel 1 (
   echo Dependency import check failed. Reinstalling requirements...
   python -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt

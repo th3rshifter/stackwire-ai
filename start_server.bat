@@ -26,7 +26,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy" >nul
+python -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy, rapidfuzz, rich" >nul
 if errorlevel 1 (
   echo Dependency import check failed. Reinstalling requirements...
   python -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt
@@ -41,6 +41,7 @@ set STEALTHWIRE_HOST=0.0.0.0
 set STEALTHWIRE_PORT=%SERVER_PORT%
 set OLLAMA_URL=http://127.0.0.1:11434/api/chat
 if "%STEALTHWIRE_MODE%"=="" set STEALTHWIRE_MODE=fast
+if "%ANSWER_MODE%"=="" set ANSWER_MODE=normal
 if "%OLLAMA_NUM_CTX%"=="" set OLLAMA_NUM_CTX=4096
 if "%OLLAMA_RECOVERY_NUM_PREDICT%"=="" set OLLAMA_RECOVERY_NUM_PREDICT=320
 if "%OLLAMA_ANSWER_NUM_PREDICT%"=="" set OLLAMA_ANSWER_NUM_PREDICT=900

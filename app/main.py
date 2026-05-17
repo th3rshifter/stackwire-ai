@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from requests import RequestException
 
-from app.llm import MODEL, OLLAMA_URL, VISION_MODEL, OllamaClient
+from app.llm import ANSWER_MODE, MODEL, OLLAMA_URL, VISION_MODEL, OllamaClient
 from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL
 from app.question_recovery import STEALTHWIRE_MODE
 
@@ -197,6 +197,7 @@ def status():
     return {
         "status": "working",
         "answer_model": MODEL,
+        "answer_mode": ANSWER_MODE,
         "vision_model": VISION_MODEL,
         "recovery_model": RECOVERY_MODEL,
         "mode": STEALTHWIRE_MODE,
