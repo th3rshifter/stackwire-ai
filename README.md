@@ -9,7 +9,7 @@ SERVER_IP=[IP]
 SERVER_PORT=8000
 ```
 <img src="[https://github.com](https://github.com/th3rshifter/stackwire-ai/blob/main/docs/images/1.png)" width="500"
-<img src="[https://github.co](https://github.com/th3rshifter/stackwire-ai/blob/main/docs/images/2.png)" width="500"
+<img src="[https://github.com](https://github.com/th3rshifter/stackwire-ai/blob/main/docs/images/2.png)" width="500"
 
 Файл добавлен в `.gitignore`, его можно держать разным на каждом компьютере.
 
