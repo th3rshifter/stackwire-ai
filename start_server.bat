@@ -4,7 +4,7 @@ setlocal
 
 cd /d "%~dp0"
 
-set CONFIG_FILE=%~dp0stealthwire.local.env
+set CONFIG_FILE=%~dp0stackwire.local.env
 set SERVER_PORT=8000
 if exist "%CONFIG_FILE%" (
   call :load_config "%CONFIG_FILE%"
@@ -37,10 +37,10 @@ if errorlevel 1 (
   )
 )
 
-set STEALTHWIRE_HOST=0.0.0.0
-set STEALTHWIRE_PORT=%SERVER_PORT%
+set STACKWIRE_HOST=0.0.0.0
+set STACKWIRE_PORT=%SERVER_PORT%
 set OLLAMA_URL=http://127.0.0.1:11434/api/chat
-if "%STEALTHWIRE_MODE%"=="" set STEALTHWIRE_MODE=fast
+if "%STACKWIRE_MODE%"=="" set STACKWIRE_MODE=fast
 if "%ANSWER_MODE%"=="" set ANSWER_MODE=normal
 if "%OLLAMA_NUM_CTX%"=="" set OLLAMA_NUM_CTX=4096
 if "%OLLAMA_RECOVERY_NUM_PREDICT%"=="" set OLLAMA_RECOVERY_NUM_PREDICT=320
@@ -79,19 +79,19 @@ set NO_PROXY=%NO_PROXY%,%PUBLIC_IP%
 set no_proxy=%no_proxy%,%PUBLIC_IP%
 
 echo.
-echo StealthWire API:
-echo   http://%PUBLIC_IP%:%STEALTHWIRE_PORT%
+echo StackWire API:
+echo   http://%PUBLIC_IP%:%STACKWIRE_PORT%
 echo.
 
 net session >nul 2>&1
 if errorlevel 1 (
   echo Firewall rule was not changed because this is not Administrator.
   echo If laptop cannot connect, run this once as Administrator:
-  echo   netsh advfirewall firewall add rule name="StealthWire API %STEALTHWIRE_PORT%" dir=in action=allow protocol=TCP localport=%STEALTHWIRE_PORT%
+  echo   netsh advfirewall firewall add rule name="StackWire API %STACKWIRE_PORT%" dir=in action=allow protocol=TCP localport=%STACKWIRE_PORT%
 ) else (
   netsh interface portproxy delete v4tov4 listenaddress=%PUBLIC_IP% listenport=8001 >nul 2>&1
-  netsh advfirewall firewall add rule name="StealthWire API %STEALTHWIRE_PORT%" dir=in action=allow protocol=TCP localport=%STEALTHWIRE_PORT% >nul 2>&1
-  echo Firewall rule for TCP %STEALTHWIRE_PORT% is ready.
+  netsh advfirewall firewall add rule name="StackWire API %STACKWIRE_PORT%" dir=in action=allow protocol=TCP localport=%STACKWIRE_PORT% >nul 2>&1
+  echo Firewall rule for TCP %STACKWIRE_PORT% is ready.
 )
 
 :check_ollama
@@ -118,7 +118,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Start laptop with:
-echo   set STEALTHWIRE_API_URL=http://%PUBLIC_IP%:%STEALTHWIRE_PORT%
+echo   set STACKWIRE_API_URL=http://%PUBLIC_IP%:%STACKWIRE_PORT%
 echo   python -m app.desktop
 echo.
 echo Starting server...

@@ -4,7 +4,7 @@ setlocal
 
 cd /d "%~dp0"
 
-set CONFIG_FILE=%~dp0stealthwire.local.env
+set CONFIG_FILE=%~dp0stackwire.local.env
 set SERVER_PORT=8000
 if exist "%CONFIG_FILE%" (
   call :load_config "%CONFIG_FILE%"
@@ -13,7 +13,7 @@ if not "%~1"=="" set SERVER_IP=%~1
 if not "%~2"=="" set SERVER_PORT=%~2
 
 if "%SERVER_IP%"=="" (
-  set /p SERVER_IP=Enter StealthWire server IP:
+  set /p SERVER_IP=Enter StackWire server IP:
 )
 
 if "%SERVER_IP%"=="" (
@@ -47,8 +47,8 @@ if errorlevel 1 (
   )
 )
 
-set STEALTHWIRE_API_URL=http://%SERVER_IP%:%SERVER_PORT%
-set STEALTHWIRE_REMOTE_STT=1
+set STACKWIRE_API_URL=http://%SERVER_IP%:%SERVER_PORT%
+set STACKWIRE_REMOTE_STT=1
 set STT_BACKEND=whisper
 set HTTP_PROXY=
 set HTTPS_PROXY=
@@ -60,8 +60,8 @@ set NO_PROXY=%SERVER_IP%,127.0.0.1,localhost
 set no_proxy=%SERVER_IP%,127.0.0.1,localhost
 
 echo.
-echo Checking %STEALTHWIRE_API_URL%/status ...
-curl.exe --noproxy "*" -f -sS "%STEALTHWIRE_API_URL%/status"
+echo Checking %STACKWIRE_API_URL%/status ...
+curl.exe --noproxy "*" -f -sS "%STACKWIRE_API_URL%/status"
 if errorlevel 1 (
   echo.
   echo Cannot reach server.
@@ -71,7 +71,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Starting desktop client connected to %STEALTHWIRE_API_URL%
+echo Starting desktop client connected to %STACKWIRE_API_URL%
 echo.
 
 python -m app.desktop

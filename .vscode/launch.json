@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Interview Assistant Desktop",
+      "name": "Desktop",
       "type": "debugpy",
       "request": "launch",
       "module": "app.desktop",
@@ -12,7 +12,7 @@
       "justMyCode": true
     },
     {
-      "name": "Interview Assistant API",
+      "name": "API",
       "type": "debugpy",
       "request": "launch",
       "module": "uvicorn",

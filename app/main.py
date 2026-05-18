@@ -10,61 +10,28 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from requests import RequestException
 
+from app.config import APP_NAME, load_local_env
+
+load_local_env()
+
 from app.llm import ANSWER_MODE, MODEL, OLLAMA_URL, VISION_MODEL, OllamaClient
 from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL
-from app.question_recovery import STEALTHWIRE_MODE
+from app.question_recovery import STACKWIRE_MODE
+from app.tech_terms import WHISPER_TECHNICAL_PROMPT
 
 
-app = FastAPI(title="Interview Assistant")
+app = FastAPI(title=APP_NAME)
 client = OllamaClient()
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
-WHISPER_INITIAL_PROMPT = (
-    "This is a Russian DevOps/SRE technical interview with mixed Russian and English terminology. "
-    
-    "Preserve English product names, commands, file paths, acronyms, protocols, config keys, "
-    "CLI tools, cloud services and technology names in English. "
-    
-    "Linux/system: systemd, journald, Bash, permissions, users, groups, sudo, SSH, cron, "
-    "logs, processes, signals, namespaces, cgroups, /dev, /proc, /etc, /var/log. "
-    
-    "Networking: DNS, TCP, UDP, HTTP, HTTPS, TLS, mTLS, ICMP, ports, routing, NAT, "
-    "load balancing, proxy, ingress, firewall, certificates. "
-    
-    "Containers: Docker, Dockerfile, image, container, volume, network, registry, "
-    "layer cache, multi-stage build, Compose, containerd, OCI. "
-    
-    "Kubernetes: Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, "
-    "Service, Ingress, ConfigMap, Secret, Volume, PVC, PV, StorageClass, Namespace, "
-    "RBAC, ServiceAccount, probes, requests, limits, HPA, rolling update. "
-    
-    "Helm and GitOps: Helm, chart, values.yaml, templates, release, Argo CD, GitOps, "
-    "sync, drift, rollback. "
-    
-    "CI/CD: GitLab CI, GitHub Actions, Jenkins, pipeline, declarative pipeline, "
-    "scripted pipeline, runner, artifact, cache, stages, jobs, variables, environment, registry. "
-    
-    "Infrastructure as Code: Ansible, playbook, role, task, handler, template, inventory, "
-    "collection, Terraform, provider, resource, module, state, plan, apply, workspace. "
-    
-    "Observability: Prometheus, Grafana, Alertmanager, metrics, logs, traces, dashboards, "
-    "alerts, SLI, SLO, OpenTelemetry, Loki, ELK, OpenSearch, Jaeger, Tempo. "
-    
-    "Security: Vault, secrets, RBAC, least privilege, SonarQube, SAST, dependency scanning, "
-    "image scanning, SSH keys, certificates, TLS. "
-    
-    "Databases: PostgreSQL, replication, backup, restore, Patroni, Redis, MongoDB, "
-    "MariaDB, ClickHouse, migrations, Liquibase. "
-    
-    "Messaging: Kafka, topic, partition, consumer group, offset, ZooKeeper, RabbitMQ, "
-    "queue, exchange. "
-    
-    "Storage: NFS, S3, Ceph, Harbor, Nexus, Artifactory, GitLab Registry. "
-    
-    "Web servers: Nginx, HAProxy, Apache, WebLogic, upstream, reverse proxy, rate limiting."
-)
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+WHISPER_BEST_OF = int(os.getenv("WHISPER_BEST_OF", "1"))
+WHISPER_VAD_MIN_SILENCE_MS = int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "300"))
+WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.65"))
+WHISPER_INITIAL_PROMPT = WHISPER_TECHNICAL_PROMPT
 _whisper_model: Any | None = None
 _whisper_model_lock = Lock()
 _whisper_transcribe_lock = Lock()
@@ -123,16 +90,16 @@ def transcribe(request: TranscribeRequest):
     with _whisper_transcribe_lock:
         segments, _info = model.transcribe(
             audio,
-            language=None,
+            language=WHISPER_LANGUAGE,
             task="transcribe",
-            beam_size=3,
-            best_of=3,
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEST_OF,
             temperature=0.0,
             condition_on_previous_text=False,
             initial_prompt=WHISPER_INITIAL_PROMPT,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450},
-            no_speech_threshold=0.65,
+            vad_parameters={"min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS},
+            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
     return {"text": text, "latency_ms": (time.perf_counter() - started) * 1000}
@@ -200,19 +167,23 @@ def status():
         "answer_mode": ANSWER_MODE,
         "vision_model": VISION_MODEL,
         "recovery_model": RECOVERY_MODEL,
-        "mode": STEALTHWIRE_MODE,
+        "mode": STACKWIRE_MODE,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "ollama_url": OLLAMA_URL,
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,
+        "whisper_language": WHISPER_LANGUAGE or "auto",
+        "whisper_beam_size": WHISPER_BEAM_SIZE,
+        "whisper_best_of": WHISPER_BEST_OF,
+        "whisper_vad_min_silence_ms": WHISPER_VAD_MIN_SILENCE_MS,
     }
 
 
 @app.get("/")
 def root():
     return {
-        "name": "Interview Assistant",
+        "name": APP_NAME,
         "ui": "Run the desktop app: python -m app.desktop",
         "docs": "/docs",
     }
@@ -223,6 +194,6 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("STEALTHWIRE_HOST", "127.0.0.1"),
-        port=int(os.getenv("STEALTHWIRE_PORT", "8000")),
+        host=os.getenv("STACKWIRE_HOST", "127.0.0.1"),
+        port=int(os.getenv("STACKWIRE_PORT", os.getenv("SERVER_PORT", "8000"))),
     )

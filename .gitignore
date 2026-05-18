@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .env
 *.local.env
-stealthwire.local.env
+stackwire.local.env
 models/
 *.md
 logs/
