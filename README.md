@@ -8,8 +8,8 @@ IP сервера берется из `stackwire.local.env`:
 SERVER_IP=[IP]
 SERVER_PORT=8000
 ```
-<img src="[https://github.com](https://github.com/th3rshifter/stackwire-ai/blob/main/docs/images/1.png)" width="500"
-<img src="[https://github.com](https://github.com/th3rshifter/stackwire-ai/blob/main/docs/images/2.png)" width="500"
+![Main](docs/images/1.png)
+![Main](docs/images/2.png)
 
 Файл добавлен в `.gitignore`, его можно держать разным на каждом компьютере.
 
