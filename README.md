@@ -1,6 +1,6 @@
 # StackWire
 
-## Локальный конфиг
+## Local config
 
 IP сервера берется из `stackwire.local.env`:
 
