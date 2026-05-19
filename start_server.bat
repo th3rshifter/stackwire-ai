@@ -64,17 +64,21 @@ if "%RECOVERY_MODEL%"=="" set "RECOVERY_MODEL=%RECOVERY_MODEL_RESOLVED%"
 if "%VISION_MODEL%"=="" set "VISION_MODEL=%VISION_MODEL_RESOLVED%"
 
 if not "%SERVER_IP%"=="" (
-  set PUBLIC_IP=%SERVER_IP%
-) else (
-  for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4"') do (
-    set PUBLIC_IP=%%A
-    goto ip_found
+  ipconfig | findstr /l /c:"%SERVER_IP%" >nul
+  if errorlevel 1 (
+    echo Config SERVER_IP=%SERVER_IP% is not assigned to this PC.
+    echo Detecting current LAN IP instead...
+    call :detect_lan_ip
+  ) else (
+    set PUBLIC_IP=%SERVER_IP%
   )
+) else (
+  call :detect_lan_ip
 )
 
-:ip_found
 set PUBLIC_IP=%PUBLIC_IP: =%
 if "%PUBLIC_IP%"=="" set PUBLIC_IP=THIS_PC_IP
+if not "%PUBLIC_IP%"=="THIS_PC_IP" call :save_server_ip
 set NO_PROXY=%NO_PROXY%,%PUBLIC_IP%
 set no_proxy=%no_proxy%,%PUBLIC_IP%
 
@@ -118,6 +122,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Start laptop with:
+echo   start_client.bat %PUBLIC_IP% %STACKWIRE_PORT%
 echo   set STACKWIRE_API_URL=http://%PUBLIC_IP%:%STACKWIRE_PORT%
 echo   python -m app.desktop
 echo.
@@ -161,6 +166,23 @@ if not exist "venv\Scripts\python.exe" (
 )
 exit /b 0
 
+
+:save_server_ip
+if not exist "%CONFIG_FILE%" exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=$env:CONFIG_FILE; $ip=$env:PUBLIC_IP; $lines=Get-Content -LiteralPath $p; if ($lines -match '^SERVER_IP=') { $lines=$lines -replace '^SERVER_IP=.*', ('SERVER_IP=' + $ip) } else { $lines=@('SERVER_IP=' + $ip)+$lines }; Set-Content -LiteralPath $p -Value $lines -Encoding ASCII"
+exit /b 0
+:detect_lan_ip
+set PUBLIC_IP=
+for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4" ^| findstr /v /c:"169.254." ^| findstr /v /c:"192.168.56."') do (
+  set PUBLIC_IP=%%A
+  goto detect_lan_ip_done
+)
+for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4"') do (
+  set PUBLIC_IP=%%A
+  goto detect_lan_ip_done
+)
+:detect_lan_ip_done
+exit /b 0
 :ensure_ollama_model
 set "REQUIRED_MODEL=%~1"
 if "%REQUIRED_MODEL%"=="" exit /b 0

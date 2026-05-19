@@ -64,8 +64,13 @@ echo Checking %STACKWIRE_API_URL%/status ...
 curl.exe --noproxy "*" -f -sS "%STACKWIRE_API_URL%/status"
 if errorlevel 1 (
   echo.
-  echo Cannot reach server.
-  echo Check server IP, Windows Firewall, and that start_server.bat is running on the main PC.
+  echo Cannot reach server at %STACKWIRE_API_URL%.
+  echo On the main PC, check that start_server.bat is still running.
+  echo If the server window says "Uvicorn running on http://0.0.0.0:%SERVER_PORT%", this is usually Windows Firewall or a wrong SERVER_IP.
+  echo Run start_server.bat on the main PC as Administrator once, or approve the firewall command shown there.
+  echo You can also test on the main PC:
+  echo   curl.exe --noproxy "*" http://127.0.0.1:%SERVER_PORT%/status
+  echo   curl.exe --noproxy "*" %STACKWIRE_API_URL%/status
   pause
   exit /b 1
 )
