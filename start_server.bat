@@ -16,20 +16,21 @@ call :ensure_venv
 if errorlevel 1 exit /b 1
 
 call venv\Scripts\activate.bat
+set "VENV_PYTHON=%~dp0venv\Scripts\python.exe"
 
 echo.
 echo Checking Python dependencies...
-python -m pip install --disable-pip-version-check -r requirements.txt
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 (
   echo Failed to install Python dependencies from requirements.txt.
   pause
   exit /b 1
 )
 
-python -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy, rapidfuzz, rich" >nul
+"%VENV_PYTHON%" -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy, rapidfuzz, rich" >nul
 if errorlevel 1 (
   echo Dependency import check failed. Reinstalling requirements...
-  python -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt
+  "%VENV_PYTHON%" -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt
   if errorlevel 1 (
     echo Failed to repair Python dependencies.
     pause
@@ -60,7 +61,7 @@ set all_proxy=
 set NO_PROXY=127.0.0.1,localhost
 set no_proxy=127.0.0.1,localhost
 
-for /f "tokens=1,* delims==" %%A in ('python -c "from app.llm import MODEL, VISION_MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL); print('VISION_MODEL_RESOLVED=' + VISION_MODEL)"') do (
+for /f "tokens=1,* delims==" %%A in ('"%VENV_PYTHON%" -c "from app.llm import MODEL, VISION_MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL); print('VISION_MODEL_RESOLVED=' + VISION_MODEL)"') do (
   set "%%A=%%B"
 )
 if "%ANSWER_MODEL%"=="" set "ANSWER_MODEL=%ANSWER_MODEL_RESOLVED%"
@@ -133,7 +134,7 @@ echo.
 echo Starting server...
 echo.
 
-python -m app.main
+"%VENV_PYTHON%" -m app.main
 
 echo.
 echo Server stopped with exit code %errorlevel%.
@@ -147,27 +148,83 @@ for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
 exit /b 0
 
 :ensure_venv
-set "PYTHON_LAUNCHER=python"
-where python >nul 2>&1
-if errorlevel 1 (
-  where py >nul 2>&1
+if exist "venv\Scripts\python.exe" (
+  "venv\Scripts\python.exe" -c "import sys" >nul 2>&1
   if errorlevel 1 (
-    echo Python was not found. Install Python 3.11+ and run this script again.
+    echo Existing virtual environment is broken: %CD%\venv
+    echo Delete the venv folder, install Python 3.11+ from python.org, then run this script again.
     pause
     exit /b 1
   )
-  set "PYTHON_LAUNCHER=py -3"
+  exit /b 0
 )
 
 if not exist "venv\Scripts\python.exe" (
+  call :find_python
+  if errorlevel 1 exit /b 1
   echo Creating virtual environment in %CD%\venv ...
-  %PYTHON_LAUNCHER% -m venv venv
+  "%PYTHON_EXE%" %PYTHON_ARGS% -m venv venv
   if errorlevel 1 (
     echo Failed to create virtual environment.
     pause
     exit /b 1
   )
 )
+exit /b 0
+
+:find_python
+set "PYTHON_EXE="
+set "PYTHON_ARGS="
+where.exe py >nul 2>&1
+if not errorlevel 1 (
+  py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+  if not errorlevel 1 (
+    set "PYTHON_EXE=py"
+    set "PYTHON_ARGS=-3"
+    exit /b 0
+  )
+)
+
+for %%P in (
+  "%LocalAppData%\Programs\Python\Python313\python.exe"
+  "%LocalAppData%\Programs\Python\Python312\python.exe"
+  "%LocalAppData%\Programs\Python\Python311\python.exe"
+  "%ProgramFiles%\Python313\python.exe"
+  "%ProgramFiles%\Python312\python.exe"
+  "%ProgramFiles%\Python311\python.exe"
+  "%ProgramFiles(x86)%\Python313\python.exe"
+  "%ProgramFiles(x86)%\Python312\python.exe"
+  "%ProgramFiles(x86)%\Python311\python.exe"
+) do (
+  if exist "%%~P" (
+    call :try_python "%%~P"
+    if not errorlevel 1 exit /b 0
+  )
+)
+
+for %%C in (python python3) do (
+  for /f "delims=" %%P in ('where.exe %%C 2^>nul') do (
+    echo %%P | findstr /i /c:"\Microsoft\WindowsApps\" >nul
+    if errorlevel 1 (
+      call :try_python "%%P"
+      if not errorlevel 1 exit /b 0
+    )
+  )
+)
+
+echo Python 3.11+ was not found outside Microsoft Store aliases.
+echo Install Python from https://www.python.org/downloads/windows/ and enable "Add python.exe to PATH".
+echo If Windows opens Microsoft Store when running python, disable:
+echo   Settings ^> Apps ^> Advanced app settings ^> App execution aliases ^> python.exe / python3.exe
+pause
+exit /b 1
+
+:try_python
+set "PYTHON_TEST=%~1"
+"%PYTHON_TEST%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+if errorlevel 1 exit /b 1
+set "PYTHON_EXE=%PYTHON_TEST%"
+set "PYTHON_ARGS="
 exit /b 0
 
 
