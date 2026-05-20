@@ -11,11 +11,12 @@ from pydantic import BaseModel, Field
 from requests import RequestException
 
 from app.config import APP_NAME, load_local_env
+from app.event_log import append_client_event
 
 load_local_env()
 
-from app.llm import ANSWER_MODE, MODEL, OLLAMA_URL, VISION_MODEL, OllamaClient
-from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL
+from app.llm import ANSWER_MODE, ANSWER_PROMPT_PROFILE, ARTIFACT_ANSWER_NUM_PREDICT, DEFAULT_ANSWER_NUM_PREDICT, MODEL, OLLAMA_KEEP_ALIVE, OLLAMA_URL, VISION_MODEL, OllamaClient
+from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL, RECOVERY_LOCAL_FAST_PATH
 from app.question_recovery import STACKWIRE_MODE
 from app.tech_terms import WHISPER_TECHNICAL_PROMPT
 
@@ -51,6 +52,12 @@ class TranscribeRequest(BaseModel):
 class ImageAnalysisRequest(BaseModel):
     image_b64: str = Field(..., min_length=1, max_length=20_000_000)
     prompt: str = Field(default="", max_length=3000)
+
+
+class ClientEventRequest(BaseModel):
+    event: str = Field(default="client_event", max_length=80)
+    client_time: str = Field(default="", max_length=80)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 def _get_whisper_model() -> Any:
@@ -157,6 +164,15 @@ def analyze_image(request: ImageAnalysisRequest):
             status_code=502,
             detail=f"Ollama vision request failed: {exc}",
         ) from exc
+
+
+@app.post("/client-event")
+def client_event(request: ClientEventRequest):
+    details = dict(request.details)
+    if request.client_time:
+        details["client_time"] = request.client_time
+    logged_at = append_client_event(request.event, details)
+    return {"ok": True, "logged_at": logged_at}
         
 
 @app.get("/status")
@@ -165,11 +181,16 @@ def status():
         "status": "working",
         "answer_model": MODEL,
         "answer_mode": ANSWER_MODE,
+        "answer_prompt_profile": ANSWER_PROMPT_PROFILE,
+        "answer_num_predict": DEFAULT_ANSWER_NUM_PREDICT,
+        "artifact_num_predict": ARTIFACT_ANSWER_NUM_PREDICT,
         "vision_model": VISION_MODEL,
         "recovery_model": RECOVERY_MODEL,
+        "recovery_local_fast_path": RECOVERY_LOCAL_FAST_PATH,
         "mode": STACKWIRE_MODE,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "ollama_url": OLLAMA_URL,
+        "ollama_keep_alive": OLLAMA_KEEP_ALIVE or "default",
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,

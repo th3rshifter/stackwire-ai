@@ -79,8 +79,20 @@ echo.
 echo Starting desktop client connected to %STACKWIRE_API_URL%
 echo.
 
-python -m app.desktop
-exit /b %errorlevel%
+set "PYTHONW_EXE=%~dp0venv\Scripts\pythonw.exe"
+set "PYTHON_EXE=%~dp0venv\Scripts\python.exe"
+
+if exist "%PYTHONW_EXE%" (
+  start "StackWire" "%PYTHONW_EXE%" -m app.desktop
+  goto launched
+)
+
+start "StackWire" "%PYTHON_EXE%" -m app.desktop
+
+:launched
+if "%STACKWIRE_KEEP_CMD%"=="1" exit /b 0
+endlocal
+exit
 
 :load_config
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (%1) do (
