@@ -27,7 +27,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-"%VENV_PYTHON%" -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, soundcard, numpy, rapidfuzz, rich" >nul
+"%VENV_PYTHON%" -c "import requests, fastapi, uvicorn, PySide6, faster_whisper, sounddevice, pyaudiowpatch, numpy, rapidfuzz, rich" >nul
 if errorlevel 1 (
   echo Dependency import check failed. Reinstalling requirements...
   "%VENV_PYTHON%" -m pip install --disable-pip-version-check --force-reinstall -r requirements.txt
