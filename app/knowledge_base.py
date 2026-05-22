@@ -63,6 +63,16 @@ DOMAIN_PROFILES: dict[str, DomainProfile] = {
             "Dockerfile instructions describe build steps; they are not shell script lines executed at container start except CMD/ENTRYPOINT.",
         ),
     ),
+    "git": DomainProfile(
+        triggers=("git", "commit", "branch", "merge", "rebase", "reflog", "stash", "checkout", "pull", "push", "remote"),
+        required_concepts=("commit/snapshot", "branch/ref", "working tree/index", "history"),
+        forbidden_concepts=("Kubernetes Ingress", "PromQL", "Docker BuildKit cache"),
+        component_model="working tree, index/staging area, local repository objects, refs/branches/tags, remotes",
+        dangerous_confusions=(
+            "Branch is a movable ref to a commit, not a copy of the repository.",
+            "Reflog is local history of ref movements and is useful for recovery after reset/rebase/checkout mistakes.",
+        ),
+    ),
     "linux_fs": DomainProfile(
         triggers=("df", "du", "inode", "lsof", "filesystem", "mount", "/var/log", "deleted file", "open file", "disk", "fsck"),
         required_concepts=("filesystem", "mount point", "open file/process", "space usage"),
@@ -186,6 +196,7 @@ INFRASTRUCTURE_DOMAINS = frozenset(
     {
         "kubernetes",
         "docker",
+        "git",
         "linux_fs",
         "linux_process",
         "linux_network",

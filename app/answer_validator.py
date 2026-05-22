@@ -51,6 +51,9 @@ def validate_answer(question: str, answer: str, plan: AnswerPlan) -> ValidationR
     if plan.intent == "troubleshoot":
         _validate_troubleshoot(a, violations)
 
+    if plan.intent == "compare" and re.search(r"(?m)^\s*[XY]\s*:", answer):
+        violations.append("compare_uses_x_y_headings")
+
     _validate_context_leak(q, a, plan, violations)
 
     if plan.intent in {"definition", "compare"} and plan.domain in INFRASTRUCTURE_DOMAINS:
