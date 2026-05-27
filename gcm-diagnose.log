@@ -1,0 +1,224 @@
+﻿Diagnose log at 2026-05-27T12:06:31Z
+
+AppPath: C:\Program Files\Git\mingw64\bin\git-credential-manager.exe
+InstallDir: C:\Program Files\Git\mingw64\bin\
+Version: 2.6.1+786ab03440ddc82e807a97c0e540f5247e44cec6
+
+------------
+Diagnostic: Environment
+Skipped: False
+Success: True
+Exception: None
+Log:
+OSType: Windows
+OSVersion: 10.0 (build 26200)
+Reading environment variables... OK
+ Variables:
+MSYSTEM_CHOST=x86_64-w64-mingw32
+EFC_8104_3789132940=1
+_=C:/Program Files/Git/mingw64/bin/git
+VBOX_MSI_INSTALL_PATH=C:\Program Files\Oracle\VirtualBox\
+ORIGINAL_TMP=C:/Users/Admin/AppData/Local/Temp
+PUBLIC=C:\Users\Public
+ALLUSERSPROFILE=C:\ProgramData
+LOGONSERVER=\\DESKTOP-PC
+INFOPATH=C:\Program Files\Git\mingw64\local\info;C:\Program Files\Git\mingw64\share\info;C:\Program Files\Git\usr\local\info;C:\Program Files\Git\usr\share\info;C:\Program Files\Git\usr\info;C:\Program Files\Git\share\info
+LOCALAPPDATA=C:\Users\Admin\AppData\Local
+ProgramData=C:\ProgramData
+PKG_CONFIG_PATH=C:\Program Files\Git\mingw64\lib\pkgconfig;C:\Program Files\Git\mingw64\share\pkgconfig
+TMPDIR=C:\Users\Admin\AppData\Local\Temp
+ORIGINAL_PATH=C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\Admin\bin;C:\Users\Admin\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\Admin\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\copilotCli;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0;C:\WINDOWS\System32\OpenSSH;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\dotnet;C:\Program Files\Git\cmd;C:\Users\Admin\AppData\Local\Microsoft\WindowsApps;C:\Users\Admin\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\Admin\AppData\Local\Programs\Ollama;C:\Users\Admin\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\scripts\noConfigScripts
+ACLOCAL_PATH=C:\Program Files\Git\mingw64\share\aclocal;C:\Program Files\Git\usr\share\aclocal
+BUNDLED_DEBUGPY_PATH=c:\Users\Admin\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\libs\debugpy
+ProgramW6432=C:\Program Files
+MINGW_PREFIX=C:/Program Files/Git/mingw64
+SYSTEMROOT=C:\WINDOWS
+MANPATH=C:\Program Files\Git\mingw64\local\man;C:\Program Files\Git\mingw64\share\man;C:\Program Files\Git\usr\local\man;C:\Program Files\Git\usr\share\man;C:\Program Files\Git\usr\man;C:\Program Files\Git\share\man
+PYTHONSTARTUP=c:\Users\Admin\AppData\Roaming\Code\User\workspaceStorage\e6504b500feeb4954b95a0ab8473b9d3\ms-python.python\pythonrc.py
+CONFIG_SITE=C:/Program Files/Git/etc/config.site
+VSCODE_GIT_ASKPASS_MAIN=c:\Users\Admin\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\493597c785d4c5cb\askpass-main.js
+SHELL=C:\Program Files\Git\usr\bin\bash.exe
+MSYSTEM=MINGW64
+OS=Windows_NT
+PROCESSOR_ARCHITECTURE=x86
+CLAUDE_CODE_SSE_PORT=35609
+MINGW_PACKAGE_PREFIX=mingw-w64-x86_64
+SHLVL=1
+PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC
+DISPLAY=needs-to-be-defined
+PYDEVD_DISABLE_FILE_VALIDATION=1
+ORIGINAL_TEMP=C:/Users/Admin/AppData/Local/Temp
+CommonProgramW6432=C:\Program Files\Common Files
+ProgramFiles(x86)=C:\Program Files (x86)
+VSCODE_GIT_ASKPASS_EXTRA_ARGS=
+COMSPEC=C:\WINDOWS\system32\cmd.exe
+MSYSTEM_CARCH=x86_64
+USERNAME=Alexander
+EFC_8104_2283032206=1
+3DVPATH=C:\AMD\Chipset_Software\Binaries\3D_V-Cache_Performance_Optimizer_Driver\
+GIT_ASKPASS=c:\Users\Admin\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\493597c785d4c5cb\askpass.sh
+PYTHON_BASIC_REPL=1
+MINGW_CHOST=x86_64-w64-mingw32
+TERM=xterm-256color
+LANG=en_US.UTF-8
+PATH=C:/Program Files/Git/mingw64/libexec/git-core;C:\Users\Admin\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\local\bin;C:\Program Files\Git\usr\bin;C:\Program Files\Git\usr\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\Admin\bin;C:\Users\Admin\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\Admin\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\copilotCli;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0;C:\WINDOWS\System32\OpenSSH;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\dotnet;C:\Program Files\Git\cmd;C:\Users\Admin\AppData\Local\Microsoft\WindowsApps;C:\Users\Admin\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\Admin\AppData\Local\Programs\Ollama;C:\Users\Admin\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\scripts\noConfigScripts;C:\Program Files\Git\usr\bin\vendor_perl;C:\Program Files\Git\usr\bin\core_perl
+OneDrive=C:\Users\Admin\OneDrive
+PSModulePath=C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules
+PROCESSOR_REVISION=4400
+AMDRMSDKPATH=C:\Program Files\AMD\RyzenMasterSDK\
+PWD=D:/development/stackwire-ai
+APPDATA=C:\Users\Admin\AppData\Roaming
+COMPUTERNAME=DESKTOP-PC
+DriverData=C:\Windows\System32\Drivers\DriverData
+VSCODE_DEBUGPY_ADAPTER_ENDPOINTS=c:\Users\Admin\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\.noConfigDebugAdapterEndpoints\endpoint-555fca4f0d943fd3.txt
+WINDIR=C:\WINDOWS
+PLINK_PROTOCOL=ssh
+PROCESSOR_LEVEL=26
+GIT_EXEC_PATH=C:/Program Files/Git/mingw64/libexec/git-core
+EXEPATH=C:\Program Files\Git\bin
+HOMEDRIVE=C:
+PKG_CONFIG_SYSTEM_INCLUDE_PATH=C:/Program Files/Git/mingw64/include
+OneDriveConsumer=C:\Users\Admin\OneDrive
+PKG_CONFIG_SYSTEM_LIBRARY_PATH=C:/Program Files/Git/mingw64/lib
+PROGRAMFILES=C:\Program Files (x86)
+SSH_ASKPASS=C:/Program Files/Git/mingw64/bin/git-askpass.exe
+USERPROFILE=C:\Users\Admin
+GIT_TRACE2_PARENT_SID=aafab92c-6717-4e7d-9704-c42fa4f845b4
+PROCESSOR_IDENTIFIER=AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD
+CommonProgramFiles(x86)=C:\Program Files (x86)\Common Files
+SESSIONNAME=Console
+TMP=C:\Users\Admin\AppData\Local\Temp
+TERM_PROGRAM_VERSION=1.121.0
+HOSTNAME=DESKTOP-PC
+TERM_PROGRAM=vscode
+USERDOMAIN=DESKTOP-PC
+NUMBER_OF_PROCESSORS=16
+EFC_8104_1262719628=1
+PS1=\[]633;A\]\[\033]0;$TITLEPREFIX:$PWD\007\]\n\[\033[32m\]\u@\h \[\033[35m\]$MSYSTEM \[\033[33m\]\w\[\033[36m\]`__git_ps1`\[\033[0m\]\n$ \[]633;B\]
+CHROME_CRASHPAD_PIPE_NAME=\\.\pipe\crashpad_1864_EUUSGNAMUPOBHYDV
+SYSTEMDRIVE=C:
+VSCODE_GIT_ASKPASS_NODE=C:\Users\Admin\AppData\Local\Programs\Microsoft VS Code\Code.exe
+USERDOMAIN_ROAMINGPROFILE=DESKTOP-PC
+COMMONPROGRAMFILES=C:\Program Files (x86)\Common Files
+EFC_8104_2775293581=1
+VSCODE_GIT_IPC_HANDLE=\\.\pipe\vscode-git-e98328584b-sock
+VSCODE_PYTHON_AUTOACTIVATE_GUARD=1
+HOMEPATH=\Users\Admin
+COLORTERM=truecolor
+HOME=C:\Users\Admin
+MSYSTEM_PREFIX=C:/Program Files/Git/mingw64
+PROCESSOR_ARCHITEW6432=AMD64
+TEMP=C:\Users\Admin\AppData\Local\Temp
+EFC_8104_1592913036=1
+
+
+------------
+Diagnostic: File system
+Skipped: False
+Success: True
+Exception: None
+Log:
+Temporary directory is 'C:\Users\Admin\AppData\Local\Temp\'...
+Checking basic file I/O...
+Writing to temporary file 'C:\Users\Admin\AppData\Local\Temp\e61d45208487be2869e253b8'... OK
+Reading from temporary file 'C:\Users\Admin\AppData\Local\Temp\e61d45208487be2869e253b8'... OK
+Deleting temporary file 'C:\Users\Admin\AppData\Local\Temp\e61d45208487be2869e253b8'... OK
+Testing IFileSystem instance...
+UserHomePath: C:\Users\Admin
+UserDataDirectoryPath: C:\Users\Admin\.gcm
+GetCurrentDirectory(): D:\development\stackwire-ai
+
+------------
+Diagnostic: Networking
+Skipped: False
+Success: True
+Exception: None
+Log:
+Checking networking and HTTP stack...
+Creating HTTP client... OK
+IsNetworkAvailable: True
+Sending HEAD request to http://example.com...Sending HEAD request to https://example.com... OK
+ OK
+Acquiring free TCP port... OK
+Testing local HTTP loopback connections...
+Creating new HTTP listener for http://localhost:50007/... OK
+Waiting for loopback connection... OK
+Writing response... OK
+Waiting for response data... OK
+Loopback connection data OK
+
+------------
+Diagnostic: Git
+Skipped: False
+Success: True
+Exception: None
+Log:
+Getting Git version... OK
+Git version is '2.52.0.windows.1'
+Locating current repository...Git repository at 'D:/development/stackwire-ai/.git'
+ OK
+Listing all Git configuration... OK
+Git configuration:
+file:C:/Program Files/Git/etc/gitconfig	diff.astextplain.textconv=astextplain
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.clean=git-lfs clean -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.smudge=git-lfs smudge -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.process=git-lfs filter-process
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.required=true
+file:C:/Program Files/Git/etc/gitconfig	http.sslbackend=schannel
+file:C:/Program Files/Git/etc/gitconfig	core.autocrlf=true
+file:C:/Program Files/Git/etc/gitconfig	core.fscache=true
+file:C:/Program Files/Git/etc/gitconfig	core.symlinks=false
+file:C:/Program Files/Git/etc/gitconfig	pull.rebase=false
+file:C:/Program Files/Git/etc/gitconfig	credential.helper=manager
+file:C:/Program Files/Git/etc/gitconfig	credential.https://dev.azure.com.usehttppath=true
+file:C:/Program Files/Git/etc/gitconfig	init.defaultbranch=master
+file:C:/Users/Admin/.gitconfig	user.name=th3rshifter
+file:C:/Users/Admin/.gitconfig	user.email=th3rshifter@gmail.com
+file:.git/config	core.repositoryformatversion=0
+file:.git/config	core.filemode=false
+file:.git/config	core.bare=false
+file:.git/config	core.logallrefupdates=true
+file:.git/config	core.symlinks=false
+file:.git/config	core.ignorecase=true
+file:.git/config	branch.main.vscode-merge-base=origin/main
+file:.git/config	branch.main.remote=origin
+file:.git/config	branch.main.merge=refs/heads/main
+file:.git/config	remote.origin.url=https://github.com/th3rshifter/stackwire-ai
+file:.git/config	remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+
+
+------------
+Diagnostic: Credential storage
+Skipped: False
+Success: True
+Exception: None
+Log:
+ICredentialStore instance is of type: CredentialStore
+Writing test credential... OK
+Reading test credential... OK
+Deleting test credential... OK
+
+------------
+Diagnostic: Microsoft authentication (AAD/MSA)
+Skipped: False
+Success: True
+Exception: None
+Log:
+Broker is not enabled.
+Flow type is: Auto
+Gathering MSAL token cache data... OK
+CacheDirectory: C:\Users\Admin\AppData\Local\.IdentityService
+CacheFileName: msal.cache
+CacheFilePath: C:\Users\Admin\AppData\Local\.IdentityService\msal.cache
+Creating cache helper... OK
+Verifying MSAL token cache persistence... OK
+
+------------
+Diagnostic: GitHub API
+Skipped: False
+Success: True
+Exception: None
+Log:
+Using 'https://github.com/' as API target.
+Querying '/meta' endpoint... OK
+
