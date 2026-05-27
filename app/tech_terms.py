@@ -1,0 +1,224 @@
+import re
+
+
+STACK_TERMINOLOGY_PROMPT = (
+    "Linux/system: systemd, systemctl, journald, journalctl, Bash, permissions, users, groups, "
+    "sudo, SSH, cron, logs, processes, signals, namespaces, cgroups, /dev, /proc, /etc, /var/log. "
+    "Networking: DNS, TCP, UDP, HTTP, HTTPS, TLS, mTLS, ICMP, ports, routing, NAT, load balancing, "
+    "proxy, ingress, firewall, certificates. "
+    "Containers: Docker, Dockerfile, image, container, volume, network, registry, layer cache, "
+    "multi-stage build, Compose, containerd, OCI. "
+    "Kubernetes: Kubernetes, kubectl, kubeadm, kubelet, kube-proxy, Pod, Deployment, ReplicaSet, "
+    "StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, ConfigMap, Secret, Volume, PVC, PV, "
+    "StorageClass, Namespace, RBAC, ServiceAccount, readinessProbe, livenessProbe, startupProbe, "
+    "requests, limits, HPA, rolling update. "
+    "Helm and GitOps: Helm, chart, values.yaml, templates, release, Argo CD, GitOps, sync, drift, rollback. "
+    "CI/CD: CI/CD, GitLab CI, GitHub Actions, Jenkins, Jenkins Pipeline, declarative pipeline, "
+    "scripted pipeline, runner, artifact, cache, stages, jobs, variables, environment, registry. "
+    "Infrastructure as Code: Ansible, playbook, role, task, handler, template, inventory, collection, "
+    "Terraform, provider, resource, module, state, plan, apply, workspace. "
+    "Observability: Prometheus, Grafana, Alertmanager, metrics, logs, traces, dashboards, alerts, "
+    "SLI, SLO, OpenTelemetry, Loki, ELK, OpenSearch, Jaeger, Tempo. "
+    "Security: Vault, secrets, RBAC, least privilege, SonarQube, SAST, dependency scanning, image scanning, "
+    "SSH keys, certificates, TLS. "
+    "Databases: PostgreSQL, replication, backup, restore, Patroni, Redis, MongoDB, MariaDB, ClickHouse, "
+    "migrations, Liquibase. "
+    "Messaging: Kafka, topic, partition, consumer group, offset, ZooKeeper, RabbitMQ, queue, exchange. "
+    "Storage: NFS, S3, Ceph, Harbor, Nexus, Artifactory, GitLab Registry. "
+    "Web servers: Nginx, HAProxy, Apache, WebLogic, upstream, reverse proxy, rate limiting."
+)
+
+
+WHISPER_TECHNICAL_PROMPT = (
+    "This is Russian DevOps/SRE technical content with mixed Russian and English terminology. "
+    "Preserve English product names, commands, file paths, acronyms, protocols, config keys, "
+    "CLI tools, cloud services and technology names in English. "
+    "When an English technical term is pronounced inside Russian speech, output the canonical spelling, "
+    "not a Cyrillic phonetic spelling. Examples: systemd, systemctl, journalctl, kubectl, kubeadm, "
+    "CI/CD, Argo CD, GitLab CI, DNS, TCP, UDP, TLS, mTLS, SSH, NFS, S3, PVC, PV, RBAC, HPA. "
+    f"{STACK_TERMINOLOGY_PROMPT}"
+)
+
+
+SPOKEN_TECHNICAL_NORMALIZATIONS: tuple[tuple[str, str], ...] = (
+    (r"\bти\s*си\s*пи\b", "TCP"),
+    (r"\bтиси\s+пи\b", "TCP"),
+    (r"\bтэ\s*цэ\s*пэ\b", "TCP"),
+    (r"\bю\s*ди\s*пи\b", "UDP"),
+    (r"\bюди\s+пи\b", "UDP"),
+    (r"\bаш\s*ти\s*ти\s*пи\s*эс\b", "HTTPS"),
+    (r"\bэйч\s*ти\s*ти\s*пи\s*эс\b", "HTTPS"),
+    (r"\bаш\s*ти\s*ти\s*пи\b", "HTTP"),
+    (r"\bэйч\s*ти\s*ти\s*пи\b", "HTTP"),
+    (r"\bси\s*ай\s*/?\s*си\s*ди\b", "CI/CD"),
+    (r"\bарго\s*си\s*ди\b", "Argo CD"),
+    (r"\bгит\s*лаб\s*си\s*ай\b", "GitLab CI"),
+    (r"\bгит\s*хаб\s*экшен[сз]?\b", "GitHub Actions"),
+    (r"\bкуб\s*си\s*ти\s*эл\b", "kubectl"),
+    (r"\bкубе\s*си\s*ти\s*эл\b", "kubectl"),
+    (r"\bкуб\s*контрол\b", "kubectl"),
+    (r"\bкуб\s*адм\b", "kubeadm"),
+    (r"\bхелм\b", "Helm"),
+    (r"\bчарт[ауы]?\b", "chart"),
+    (r"\bвейлюс\b", "values.yaml"),
+    (r"\bвальюс\b", "values.yaml"),
+    (r"\bреплика\s*сет\b", "ReplicaSet"),
+    (r"\bстейтфул\s*сет\b", "StatefulSet"),
+    (r"\bдемон\s*сет\b", "DaemonSet"),
+    (r"\bконфиг\s*мап\b", "ConfigMap"),
+    (r"\bсекрет[аы]?\b", "Secret"),
+    (r"\bнейм\s*спейс\b", "Namespace"),
+    (r"\bнеймспейс\b", "Namespace"),
+    (r"\bсервис\s*аккаунт\b", "ServiceAccount"),
+    (r"\bкубернетис\b", "Kubernetes"),
+    (r"\bкубернетес\b", "Kubernetes"),
+    (r"\bгубернетес\b", "Kubernetes"),
+    (r"\bгубернии\s*т[её]с\b", "Kubernetes"),
+    (r"\bдипло\s*и\s*менты\b", "Deployment"),
+    (r"\bдиплой\s*мент[ауы]?\b", "Deployment"),
+    (r"\bдеплой\s*мент[ауы]?\b", "Deployment"),
+    (r"\bманифест[аы]?\b", "manifest"),
+    (r"\bодин\s+грея\s+с\b", "Ingress"),
+    (r"\bин\s+грея\s+с\b", "Ingress"),
+    (r"\bингрея\s+с\b", "Ingress"),
+    (r"\bсервис\s*меш\b", "service mesh"),
+    (r"\bэнвой\b", "Envoy"),
+    (r"\bджорнал\s*си\s*ти\s*эл\b", "journalctl"),
+    (r"\bжурнал\s*си\s*ти\s*эл\b", "journalctl"),
+    (r"\bсистем\s*си\s*ти\s*эл\b", "systemctl"),
+    (r"\bди\s*эф\b", "df"),
+    (r"\bди\s*ю\b", "du"),
+    (r"\bэл\s*эс\s*оф\b", "lsof"),
+    (r"\bо\s*о\s*эм\s*килд\b", "OOMKilled"),
+    (r"\bкраш\s*луп\s*бек\s*оф[ф]?\b", "CrashLoopBackOff"),
+    (r"\bлоад\s*эвередж\b", "load average"),
+    (r"\bтерра\s*форм\b", "Terraform"),
+    (r"\bплей\s*бук[ауы]?\b", "playbook"),
+    (r"\bпостгрес\s*кью\s*эл\b", "PostgreSQL"),
+    (r"\bсистем\s+си\s+ти\s+эл\b", "systemctl"),
+    (r"\bсистем\s+ди\b", "systemd"),
+    (r"\bджорнал\s+си\s+ти\s+эл\b", "journalctl"),
+    (r"\bжурнал\s+си\s+ти\s+эл\b", "journalctl"),
+    (r"\bкуб\s+си\s+ти\s+эл\b", "kubectl"),
+    (r"\bкуб\s+контрол\b", "kubectl"),
+    (r"\bкуб\s+адм\b", "kubeadm"),
+    (r"\bкубе\s+адм\b", "kubeadm"),
+    (r"\bгуберн(?:ии|и|ий|ия)?\s+т[её]с\b", "Kubernetes"),
+    (r"\bгубернет(?:ес|ис|ик)\b", "Kubernetes"),
+    (r"\bкубернет(?:ес|ис|ик)\b", "Kubernetes"),
+    (r"\bкубер\b", "Kubernetes"),
+    (r"\bпадаешь\s+то\b", "Pods что"),
+    (r"\bпады\b", "Pods"),
+    (r"\bпод[ыа]?\b", "Pod"),
+    (r"\bкак\s+где\s+божиим\b", "как задеплоить"),
+    (r"\bдеплоймент[аеоы]?\b", "Deployment"),
+    (r"\bдеплойментом\b", "Deployment"),
+    (r"\bдипло\s+и\s+ментовку\s+берия\b", "Deployment в Kubernetes"),
+    (r"\bдипло\s+и\s+мент[ыа]?\b", "Deployment"),
+    (r"\bдиплой\s+мент[ыа]?\b", "Deployment"),
+    (r"\bстейтфул+\s*сет\b", "StatefulSet"),
+    (r"\bстейтфул+\s*set\b", "StatefulSet"),
+    (r"\bдеймон\s*сет\b", "DaemonSet"),
+    (r"\bсервис\s*меш\b", "service mesh"),
+    (r"\bservi(?:ce|sh|s)\s+mesh\b", "service mesh"),
+    (r"\bservish\s+mesh\b", "service mesh"),
+    (r"\bистио\b", "Istio"),
+    (r"\blinkerd\b", "Linkerd"),
+    (r"\bэнвой\b", "Envoy"),
+    (r"\bингресс\b", "Ingress"),
+    (r"\bодин\s+грея\s+с\b", "Ingress"),
+    (r"\bин\s+грея\s+с\b", "Ingress"),
+    (r"\bингрея\s+с\b", "Ingress"),
+    (r"\bгейтвей\b", "Gateway"),
+    (r"\bрединес(?:с)?\s+проб[ауы]?\b", "readinessProbe"),
+    (r"\bлайвнес(?:с)?\s+проб[ауы]?\b", "livenessProbe"),
+    (r"\bрединес(?:с)?\b", "readinessProbe"),
+    (r"\bлайвнес(?:с)?\b", "livenessProbe"),
+    (r"\bстартап\s+проб[ауы]?\b", "startupProbe"),
+    (r"\bстарт\s+ап\s+проб[ауы]?\b", "startupProbe"),
+    (r"\bдокер\s+файл\b", "Dockerfile"),
+    (r"\bдокер\s+компоуз\b", "docker-compose.yml"),
+    (r"\bдженкинс\s+пайплайн\b", "Jenkins Pipeline"),
+    (r"\bджин\s+киноха\b", "Jenkins Pipeline"),
+    (r"\bгитлаб\s+си\s+ай\b", "GitLab CI"),
+    (r"\bгитхаб\s+экшнс\b", "GitHub Actions"),
+    (r"\bарго\s+си\s+ди\b", "Argo CD"),
+    (r"\bси\s+ай\s*/\s*си\s+ди\b", "CI/CD"),
+    (r"\bси\s+ай\s+си\s+ди\b", "CI/CD"),
+    (r"\bси\s+ай\b", "CI"),
+    (r"\bси\s+ди\b", "CD"),
+    (r"\bдекларат[а-яё]*\s+пайплайн\b", "declarative pipeline"),
+    (r"\bдекорат[а-яё]*\s+подход\b", "декларативный подход"),
+    (r"\bдекоративн[а-яё]*\s+подход\b", "декларативный подход"),
+    (r"\bскриптед\s+пайплайн\b", "scripted pipeline"),
+    (r"\bраннер\b", "runner"),
+    (r"\bпайплайн[ауы]?\b", "pipeline"),
+    (r"\bпромете(?:й|ус|йс|я)\b", "Prometheus"),
+    (r"\bграфан[ауы]?\b", "Grafana"),
+    (r"\bгрофан[ауы]?\b", "Grafana"),
+    (r"\bалерт\s+менеджер\b", "Alertmanager"),
+    (r"\bопен\s+телеметр[иия]\b", "OpenTelemetry"),
+    (r"\bджаегер\b", "Jaeger"),
+    (r"\bджейгер\b", "Jaeger"),
+    (r"\bтерра\s+форм\b", "Terraform"),
+    (r"\bтерраформ\b", "Terraform"),
+    (r"\bтф\s+стейт\b", "Terraform state"),
+    (r"\bансибл\b", "Ansible"),
+    (r"\bплейбук[аи]?\b", "playbook"),
+    (r"\bпостгрес\s+кью\s+эл\b", "PostgreSQL"),
+    (r"\bпостгрес\b", "PostgreSQL"),
+    (r"\bпатрони\b", "Patroni"),
+    (r"\bклик\s+хаус\b", "ClickHouse"),
+    (r"\bликви\s+бейс\b", "Liquibase"),
+    (r"\bэнджинкс\b", "Nginx"),
+    (r"\bнжинкс\b", "Nginx"),
+    (r"\bхапрокси\b", "HAProxy"),
+    (r"\bвеб\s+лоджик\b", "WebLogic"),
+    (r"\bди\s+эн\s+эс\b", "DNS"),
+    (r"\bдиэнэс\b", "DNS"),
+    (r"\bднс\b", "DNS"),
+    (r"\bdns\b", "DNS"),
+    (r"\bти\s+си\s+пи\b", "TCP"),
+    (r"\bтс\s*пи\b", "TCP"),
+    (r"\bтсп\b", "TCP"),
+    (r"\btcp\b", "TCP"),
+    (r"\bю\s+ди\s+пи\b", "UDP"),
+    (r"\bюдипи\b", "UDP"),
+    (r"\bюдп\b", "UDP"),
+    (r"\bу\s*д\s*п\b", "UDP"),
+    (r"\budp\b", "UDP"),
+    (r"\bэм\s+ти\s+эл\s+эс\b", "mTLS"),
+    (r"\bм\s*тлс\b", "mTLS"),
+    (r"\bмтлс\b", "mTLS"),
+    (r"\bти\s+эл\s+эс\b", "TLS"),
+    (r"\bтлс\b", "TLS"),
+    (r"\bэс\s+эс\s+эйч\b", "SSH"),
+    (r"\bлинукс\b", "Linux"),
+    (r"\bд\s+стейт\b", "D state"),
+    (r"\bди\s+стейт\b", "D state"),
+    (r"\bэн\s+эф\s+эс\b", "NFS"),
+    (r"\bэс\s+три\b", "S3"),
+    (r"\bпи\s+ви\s+си\b", "PVC"),
+    (r"\bпи\s+ви\b", "PV"),
+    (r"\bэйч\s+пи\s+эй\b", "HPA"),
+    (r"\bар\s+би\s+эй\s+си\b", "RBAC"),
+    (r"\bо\s+о\s+эм\s+килд\b", "OOMKilled"),
+    (r"\bум\s+килд\b", "OOMKilled"),
+    (r"\bкраш\s+луп\s+бэк\s+офф\b", "CrashLoopBackOff"),
+    (r"\bлоад\s+эвередж\b", "load average"),
+    (r"\bpat[-\s]*ingress\b", "Pod и Ingress"),
+    (r"\bсистермарктрол\b", "systemctl"),
+    (r"\bсистемарктрол\b", "systemctl"),
+    (r"\bджернрл\s+карантейл\b", "journalctl"),
+    (r"\bгубернии\s+тоз\b", "Kubernetes"),
+    (r"\bпди[-\s]*1\s+гриэс\b", "Pods и Ingress"),
+    (r"\bmtls\b", "mTLS"),
+)
+
+
+def normalize_spoken_technical_terms(text: str) -> str:
+    normalized = text
+    for pattern, replacement in SPOKEN_TECHNICAL_NORMALIZATIONS:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+([?!,.:;])", r"\1", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
