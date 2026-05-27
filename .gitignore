@@ -31,3 +31,4 @@ tests/*
 !tests/test_expand.py
 !tests/test_knowledge_topics.py
 !tests/test_stt_eval.py
+gcm-diagnose.log
