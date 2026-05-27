@@ -13,7 +13,7 @@ if not "%~1"=="" set SERVER_IP=%~1
 if not "%~2"=="" set SERVER_PORT=%~2
 
 if "%SERVER_IP%"=="" (
-  set /p SERVER_IP=Enter StackWire server IP:
+  set /p SERVER_IP=Enter StackWire server IP address:
 )
 
 if "%SERVER_IP%"=="" (
