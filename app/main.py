@@ -22,6 +22,7 @@ from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVER
 from app.question_recovery import STACKWIRE_MODE
 from app.storage import init_db, log_feedback, save_good_answer
 from app.tech_terms import WHISPER_TECHNICAL_PROMPT
+from app.transcript_repair import clean_stt_output, is_probable_stt_hallucination
 
 
 app = FastAPI(title=APP_NAME)
@@ -31,13 +32,28 @@ init_db()
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 STT_ALLOW_CPU_WHISPER_FALLBACK = os.getenv("STT_ALLOW_CPU_WHISPER_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru").strip() or None
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_BEST_OF = int(os.getenv("WHISPER_BEST_OF", "5"))
-WHISPER_VAD_MIN_SILENCE_MS = int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "450"))
-WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.65"))
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "1").strip().lower() not in {"0", "false", "no", "off"}
+WHISPER_RETRY_WITHOUT_VAD = os.getenv("WHISPER_RETRY_WITHOUT_VAD", "1").strip().lower() in {"1", "true", "yes", "on"}
+WHISPER_VAD_THRESHOLD = float(os.getenv("WHISPER_VAD_THRESHOLD", "0.20"))
+WHISPER_VAD_MIN_SPEECH_MS = int(os.getenv("WHISPER_VAD_MIN_SPEECH_MS", "100"))
+WHISPER_VAD_MIN_SILENCE_MS = int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "650"))
+WHISPER_VAD_SPEECH_PAD_MS = int(os.getenv("WHISPER_VAD_SPEECH_PAD_MS", "450"))
+WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.60"))
+WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-1.15"))
+WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.6"))
+WHISPER_REPETITION_PENALTY = float(os.getenv("WHISPER_REPETITION_PENALTY", "1.08"))
+WHISPER_NO_REPEAT_NGRAM_SIZE = int(os.getenv("WHISPER_NO_REPEAT_NGRAM_SIZE", "3"))
+WHISPER_HALLUCINATION_SILENCE_THRESHOLD = float(os.getenv("WHISPER_HALLUCINATION_SILENCE_THRESHOLD", "1.0"))
+WHISPER_HOTWORDS = os.getenv(
+    "WHISPER_HOTWORDS",
+    "Kubernetes kubectl kubelet Deployment StatefulSet DaemonSet Pod Service Ingress ConfigMap Secret PVC "
+    "Docker Dockerfile docker-compose GitLab CI Jenkins Terraform Ansible Prometheus Grafana Linux TCP UDP DNS TLS mTLS HTTPS",
+).strip() or None
 WHISPER_INITIAL_PROMPT = WHISPER_TECHNICAL_PROMPT
 _whisper_model: Any | None = None
 _whisper_model_lock = Lock()
@@ -121,6 +137,67 @@ def _whisper_model_attempts() -> list[tuple[str, str]]:
     return [(configured_device, configured_compute or "float16")]
 
 
+def _whisper_vad_parameters() -> dict[str, int | float]:
+    return {
+        "threshold": WHISPER_VAD_THRESHOLD,
+        "min_speech_duration_ms": WHISPER_VAD_MIN_SPEECH_MS,
+        "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS,
+        "speech_pad_ms": WHISPER_VAD_SPEECH_PAD_MS,
+    }
+
+
+def _mean_segment_attr(segments: list[object], attr: str) -> float:
+    values = [float(value) for segment in segments if isinstance((value := getattr(segment, attr, None)), int | float)]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _max_segment_attr(segments: list[object], attr: str) -> float:
+    values = [float(value) for segment in segments if isinstance((value := getattr(segment, attr, None)), int | float)]
+    return max(values) if values else 0.0
+
+
+def _transcribe_with_quality(model: Any, audio: Any, *, vad_filter: bool) -> tuple[str, dict[str, float | str]]:
+    segments, info = model.transcribe(
+        audio,
+        language=WHISPER_LANGUAGE,
+        task="transcribe",
+        beam_size=WHISPER_BEAM_SIZE,
+        best_of=WHISPER_BEST_OF,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        initial_prompt=WHISPER_INITIAL_PROMPT,
+        vad_filter=vad_filter,
+        vad_parameters=_whisper_vad_parameters() if vad_filter else None,
+        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+        repetition_penalty=WHISPER_REPETITION_PENALTY,
+        no_repeat_ngram_size=WHISPER_NO_REPEAT_NGRAM_SIZE,
+        hallucination_silence_threshold=WHISPER_HALLUCINATION_SILENCE_THRESHOLD,
+        hotwords=WHISPER_HOTWORDS,
+    )
+    segment_list = list(segments)
+    text = " ".join(segment.text.strip() for segment in segment_list).strip()
+    diagnostics: dict[str, float | str] = {
+        "language": str(getattr(info, "language", WHISPER_LANGUAGE or "")),
+        "avg_logprob": _mean_segment_attr(segment_list, "avg_logprob"),
+        "no_speech_prob": _max_segment_attr(segment_list, "no_speech_prob"),
+        "compression_ratio": _max_segment_attr(segment_list, "compression_ratio"),
+        "vad": "1" if vad_filter else "0",
+    }
+    return text, diagnostics
+
+
+def _is_bad_transcript(text: str, diagnostics: dict[str, float | str], rms: float) -> bool:
+    return is_probable_stt_hallucination(
+        text,
+        avg_logprob=float(diagnostics.get("avg_logprob") or 0.0),
+        no_speech_prob=float(diagnostics.get("no_speech_prob") or 0.0),
+        compression_ratio=float(diagnostics.get("compression_ratio") or 0.0),
+        rms=rms,
+    )
+
+
 def _get_whisper_model() -> Any:
     global _whisper_model
     with _whisper_model_lock:
@@ -174,23 +251,35 @@ def transcribe(request: TranscribeRequest):
         return {"text": "", "latency_ms": 0.0}
 
     started = time.perf_counter()
+    rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
     model = _get_whisper_model()
     with _whisper_transcribe_lock:
-        segments, _info = model.transcribe(
-            audio,
-            language=WHISPER_LANGUAGE,
-            task="transcribe",
-            beam_size=WHISPER_BEAM_SIZE,
-            best_of=WHISPER_BEST_OF,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            initial_prompt=WHISPER_INITIAL_PROMPT,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS},
-            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-        )
-        text = " ".join(segment.text.strip() for segment in segments).strip()
-    return {"text": text, "latency_ms": (time.perf_counter() - started) * 1000}
+        text, diagnostics = _transcribe_with_quality(model, audio, vad_filter=WHISPER_VAD_FILTER)
+        bad_text = _is_bad_transcript(text, diagnostics, rms)
+        if WHISPER_RETRY_WITHOUT_VAD and WHISPER_VAD_FILTER and (not text.strip() or bad_text):
+            retry_text, retry_diagnostics = _transcribe_with_quality(model, audio, vad_filter=False)
+            if retry_text.strip() and not _is_bad_transcript(retry_text, retry_diagnostics, rms):
+                text = retry_text
+                diagnostics = retry_diagnostics
+                bad_text = False
+        text = clean_stt_output(text)
+        bad_text = bad_text or _is_bad_transcript(text, diagnostics, rms)
+    latency_ms = (time.perf_counter() - started) * 1000
+    LOGGER.info(
+        "remote_transcribe latency_ms=%.0f language=%s vad=%s rms=%.6f avg_logprob=%.2f no_speech=%.2f compression=%.2f bad=%s text=%r",
+        latency_ms,
+        diagnostics.get("language", ""),
+        diagnostics.get("vad", ""),
+        rms,
+        float(diagnostics.get("avg_logprob") or 0.0),
+        float(diagnostics.get("no_speech_prob") or 0.0),
+        float(diagnostics.get("compression_ratio") or 0.0),
+        bad_text,
+        text,
+    )
+    if bad_text:
+        return {"text": "", "latency_ms": latency_ms}
+    return {"text": text, "latency_ms": latency_ms}
 
 
 @app.post("/ask")
@@ -331,7 +420,13 @@ def status():
         "whisper_language": WHISPER_LANGUAGE or "auto",
         "whisper_beam_size": WHISPER_BEAM_SIZE,
         "whisper_best_of": WHISPER_BEST_OF,
+        "whisper_vad_filter": WHISPER_VAD_FILTER,
+        "whisper_retry_without_vad": WHISPER_RETRY_WITHOUT_VAD,
+        "whisper_vad_threshold": WHISPER_VAD_THRESHOLD,
         "whisper_vad_min_silence_ms": WHISPER_VAD_MIN_SILENCE_MS,
+        "whisper_no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
+        "whisper_repetition_penalty": WHISPER_REPETITION_PENALTY,
+        "whisper_no_repeat_ngram_size": WHISPER_NO_REPEAT_NGRAM_SIZE,
     }
 
 
