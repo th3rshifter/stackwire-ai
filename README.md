@@ -1,4 +1,4 @@
-# StackWire
+# StackWire v0.4
 
 Technical knowledge assistant for DevOps/SRE professionals. Combines speech-to-text, question recovery, retrieval-augmented generation (RAG), and intelligent answer generation to provide production-oriented technical responses.
 
