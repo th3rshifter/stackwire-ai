@@ -314,6 +314,22 @@ def search_good_answers(query: str, domain: str | None = None, limit: int = 3) -
     return result
 
 
+def all_good_answers(limit: int = 5000) -> list[dict[str, Any]]:
+    """Return every saved good answer (used to migrate into the vector store)."""
+    init_db()
+    with _connect() as db:
+        rows = db.execute(
+            """
+            SELECT id, question, answer, domain, intent, tags, rating
+            FROM good_answers
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max(0, limit),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_recent_questions(limit: int = 20) -> list[dict[str, Any]]:
     init_db()
     with _connect() as db:

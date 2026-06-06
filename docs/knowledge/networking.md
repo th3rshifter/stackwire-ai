@@ -8,3 +8,10 @@ TLS authenticates the server and encrypts the connection. mTLS authenticates bot
 
 ## Debug flow
 A practical network debug path is: name resolution, route, local listener, firewall/security group, upstream health, application logs. Avoid jumping directly to Kubernetes or proxy config unless the symptom points there.
+
+## Comparing requests between servers
+When the same request behaves differently on two servers, compare one controlled request end to end: method, scheme, host, path, query string, request body, headers, cookies/auth, source IP, DNS target, TLS/SNI, status code, response body and latency.
+
+Use a correlation id if the application supports it. Otherwise compare proxy access logs and application logs by timestamp, client IP and request path. Check whether both servers run the same app version, environment variables, feature flags, upstream target, routing/proxy config and firewall/security group rules.
+
+Useful commands include `curl -sv`, `dig`, `ss -lntp`, proxy access logs and application logs.

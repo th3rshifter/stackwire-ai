@@ -104,3 +104,31 @@ Fix:
     assert "```bash" in result.answer
     assert len(session.payloads) == 2
     assert "expand_troubleshoot_missing_causes_checks_fix" in session.payloads[1]["messages"][1]["content"]
+
+
+def test_expand_compare_requires_compare_sections(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("STACKWIRE_DB_PATH", str(tmp_path / "stackwire.db"))
+    bad = "Ingress и Gateway API используются для HTTP routing."
+    good = """
+Главное отличие:
+Ingress задает простой host/path routing, а Gateway API разделяет инфраструктурный Gateway и прикладные Routes.
+
+Ближайшие аналоги:
+- Ingress Controller.
+- Gateway API с HTTPRoute.
+
+Когда что использовать:
+- Ingress проще для базового HTTP routing.
+- Gateway API лучше, когда нужны роли, shared Gateway и более строгая модель маршрутов.
+
+Нюанс:
+Оба варианта все равно требуют controller, который реально программирует proxy.
+"""
+    session = _FakeSession([bad, good])
+    client = OllamaClient(session=session)
+
+    result = client.expand("сравни Ingress и Gateway API", "Ingress routes HTTP traffic.", "compare")
+
+    assert "Главное отличие" in result.answer
+    assert len(session.payloads) == 2
+    assert "expand_compare_missing_required_sections" in session.payloads[1]["messages"][1]["content"]

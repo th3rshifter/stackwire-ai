@@ -120,6 +120,40 @@ def clean_stt_output(text: str) -> str:
     return _fix_spacing(repaired).strip(" ,.;")
 
 
+def condense_spoken_question(text: str, *, max_words: int = 120) -> str:
+    cleaned = clean_stt_output(text)
+    if not cleaned:
+        return ""
+
+    chunks = _split_spoken_chunks(cleaned)
+    if not chunks:
+        return _limit_words(cleaned, max_words)
+
+    scored = [(index, _spoken_chunk_score(chunk), chunk) for index, chunk in enumerate(chunks)]
+    question_chunks = [(index, score, chunk) for index, score, chunk in scored if _looks_like_question_chunk(chunk)]
+    if question_chunks:
+        anchor_index, _score, anchor = question_chunks[-1]
+        selected = [anchor]
+        if anchor_index > 0:
+            previous = chunks[anchor_index - 1]
+            previous_has_terms = _latin_token_count(previous) > 0
+            anchor_has_terms = _latin_token_count(anchor) > 0
+            if _spoken_chunk_score(previous) >= 1.2 and (
+                len(previous.split()) <= 12
+                or (previous_has_terms and not anchor_has_terms and len(previous.split()) <= 35)
+            ):
+                selected.insert(0, previous)
+        condensed = " ".join(selected)
+    else:
+        scored.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        condensed = scored[0][2] if scored else cleaned
+
+    condensed = _trim_to_question_window(condensed)
+    condensed = collapse_repeated_phrases(condensed)
+    condensed = _limit_words(_fix_spacing(condensed).strip(" ,.;"), max_words)
+    return _capitalize_cyrillic_start(condensed)
+
+
 def is_probable_stt_hallucination(
     text: str,
     *,
@@ -205,6 +239,99 @@ def _drop_consecutive_duplicate_words(text: str) -> str:
             continue
         kept.append(word)
     return " ".join(kept)
+
+
+def _split_spoken_chunks(text: str) -> list[str]:
+    normalized = re.sub(r"[\r\n]+", ". ", text)
+    marker_pattern = (
+        r"\b(?:что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
+        r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b"
+    )
+    normalized = re.sub(
+        rf"(.{{25,}}?)\s+({marker_pattern})",
+        lambda match: f"{match.group(1).strip()}. {match.group(2)}",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    chunks = [chunk.strip(" ,.;") for chunk in re.split(r"[.?!]+", normalized) if chunk.strip(" ,.;")]
+    return chunks
+
+
+def _spoken_chunk_score(chunk: str) -> float:
+    lowered = chunk.casefold()
+    score = 0.0
+    if _looks_like_question_chunk(chunk):
+        score += 3.0
+    score += min(4.0, sum(1 for marker in QUESTION_OR_TECH_MARKERS if marker in lowered) * 0.8)
+    score += min(3.0, len(re.findall(r"\b[A-Za-z][A-Za-z0-9./+-]{1,}\b", chunk)) * 0.35)
+    if any(pattern in lowered for pattern in COMMON_WHISPER_HALLUCINATION_PATTERNS):
+        score -= 4.0
+    if len(chunk.split()) <= 3:
+        score -= 1.0
+    return score
+
+
+def _looks_like_question_chunk(chunk: str) -> bool:
+    lowered = chunk.casefold()
+    return bool(
+        re.search(
+            r"\b(что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
+            r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _trim_to_question_window(text: str) -> str:
+    matches = list(
+        re.finditer(
+            r"\b(что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
+            r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return text
+    last = matches[-1]
+    prefix = text[: last.start()].strip(" ,.;")
+    suffix = text[last.start() :].strip(" ,.;")
+    if prefix and _latin_token_count(prefix) > 0 and _question_depends_on_previous_subject(suffix):
+        return text
+    if prefix and _latin_token_count(prefix) > 0 and _latin_token_count(suffix) == 0 and len(prefix.split()) <= 35:
+        return text
+    if prefix and _spoken_chunk_score(prefix) >= 1.2 and len(prefix.split()) <= 8:
+        return text
+    return text[last.start() :].strip(" ,.;")
+
+
+def _question_depends_on_previous_subject(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^(?:как|чем|почему|зачем|когда|где|how|why|when|where)\s+"
+            r"(?:он|она|оно|они|это|эти|их|его|ее|её|it|they|these|those|that)\b",
+            text.strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _latin_token_count(text: str) -> int:
+    return len(re.findall(r"\b[A-Za-z][A-Za-z0-9./+-]*\b", text))
+
+
+def _limit_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if max_words <= 0 or len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[-max_words:]).strip(" ,.;")
+
+
+def _capitalize_cyrillic_start(text: str) -> str:
+    if text and re.match(r"[а-яё]", text[0]):
+        return text[0].upper() + text[1:]
+    return text
 
 
 def _remove_noise_phrases(text: str) -> str:

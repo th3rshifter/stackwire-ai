@@ -7,18 +7,19 @@ from threading import Lock
 from typing import Any
 
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from requests import RequestException
 
-from app.config import APP_NAME, load_local_env
+from app.config import APP_NAME, get_stt_settings, is_cuda_whisper_error, load_local_env, whisper_language, whisper_model_attempts, whisper_vad_parameters
 from app.event_log import append_client_event
 
 load_local_env()
 
+from app import auth
 from app.answer_planner import build_answer_plan
-from app.llm import ANSWER_MODE, ANSWER_PROMPT_PROFILE, ARTIFACT_ANSWER_NUM_PREDICT, DEFAULT_ANSWER_NUM_PREDICT, EXPAND_ANSWER_NUM_PREDICT, MODEL, OLLAMA_KEEP_ALIVE, OLLAMA_URL, VISION_MODEL, OllamaClient
-from app.question_recovery import CONFIDENCE_THRESHOLD, DEFAULT_MODEL as RECOVERY_MODEL, RECOVERY_LOCAL_FAST_PATH
+from app.llm import ANSWER_MODE, ANSWER_PROMPT_PROFILE, ARTIFACT_ANSWER_NUM_PREDICT, DEFAULT_ANSWER_NUM_PREDICT, EXPAND_ANSWER_NUM_PREDICT, OLLAMA_KEEP_ALIVE, OLLAMA_URL, OllamaClient, current_answer_model, current_vision_model
+from app.question_recovery import CONFIDENCE_THRESHOLD, RECOVERY_LOCAL_FAST_PATH, current_recovery_model
 from app.question_recovery import STACKWIRE_MODE
 from app.storage import init_db, log_feedback, save_good_answer
 from app.tech_terms import WHISPER_TECHNICAL_PROMPT
@@ -29,43 +30,63 @@ app = FastAPI(title=APP_NAME)
 LOGGER = logging.getLogger(__name__)
 client = OllamaClient()
 init_db()
+auth.init_auth_db()
 
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-STT_ALLOW_CPU_WHISPER_FALLBACK = os.getenv("STT_ALLOW_CPU_WHISPER_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
-WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru").strip() or None
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-WHISPER_BEST_OF = int(os.getenv("WHISPER_BEST_OF", "5"))
-WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "1").strip().lower() not in {"0", "false", "no", "off"}
-WHISPER_RETRY_WITHOUT_VAD = os.getenv("WHISPER_RETRY_WITHOUT_VAD", "1").strip().lower() in {"1", "true", "yes", "on"}
-WHISPER_VAD_THRESHOLD = float(os.getenv("WHISPER_VAD_THRESHOLD", "0.20"))
-WHISPER_VAD_MIN_SPEECH_MS = int(os.getenv("WHISPER_VAD_MIN_SPEECH_MS", "100"))
-WHISPER_VAD_MIN_SILENCE_MS = int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "650"))
-WHISPER_VAD_SPEECH_PAD_MS = int(os.getenv("WHISPER_VAD_SPEECH_PAD_MS", "450"))
-WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.60"))
-WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-1.15"))
-WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.6"))
-WHISPER_REPETITION_PENALTY = float(os.getenv("WHISPER_REPETITION_PENALTY", "1.08"))
-WHISPER_NO_REPEAT_NGRAM_SIZE = int(os.getenv("WHISPER_NO_REPEAT_NGRAM_SIZE", "3"))
-WHISPER_HALLUCINATION_SILENCE_THRESHOLD = float(os.getenv("WHISPER_HALLUCINATION_SILENCE_THRESHOLD", "1.0"))
-WHISPER_HOTWORDS = os.getenv(
-    "WHISPER_HOTWORDS",
-    "Kubernetes kubectl kubelet Deployment StatefulSet DaemonSet Pod Service Ingress ConfigMap Secret PVC "
-    "Docker Dockerfile docker-compose GitLab CI Jenkins Terraform Ansible Prometheus Grafana Linux TCP UDP DNS TLS mTLS HTTPS",
-).strip() or None
+# When enabled, /ask, /expand and /analyze-image require a valid bearer token.
+REQUIRE_AUTH = os.getenv("STACKWIRE_REQUIRE_AUTH", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_user(authorization: str | None = Header(default=None)) -> auth.AuthUser:
+    if not REQUIRE_AUTH:
+        return auth.AuthUser(id=0, username="anonymous")
+    token = ""
+    if authorization:
+        parts = authorization.split(" ", 1)
+        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else authorization.strip()
+    user = auth.verify_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    return user
+
+STT_SETTINGS = get_stt_settings()
+WHISPER_MODEL = STT_SETTINGS.model
+WHISPER_DEVICE = STT_SETTINGS.device
+WHISPER_COMPUTE_TYPE = STT_SETTINGS.compute_type
+WHISPER_VAD_FILTER = STT_SETTINGS.vad_filter
+WHISPER_RETRY_WITHOUT_VAD = STT_SETTINGS.retry_without_vad
+WHISPER_HOTWORDS = STT_SETTINGS.hotwords
 WHISPER_INITIAL_PROMPT = WHISPER_TECHNICAL_PROMPT
 _whisper_model: Any | None = None
 _whisper_model_lock = Lock()
 _whisper_transcribe_lock = Lock()
-CUDA_WHISPER_ERROR_MARKERS = (
-    "cuda",
-    "cublas",
-    "cublas64",
-    "cudnn",
-    "nvrtc",
-    "ctranslate2",
-)
+
+
+def _request_error_detail(exc: RequestException, *, prefix: str = "Ollama request failed") -> str:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    response_text = ""
+    if response is not None:
+        try:
+            response_text = str(response.text or "")
+        except Exception:
+            response_text = ""
+
+    if status_code == 403 and "requires a subscription" in response_text.lower():
+        return (
+            "Ollama cloud model access denied: this model requires an Ollama account/subscription. "
+            "Run `ollama signin`, check https://ollama.com/upgrade, or switch ANSWER_MODEL/RECOVERY_MODEL to local models. "
+            f"Details: {response_text}"
+        )
+
+    detail = response_text.strip() if response_text.strip() else str(exc)
+    if "remote end closed connection without response" in detail.lower() or "connection aborted" in detail.lower():
+        return (
+            "Local Ollama closed the chat request without a response. "
+            "The selected model may be too heavy, still loading, or the Ollama runner crashed. "
+            "Retry after the model loads, restart Ollama, or switch ANSWER_MODEL/RECOVERY_MODEL to a smaller local model. "
+            f"Details: {detail}"
+        )
+    return f"{prefix}: {detail}"
 
 
 class Question(BaseModel):
@@ -77,6 +98,7 @@ class Question(BaseModel):
 class TranscribeRequest(BaseModel):
     audio_b64: str = Field(..., min_length=1, max_length=20_000_000)
     sample_rate: int = Field(default=16000, ge=8000, le=48000)
+    language: str | None = Field(default=None, max_length=16)
 
 
 class ImageAnalysisRequest(BaseModel):
@@ -111,39 +133,21 @@ class ClientEventRequest(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class AuthRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
 def _is_cuda_whisper_error(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return any(marker in text for marker in CUDA_WHISPER_ERROR_MARKERS)
+    return is_cuda_whisper_error(exc)
 
 
 def _whisper_model_attempts() -> list[tuple[str, str]]:
-    configured_device = (WHISPER_DEVICE or "auto").strip().lower()
-    configured_compute = (WHISPER_COMPUTE_TYPE or "float16").strip().lower()
-
-    if configured_device == "auto":
-        cuda_compute = "float16" if configured_compute in {"", "auto", "int8"} else configured_compute
-        return [("cpu", "int8"), ("cuda", cuda_compute)]
-
-    if configured_device in {"cuda", "gpu"}:
-        attempts = [("cuda", configured_compute or "float16")]
-        if STT_ALLOW_CPU_WHISPER_FALLBACK:
-            attempts.append(("cpu", "int8"))
-        return attempts
-
-    if configured_device == "cpu":
-        cpu_compute = "int8" if configured_compute in {"", "auto", "float16"} else configured_compute
-        return [("cpu", cpu_compute)]
-
-    return [(configured_device, configured_compute or "float16")]
+    return whisper_model_attempts(STT_SETTINGS)
 
 
 def _whisper_vad_parameters() -> dict[str, int | float]:
-    return {
-        "threshold": WHISPER_VAD_THRESHOLD,
-        "min_speech_duration_ms": WHISPER_VAD_MIN_SPEECH_MS,
-        "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS,
-        "speech_pad_ms": WHISPER_VAD_SPEECH_PAD_MS,
-    }
+    return whisper_vad_parameters(STT_SETTINGS)
 
 
 def _mean_segment_attr(segments: list[object], attr: str) -> float:
@@ -156,30 +160,30 @@ def _max_segment_attr(segments: list[object], attr: str) -> float:
     return max(values) if values else 0.0
 
 
-def _transcribe_with_quality(model: Any, audio: Any, *, vad_filter: bool) -> tuple[str, dict[str, float | str]]:
+def _transcribe_with_quality(model: Any, audio: Any, *, vad_filter: bool, language: str | None = None) -> tuple[str, dict[str, float | str]]:
     segments, info = model.transcribe(
         audio,
-        language=WHISPER_LANGUAGE,
+        language=whisper_language(STT_SETTINGS, requested_language=language),
         task="transcribe",
-        beam_size=WHISPER_BEAM_SIZE,
-        best_of=WHISPER_BEST_OF,
+        beam_size=STT_SETTINGS.beam_size,
+        best_of=STT_SETTINGS.best_of,
         temperature=0.0,
         condition_on_previous_text=False,
         initial_prompt=WHISPER_INITIAL_PROMPT,
         vad_filter=vad_filter,
         vad_parameters=_whisper_vad_parameters() if vad_filter else None,
-        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-        repetition_penalty=WHISPER_REPETITION_PENALTY,
-        no_repeat_ngram_size=WHISPER_NO_REPEAT_NGRAM_SIZE,
-        hallucination_silence_threshold=WHISPER_HALLUCINATION_SILENCE_THRESHOLD,
+        no_speech_threshold=STT_SETTINGS.no_speech_threshold,
+        log_prob_threshold=STT_SETTINGS.log_prob_threshold,
+        compression_ratio_threshold=STT_SETTINGS.compression_ratio_threshold,
+        repetition_penalty=STT_SETTINGS.repetition_penalty,
+        no_repeat_ngram_size=STT_SETTINGS.no_repeat_ngram_size,
+        hallucination_silence_threshold=STT_SETTINGS.hallucination_silence_threshold,
         hotwords=WHISPER_HOTWORDS,
     )
     segment_list = list(segments)
     text = " ".join(segment.text.strip() for segment in segment_list).strip()
     diagnostics: dict[str, float | str] = {
-        "language": str(getattr(info, "language", WHISPER_LANGUAGE or "")),
+        "language": str(getattr(info, "language", whisper_language(STT_SETTINGS, requested_language=language) or "")),
         "avg_logprob": _mean_segment_attr(segment_list, "avg_logprob"),
         "no_speech_prob": _max_segment_attr(segment_list, "no_speech_prob"),
         "compression_ratio": _max_segment_attr(segment_list, "compression_ratio"),
@@ -196,6 +200,26 @@ def _is_bad_transcript(text: str, diagnostics: dict[str, float | str], rms: floa
         compression_ratio=float(diagnostics.get("compression_ratio") or 0.0),
         rms=rms,
     )
+
+
+def _warmup_whisper_model(model: Any, device: str) -> None:
+    if device != "cuda":
+        return
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    segments, _info = model.transcribe(
+        np.zeros(STT_SETTINGS.sample_rate, dtype=np.float32),
+        language="en",
+        task="transcribe",
+        beam_size=1,
+        best_of=1,
+        condition_on_previous_text=False,
+        vad_filter=False,
+        no_speech_threshold=0.95,
+    )
+    list(segments)
 
 
 def _get_whisper_model() -> Any:
@@ -216,11 +240,13 @@ def _get_whisper_model() -> Any:
                         device,
                         compute_type,
                     )
-                    _whisper_model = WhisperModel(
+                    candidate_model = WhisperModel(
                         WHISPER_MODEL,
                         device=device,
                         compute_type=compute_type,
                     )
+                    _warmup_whisper_model(candidate_model, device)
+                    _whisper_model = candidate_model
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
@@ -254,36 +280,92 @@ def transcribe(request: TranscribeRequest):
     rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
     model = _get_whisper_model()
     with _whisper_transcribe_lock:
-        text, diagnostics = _transcribe_with_quality(model, audio, vad_filter=WHISPER_VAD_FILTER)
+        text, diagnostics = _transcribe_with_quality(model, audio, vad_filter=WHISPER_VAD_FILTER, language=request.language)
         bad_text = _is_bad_transcript(text, diagnostics, rms)
         if WHISPER_RETRY_WITHOUT_VAD and WHISPER_VAD_FILTER and (not text.strip() or bad_text):
-            retry_text, retry_diagnostics = _transcribe_with_quality(model, audio, vad_filter=False)
+            retry_text, retry_diagnostics = _transcribe_with_quality(model, audio, vad_filter=False, language=request.language)
             if retry_text.strip() and not _is_bad_transcript(retry_text, retry_diagnostics, rms):
                 text = retry_text
                 diagnostics = retry_diagnostics
                 bad_text = False
-        text = clean_stt_output(text)
-        bad_text = bad_text or _is_bad_transcript(text, diagnostics, rms)
+        raw_text = text
+        cleaned_text = clean_stt_output(raw_text)
+        bad_text = bad_text or _is_bad_transcript(cleaned_text, diagnostics, rms)
     latency_ms = (time.perf_counter() - started) * 1000
+    stt_diagnostics = {
+        "language": diagnostics.get("language", ""),
+        "vad": diagnostics.get("vad", ""),
+        "rms": rms,
+        "avg_logprob": float(diagnostics.get("avg_logprob") or 0.0),
+        "no_speech_prob": float(diagnostics.get("no_speech_prob") or 0.0),
+        "compression_ratio": float(diagnostics.get("compression_ratio") or 0.0),
+        "bad_text": bad_text,
+    }
     LOGGER.info(
-        "remote_transcribe latency_ms=%.0f language=%s vad=%s rms=%.6f avg_logprob=%.2f no_speech=%.2f compression=%.2f bad=%s text=%r",
+        "remote_transcribe latency_ms=%.0f language=%s vad=%s rms=%.6f avg_logprob=%.2f no_speech=%.2f compression=%.2f bad=%s raw=%r cleaned=%r",
         latency_ms,
-        diagnostics.get("language", ""),
-        diagnostics.get("vad", ""),
+        stt_diagnostics["language"],
+        stt_diagnostics["vad"],
         rms,
-        float(diagnostics.get("avg_logprob") or 0.0),
-        float(diagnostics.get("no_speech_prob") or 0.0),
-        float(diagnostics.get("compression_ratio") or 0.0),
+        stt_diagnostics["avg_logprob"],
+        stt_diagnostics["no_speech_prob"],
+        stt_diagnostics["compression_ratio"],
         bad_text,
-        text,
+        raw_text,
+        cleaned_text,
     )
     if bad_text:
-        return {"text": "", "latency_ms": latency_ms}
-    return {"text": text, "latency_ms": latency_ms}
+        return {
+            "text": "",
+            "raw_text": raw_text,
+            "cleaned_text": cleaned_text,
+            "latency_ms": latency_ms,
+            "language": diagnostics.get("language", ""),
+            "diagnostics": stt_diagnostics,
+        }
+    return {
+        "text": cleaned_text,
+        "raw_text": raw_text,
+        "cleaned_text": cleaned_text,
+        "latency_ms": latency_ms,
+        "language": diagnostics.get("language", ""),
+        "diagnostics": stt_diagnostics,
+    }
+
+
+@app.post("/auth/register")
+def auth_register(request: AuthRequest):
+    try:
+        token = auth.register(request.username, request.password)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"token": token, "username": request.username.strip()}
+
+
+@app.post("/auth/login")
+def auth_login(request: AuthRequest):
+    try:
+        token = auth.login(request.username, request.password)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return {"token": token, "username": request.username.strip()}
+
+
+@app.get("/auth/me")
+def auth_me(user: auth.AuthUser = Depends(require_user)):
+    return {"username": user.username, "id": user.id}
+
+
+@app.post("/auth/logout")
+def auth_logout(authorization: str | None = Header(default=None)):
+    if authorization:
+        token = authorization.split(" ", 1)[-1].strip()
+        auth.logout(token)
+    return {"ok": True}
 
 
 @app.post("/ask")
-def ask(question: Question):
+def ask(question: Question, user: auth.AuthUser = Depends(require_user)):
     try:
         result = client.ask(question.text, question.context, trusted_text=question.trusted_text)
         payload = {
@@ -317,12 +399,12 @@ def ask(question: Question):
     except RequestException as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama request failed: {exc}",
+            detail=_request_error_detail(exc),
         ) from exc
 
 
 @app.post("/expand")
-def expand(request: ExpandRequest):
+def expand(request: ExpandRequest, user: auth.AuthUser = Depends(require_user)):
     try:
         result = client.expand(request.question, request.previous_answer, request.mode)
         return JSONResponse(
@@ -340,7 +422,7 @@ def expand(request: ExpandRequest):
     except RequestException as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama request failed: {exc}",
+            detail=_request_error_detail(exc),
         ) from exc
 
 
@@ -370,7 +452,7 @@ def good_answer(request: SaveGoodRequest):
 
 
 @app.post("/analyze-image")
-def analyze_image(request: ImageAnalysisRequest):
+def analyze_image(request: ImageAnalysisRequest, user: auth.AuthUser = Depends(require_user)):
     try:
         started = time.perf_counter()
         answer = client.analyze_image(request.image_b64, request.prompt)
@@ -384,7 +466,7 @@ def analyze_image(request: ImageAnalysisRequest):
     except RequestException as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama vision request failed: {exc}",
+            detail=_request_error_detail(exc, prefix="Ollama vision request failed"),
         ) from exc
 
 
@@ -401,14 +483,14 @@ def client_event(request: ClientEventRequest):
 def status():
     return {
         "status": "working",
-        "answer_model": MODEL,
+        "answer_model": current_answer_model(),
         "answer_mode": ANSWER_MODE,
         "answer_prompt_profile": ANSWER_PROMPT_PROFILE,
         "answer_num_predict": DEFAULT_ANSWER_NUM_PREDICT,
         "artifact_num_predict": ARTIFACT_ANSWER_NUM_PREDICT,
         "expand_num_predict": EXPAND_ANSWER_NUM_PREDICT,
-        "vision_model": VISION_MODEL,
-        "recovery_model": RECOVERY_MODEL,
+        "vision_model": current_vision_model(),
+        "recovery_model": current_recovery_model(),
         "recovery_local_fast_path": RECOVERY_LOCAL_FAST_PATH,
         "mode": STACKWIRE_MODE,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
@@ -417,16 +499,17 @@ def status():
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,
-        "whisper_language": WHISPER_LANGUAGE or "auto",
-        "whisper_beam_size": WHISPER_BEAM_SIZE,
-        "whisper_best_of": WHISPER_BEST_OF,
+        "stt_language_mode": STT_SETTINGS.language_mode,
+        "whisper_language": whisper_language(STT_SETTINGS) or "auto",
+        "whisper_beam_size": STT_SETTINGS.beam_size,
+        "whisper_best_of": STT_SETTINGS.best_of,
         "whisper_vad_filter": WHISPER_VAD_FILTER,
         "whisper_retry_without_vad": WHISPER_RETRY_WITHOUT_VAD,
-        "whisper_vad_threshold": WHISPER_VAD_THRESHOLD,
-        "whisper_vad_min_silence_ms": WHISPER_VAD_MIN_SILENCE_MS,
-        "whisper_no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
-        "whisper_repetition_penalty": WHISPER_REPETITION_PENALTY,
-        "whisper_no_repeat_ngram_size": WHISPER_NO_REPEAT_NGRAM_SIZE,
+        "whisper_vad_threshold": STT_SETTINGS.vad_threshold,
+        "whisper_vad_min_silence_ms": STT_SETTINGS.vad_min_silence_ms,
+        "whisper_no_speech_threshold": STT_SETTINGS.no_speech_threshold,
+        "whisper_repetition_penalty": STT_SETTINGS.repetition_penalty,
+        "whisper_no_repeat_ngram_size": STT_SETTINGS.no_repeat_ngram_size,
     }
 
 

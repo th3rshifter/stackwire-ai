@@ -11,6 +11,9 @@ logs/
 data/stt_eval/
 tests/
 data/*.db
+data/qdrant/
+data/embed_cache/
+data/credentials.json
 !docs/
 !docs/knowledge/
 !docs/knowledge/ansible.md
@@ -31,4 +34,5 @@ tests/*
 !tests/test_expand.py
 !tests/test_knowledge_topics.py
 !tests/test_stt_eval.py
-gcm-diagnose.log
+!tests/test_auth.py
+/gcm-diagnose.log

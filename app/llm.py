@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -14,20 +15,33 @@ from app.answer_validator import ValidationResult, validate_answer
 from app.question_recovery import CONFIDENCE_THRESHOLD, QuestionRecovery, RecoveryResult
 from app.rag import format_knowledge_chunks, retrieve_knowledge
 from app.storage import create_session, log_answer, log_question, search_good_answers
+from app.transcript_repair import condense_spoken_question
+from app.web_search import format_results_for_prompt, format_results_markdown, search_duckduckgo
+
+
+DEFAULT_STACKWIRE_MODEL = "qwen3.6:latest"
+
+
+def current_answer_model() -> str:
+    return os.getenv("ANSWER_MODEL", os.getenv("OLLAMA_ANSWER_MODEL", os.getenv("OLLAMA_MODEL", DEFAULT_STACKWIRE_MODEL))).strip() or DEFAULT_STACKWIRE_MODEL
+
+
+def current_vision_model() -> str:
+    return os.getenv("VISION_MODEL", os.getenv("OLLAMA_VISION_MODEL", DEFAULT_STACKWIRE_MODEL)).strip() or DEFAULT_STACKWIRE_MODEL
 
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
-MODEL = os.getenv("ANSWER_MODEL", os.getenv("OLLAMA_ANSWER_MODEL", os.getenv("OLLAMA_MODEL", "qwen3.6:latest")))
+MODEL = current_answer_model()
 ANSWER_MODEL = MODEL
-VISION_MODEL = os.getenv("VISION_MODEL", os.getenv("OLLAMA_VISION_MODEL", "gemma4:latest"))
+VISION_MODEL = current_vision_model()
 ANSWER_MODE = os.getenv("ANSWER_MODE", os.getenv("STACKWIRE_ANSWER_MODE", "normal")).strip().lower()
 if ANSWER_MODE not in {"normal", "deep"}:
     ANSWER_MODE = "normal"
-ANSWER_PROMPT_PROFILE = os.getenv("ANSWER_PROMPT_PROFILE", "compact").strip().lower()
+ANSWER_PROMPT_PROFILE = os.getenv("ANSWER_PROMPT_PROFILE", "balanced").strip().lower()
 DEFAULT_NUM_CTX = max(int(os.getenv("OLLAMA_NUM_CTX", "4096")), 4096)
 DEFAULT_ANSWER_NUM_PREDICT = max(
-    int(os.getenv("OLLAMA_ANSWER_NUM_PREDICT", "1200" if ANSWER_MODE == "deep" else "760")),
-    1100 if ANSWER_MODE == "deep" else 760,
+    int(os.getenv("OLLAMA_ANSWER_NUM_PREDICT", "1100" if ANSWER_MODE == "deep" else "950")),
+    1100 if ANSWER_MODE == "deep" else 900,
 )
 ARTIFACT_ANSWER_NUM_PREDICT = max(
     int(os.getenv("OLLAMA_ARTIFACT_NUM_PREDICT", os.getenv("OLLAMA_CODE_NUM_PREDICT", "1200"))),
@@ -41,21 +55,28 @@ LOGGER = logging.getLogger(__name__)
 NEED_MANUAL_FIX_MESSAGE = "Вопрос распознан ненадежно. Поправь текст вручную."
 
 ANSWER_SYSTEM_PROMPT = """
-You are a senior DevOps/SRE specialist.
-Answer in Russian, concise and production-oriented.
-Keep canonical English names for tools, protocols, API objects, commands, config keys and metrics.
+You are a knowledgeable assistant. You answer ANY question the user has: everyday life, science, history, culture, cooking, travel, health, relationships, software, programming, infrastructure, networking, security, and anything else.
+Answer in Russian, practical, clear and useful.
+
+CRITICAL: You are NOT a DevOps assistant. You are NOT an SRE assistant. You are a general-purpose assistant. Do NOT assume the user is asking about infrastructure, Kubernetes, Docker, Linux, or any technical topic unless the question clearly contains those terms. When in doubt, treat the question as general/everyday.
+
+When a question is unclear, too short, or does not make sense — respond simply and naturally, like a helpful person would. Do NOT list examples that assume a technical or DevOps context. Ask the user to clarify what they mean, without suggesting any specific domain.
+
+Keep canonical English names for tools, protocols, API objects, commands, config keys and metrics when they appear.
 Do not invent mechanisms. Do not use prior question context unless the current question explicitly asks for it.
-Assume the question may come from noisy speech recognition: ignore filler words and answer only the supported technical core.
-Style: direct, practical response. Start with a clear first sentence, then use compact bullets. Avoid long textbook introductions.
-Use Russian section labels. Use fenced Markdown with a language tag for any code, config, command or query.
+Assume the question may come from noisy speech recognition: ignore filler words and answer only the supported core.
+Answer the entire user question. If it contains multiple entities, conditions or comparisons, address all of them.
+Style: direct, natural response. Start with a clear first sentence, then give enough explanation to make the answer usable. Avoid long textbook introductions.
+Use Russian section labels when helpful. Use fenced Markdown with a language tag for any code, config, command or query.
 Do not write the language name as a separate line before code.
+When the user explicitly asks for a diagram, scheme, architecture or drawing, include a clear ASCII diagram (boxes drawn with +, -, | and arrows ->) inside a fenced code block so it is always readable. For graphs, flows or architectures you may instead emit a Mermaid diagram in a ```mermaid block or Graphviz in a ```dot block; the app renders those to an image when a renderer is installed. Do not produce diagrams unless the user asks for one.
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
-Ты анализируешь выделенную область экрана для DevOps/SRE.
+Ты анализируешь выделенную область экрана.
 
 Ответь на русском, коротко и практично:
-- что это за объект, экран, ошибка, код, конфиг или интерфейс;
+- что это за объект, экран, ошибка, код, конфиг, интерфейс или текст;
 - какие ключевые детали видны;
 - если это ошибка/лог/конфиг, что проверить дальше;
 - если текст плохо читается, явно скажи что уверенность низкая.
@@ -302,6 +323,69 @@ EXPAND_MODE_RULES: dict[str, tuple[str, ...]] = {
 }
 
 
+EXPAND_OUTPUT_SHAPES: dict[str, tuple[str, ...]] = {
+    "details": (
+        "Новый слой:",
+        "Связи и механика:",
+        "Production-нюансы:",
+        "Типичные ошибки:",
+    ),
+    "components": (
+        "Компоненты:",
+        "Control plane / data plane:",
+        "Data path / control flow:",
+        "Кто за что отвечает:",
+    ),
+    "example": (
+        "Минимальный пример:",
+        "Практические замечания:",
+    ),
+    "compare": (
+        "Главное отличие:",
+        "Ближайшие аналоги:",
+        "Когда что использовать:",
+        "Нюанс:",
+    ),
+    "troubleshoot": (
+        "Причины:",
+        "Проверки:",
+        "Fix:",
+    ),
+}
+
+
+EXPAND_MODE_INTENT: dict[str, str] = {
+    "details": "definition",
+    "components": "architecture",
+    "example": "example",
+    "compare": "compare",
+    "troubleshoot": "troubleshoot",
+}
+
+
+def _expand_output_shape(mode: str) -> str:
+    return "\n".join(f"- {heading}" for heading in EXPAND_OUTPUT_SHAPES.get(mode, EXPAND_OUTPUT_SHAPES["details"]))
+
+
+def _expand_validation_plan(plan: AnswerPlan, mode: str) -> AnswerPlan:
+    mode = mode if mode in EXPAND_MODE_RULES else "details"
+    intent = EXPAND_MODE_INTENT[mode]
+    artifact_required = mode == "example"
+    code_allowed = mode in {"example", "troubleshoot"} or plan.code_allowed
+    return AnswerPlan(
+        domain=plan.domain,
+        intent=intent,
+        artifact_required=artifact_required,
+        code_allowed=code_allowed,
+        answer_shape=" -> ".join(EXPAND_OUTPUT_SHAPES[mode]),
+        required_concepts=plan.required_concepts,
+        forbidden_concepts=plan.forbidden_concepts,
+        dangerous_confusions=plan.dangerous_confusions,
+        component_model=plan.component_model,
+        depth="deep" if mode in {"details", "components", "troubleshoot"} else plan.depth,
+    )
+
+
 def _plan_contract(plan: AnswerPlan) -> str:
     return f"""
 AnswerPlan:
@@ -327,28 +411,85 @@ Component model:
 
 
 def _format_good_answer_examples(question: str, plan: AnswerPlan, limit: int = 3) -> str:
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # Semantic recall first (saved good answers + remembered Q/A), then lexical.
     try:
-        examples = search_good_answers(question, domain=plan.domain, limit=limit)
+        from app import vectorstore
+
+        for hit in vectorstore.search_memory(question, limit=limit):
+            q = hit.question.strip() or hit.title.strip()
+            a = hit.answer.strip() or hit.text.strip()
+            if q and a and q.casefold() not in seen:
+                seen.add(q.casefold())
+                pairs.append((q, a))
     except Exception:
-        LOGGER.debug("good answer search failed", exc_info=True)
-        return ""
-    if not examples:
+        LOGGER.debug("vector good-answer search failed", exc_info=True)
+
+    if len(pairs) < limit:
+        try:
+            for example in search_good_answers(question, domain=plan.domain, limit=limit):
+                q = example.question.strip()
+                if q and q.casefold() not in seen:
+                    seen.add(q.casefold())
+                    pairs.append((q, example.answer.strip()))
+        except Exception:
+            LOGGER.debug("good answer search failed", exc_info=True)
+
+    if not pairs:
         return ""
 
     blocks: list[str] = []
-    for index, example in enumerate(examples, start=1):
-        answer = example.answer.strip()
+    for index, (q, answer) in enumerate(pairs[:limit], start=1):
         if len(answer) > 900:
             answer = answer[:900].rstrip() + "..."
         blocks.append(
             f"Example {index} (style/reference only, do not copy verbatim):\n"
-            f"Question: {example.question.strip()}\n"
+            f"Question: {q}\n"
             f"Answer:\n{answer}"
         )
     return "\n\n".join(blocks)
 
 
+def _remember_answer(question: str, answer: str, plan: AnswerPlan, *, valid: bool) -> None:
+    """Persist a good answer into the local vector store so the app 'remembers' it."""
+    if not valid:
+        return
+    if os.getenv("STACKWIRE_REMEMBER_ANSWERS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    try:
+        from app import vectorstore
+
+        vectorstore.remember(question, answer, domain=plan.domain, intent=plan.intent)
+    except Exception:
+        LOGGER.debug("vector remember skipped", exc_info=True)
+
+
 def _format_rag_context(question: str, plan: AnswerPlan) -> str:
+    # Semantic knowledge retrieval via the local vector store, when available.
+    try:
+        from app import vectorstore
+
+        hits = vectorstore.search_knowledge(question, limit=3)
+        if hits:
+            parts: list[str] = []
+            used = 0
+            for hit in hits:
+                text = hit.text.strip()
+                if not text:
+                    continue
+                block = f"[{hit.source} :: {hit.title}]\n{text}"
+                if used + len(block) > 3200:
+                    break
+                parts.append(block)
+                used += len(block)
+            if parts:
+                return "\n\n".join(parts)
+    except Exception:
+        LOGGER.debug("vector rag retrieval failed", exc_info=True)
+
+    # Fallback: lexical retrieval over the same markdown knowledge.
     try:
         chunks = retrieve_knowledge(question, plan, limit=3)
     except Exception:
@@ -421,10 +562,11 @@ Question:
 
 Contract:
 - Follow answer_shape.
+- Answer the full Question field, not only the first detected technical term.
 - Include required_concepts naturally.
 - Avoid forbidden_concepts and dangerous_confusions.
 - Explain platform objects as platform objects, not generic concepts.
-- Keep the answer concise, complete and logically finished.
+- Keep the answer focused, complete and logically finished; do not compress away important steps.
 - {artifact_rule}
 - {command_rule}
 - {compare_rule}
@@ -459,6 +601,10 @@ def _build_expand_prompt(question: str, previous_answer: str, mode: str, plan: A
 
 Режим расширения: {mode}
 AnswerPlan нужен только чтобы сохранить domain/intent и dangerous confusions. Для формы ответа следуй режиму расширения, а не answer_shape из AnswerPlan.
+Обязательная форма ответа:
+{_expand_output_shape(mode)}
+
+Начни сразу с первой секции из обязательной формы. Не добавляй общий вступительный абзац перед ней.
 Правила режима:
 {rules}
 - Оставайся в том же domain и не меняй смысл исходного вопроса.
@@ -519,6 +665,10 @@ Expansion answer violated contract:
 
 Перепиши расширение с нуля.
 Режим расширения: {mode}
+Обязательная форма ответа:
+{_expand_output_shape(mode)}
+
+Начни сразу с первой секции из обязательной формы.
 Форма ответа должна соответствовать режиму расширения, а не answer_shape из AnswerPlan.
 Оставайся в domain={plan.domain}, intent={plan.intent}.
 Не повторяй previous_answer и не упоминай validation.
@@ -552,7 +702,13 @@ def _looks_too_similar(previous_answer: str, answer: str) -> bool:
     if len(previous_tokens) < 12 or len(answer_tokens) < 12:
         return False
     overlap = len(previous_tokens & answer_tokens) / max(1, min(len(previous_tokens), len(answer_tokens)))
-    return overlap >= 0.72
+    return overlap >= 0.58
+
+
+def _has_required_expand_sections(answer: str, mode: str) -> bool:
+    lowered = answer.casefold()
+    headings = EXPAND_OUTPUT_SHAPES.get(mode, ())
+    return all(heading.casefold().rstrip(":") in lowered for heading in headings)
 
 
 def _validate_expand_mode(
@@ -566,9 +722,13 @@ def _validate_expand_mode(
     violations = list(validation.violations)
     if _looks_too_similar(previous_answer, answer):
         violations.append("expand_repeats_previous_answer")
+    if not _has_required_expand_sections(answer, mode):
+        violations.append(f"expand_{mode}_missing_required_sections")
     if mode == "example" and "```" not in answer:
         violations.append("expand_example_missing_fenced_block")
-    if mode == "compare" and re.search(r"(?m)^\s*(apiVersion|kind):", answer):
+    if mode != "example" and "```" in answer and not (mode == "troubleshoot" and plan.domain in {"kubernetes", "linux_fs", "linux_process", "linux_network", "ci_cd", "web_proxy", "observability"}):
+        violations.append(f"expand_{mode}_unexpected_code_block")
+    if mode == "compare" and ("```" in answer or re.search(r"(?m)^\s*(apiVersion|kind):", answer)):
         violations.append("expand_compare_added_yaml")
     if mode == "compare" and not any(marker in answer.casefold() for marker in ("главное отличие", "когда использовать", "когда что", "vs", "аналог")):
         violations.append("expand_compare_missing_decision_points")
@@ -591,6 +751,50 @@ def _validate_expand_mode(
     return ValidationResult(ok=not unique, violations=unique)
 
 
+WEB_SEARCH_UNCERTAINTY_MARKERS: tuple[str, ...] = (
+    "не знаю",
+    "не уверен",
+    "недостаточно информаци",
+    "не могу ответить",
+    "нет информации",
+    "не располага",
+    "не нашёл",
+    "не нашел",
+    "затрудняюсь ответить",
+    "неизвестно",
+    "не известно",
+    "i don't know",
+    "cannot answer",
+    "no information",
+    "not sure",
+)
+
+
+def _web_search_enabled() -> bool:
+    return os.getenv("STACKWIRE_WEB_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _answer_is_uncertain(answer: str) -> bool:
+    text = answer.strip().casefold()
+    if not text:
+        return True
+    head = text[:240]
+    return any(marker in head for marker in WEB_SEARCH_UNCERTAINTY_MARKERS)
+
+
+def _build_web_prompt(question: str, web_context: str) -> str:
+    return f"""
+Вопрос:
+{question}
+
+Свежие результаты веб-поиска DuckDuckGo. Используй их как источник фактов и не выдумывай:
+{web_context}
+
+Ответь на русском, опираясь на эти результаты. Если они не отвечают на вопрос — честно скажи об этом.
+Не вставляй сырые URL в текст: список источников будет добавлен отдельно.
+""".strip()
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -609,9 +813,9 @@ class OllamaClient:
             LOGGER.debug("storage session creation failed", exc_info=True)
             self.storage_session_id = None
 
-    def _chat(self, messages: list[dict[str, Any]], options: dict[str, Any], *, timeout: int = 300, model: str = ANSWER_MODEL) -> str:
+    def _chat(self, messages: list[dict[str, Any]], options: dict[str, Any], *, timeout: int = 300, model: str | None = None) -> str:
         payload: dict[str, Any] = {
-            "model": model,
+            "model": model or current_answer_model(),
             "messages": messages,
             "stream": False,
             "think": False,
@@ -625,10 +829,45 @@ class OllamaClient:
         message = data.get("message") or {}
         return str(message.get("content", "")).strip()
 
+    def _chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        options: dict[str, Any],
+        on_delta: Callable[[str], None] | None,
+        *,
+        timeout: int = 300,
+        model: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": model or current_answer_model(),
+            "messages": messages,
+            "stream": True,
+            "think": False,
+            "options": options,
+        }
+        if OLLAMA_KEEP_ALIVE:
+            payload["keep_alive"] = OLLAMA_KEEP_ALIVE
+        parts: list[str] = []
+        with self.session.post(OLLAMA_URL, json=cast(Any, payload), timeout=timeout, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                chunk = str((data.get("message") or {}).get("content", ""))
+                if chunk:
+                    parts.append(chunk)
+                    if on_delta is not None:
+                        on_delta(chunk)
+                if data.get("done"):
+                    break
+        return "".join(parts).strip()
+
     def _answer_options(self, plan: AnswerPlan) -> dict[str, Any]:
         num_predict = ARTIFACT_ANSWER_NUM_PREDICT if plan.artifact_required else DEFAULT_ANSWER_NUM_PREDICT
-        if plan.intent == "command_explain":
-            num_predict = min(num_predict, 560)
         return {
             "num_ctx": _env_int("OLLAMA_ANSWER_NUM_CTX", DEFAULT_NUM_CTX),
             "num_predict": num_predict,
@@ -661,6 +900,56 @@ class OllamaClient:
         )
         return _repair_answer(answer, question, plan)
 
+    def _generate_answer_stream(
+        self,
+        question: str,
+        plan: AnswerPlan,
+        prompt: str,
+        on_delta: Callable[[str], None] | None,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> str:
+        answer = self._chat_stream(
+            [
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            options or self._answer_options(plan),
+            on_delta,
+            timeout=300,
+        )
+        return _repair_answer(answer, question, plan)
+
+    def _web_fallback(self, question: str, plan: AnswerPlan, prior_answer: str, on_delta: Callable[[str], None] | None) -> str:
+        try:
+            results = search_duckduckgo(question)
+        except Exception:
+            LOGGER.debug("web search failed", exc_info=True)
+            results = []
+        if not results:
+            note = "\n\nВеб-поиск не дал результатов."
+            if on_delta is not None:
+                on_delta(note)
+            return prior_answer + note
+
+        if on_delta is not None:
+            on_delta("\n\nДополняю из веба:\n\n")
+        grounded = self._chat_stream(
+            [
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "user", "content": _build_web_prompt(question, format_results_for_prompt(results))},
+            ],
+            self._answer_options(plan),
+            on_delta,
+        )
+        grounded = _repair_answer(grounded, question, plan)
+        sources = format_results_markdown(results)
+        if on_delta is not None and sources:
+            on_delta(f"\n\n{sources}")
+        if not grounded:
+            return f"{prior_answer}\n\n{sources}".strip()
+        return f"{grounded}\n\n{sources}".strip()
+
     def answer_question(self, recovered_question: str, context: list[str] | None = None) -> str:
         question = normalize_question(recovered_question)
         if not question:
@@ -690,14 +979,15 @@ class OllamaClient:
         normalized_question = normalize_question(question)
         normalized_mode = mode if mode in EXPAND_MODE_RULES else "details"
         plan = build_answer_plan(normalized_question)
+        validation_plan = _expand_validation_plan(plan, normalized_mode)
         prompt = _build_expand_prompt(normalized_question, previous_answer, normalized_mode, plan)
         answer = self._generate_answer(normalized_question, plan, prompt, options=self._expand_options(plan, normalized_mode))
         validation = _validate_expand_mode(
             answer,
             normalized_mode,
-            validate_answer(normalized_question, answer, plan),
+            validate_answer(normalized_question, answer, validation_plan),
             previous_answer=previous_answer,
-            plan=plan,
+            plan=validation_plan,
         )
 
         if not validation.ok:
@@ -714,9 +1004,9 @@ class OllamaClient:
             validation = _validate_expand_mode(
                 answer,
                 normalized_mode,
-                validate_answer(normalized_question, answer, plan),
+                validate_answer(normalized_question, answer, validation_plan),
                 previous_answer=previous_answer,
-                plan=plan,
+                plan=validation_plan,
             )
             if not validation.ok:
                 LOGGER.warning(
@@ -744,7 +1034,7 @@ class OllamaClient:
                 answer=answer,
                 answer_type="expand",
                 expand_mode=normalized_mode,
-                model=MODEL,
+                model=current_answer_model(),
                 answer_mode=ANSWER_MODE,
                 latency_ms=latency * 1000,
                 validator_ok=validation.ok,
@@ -805,7 +1095,7 @@ class OllamaClient:
                 question_id=question_id,
                 answer=answer,
                 answer_type="main",
-                model=MODEL,
+                model=current_answer_model(),
                 answer_mode=ANSWER_MODE,
                 latency_ms=answer_latency * 1000,
                 validator_ok=validation.ok,
@@ -814,6 +1104,7 @@ class OllamaClient:
                 plan_intent=plan.intent,
                 artifact_required=plan.artifact_required,
             )
+            _remember_answer(recovered_question, answer, plan, valid=validation.ok)
             return question_id, answer_id, plan
         except Exception:
             LOGGER.debug("main answer storage logging failed", exc_info=True)
@@ -874,7 +1165,10 @@ class OllamaClient:
             )
 
         recovery_started = time.perf_counter()
-        recovery = self.question_recovery.recover(raw_text, context)
+        recovery_input = condense_spoken_question(raw_text)
+        if recovery_input and recovery_input != raw_text:
+            LOGGER.info("condensed transcript for recovery raw_len=%s condensed_len=%s", len(raw_text), len(recovery_input))
+        recovery = self.question_recovery.recover(recovery_input or raw_text, context)
         recovery_latency = time.perf_counter() - recovery_started
 
         if (
@@ -935,6 +1229,113 @@ class OllamaClient:
             plan_intent=plan.intent if plan else None,
         )
 
+    def ask_stream(
+        self,
+        raw_text: str,
+        context: list[str] | None = None,
+        *,
+        trusted_text: bool = False,
+        on_recovery: Callable[[str], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> AskResult:
+        context = context or []
+        raw_text = raw_text.strip()
+        pipeline_started = time.perf_counter()
+
+        if trusted_text:
+            recovery = RecoveryResult(
+                confidence=1.0,
+                recovered_question=raw_text,
+                detected_topic="Manual input",
+                reason="trusted manual input",
+                technical_entities=[],
+                ambiguities=[],
+                needs_manual_fix=False,
+                candidate_questions=[raw_text],
+                candidate_quality="manual",
+            )
+            recovery_latency = 0.0
+            answer_context: list[str] | None = None
+            question = raw_text
+        else:
+            recovery_started = time.perf_counter()
+            recovery_input = condense_spoken_question(raw_text)
+            recovery = self.question_recovery.recover(recovery_input or raw_text, context)
+            recovery_latency = time.perf_counter() - recovery_started
+            if (
+                recovery.needs_manual_fix
+                or recovery.confidence < CONFIDENCE_THRESHOLD
+                or recovery.detected_topic == "NEED_CLARIFICATION"
+            ):
+                return AskResult(
+                    raw_text=raw_text,
+                    recovery=recovery,
+                    answer=NEED_MANUAL_FIX_MESSAGE,
+                    answered=False,
+                    recovery_latency=recovery_latency,
+                    answer_latency=0.0,
+                    total_latency=time.perf_counter() - pipeline_started,
+                )
+            answer_context = context
+            question = recovery.recovered_question
+
+        normalized = normalize_question(question)
+        if not normalized:
+            return AskResult(
+                raw_text=raw_text,
+                recovery=recovery,
+                answer="Вопрос нужно уточнить.",
+                answered=False,
+                recovery_latency=recovery_latency,
+                answer_latency=0.0,
+                total_latency=time.perf_counter() - pipeline_started,
+            )
+
+        if on_recovery is not None:
+            on_recovery(normalized)
+
+        started = time.perf_counter()
+        plan = build_answer_plan(normalized)
+        prompt = _build_prompt(normalized, plan, answer_context)
+        answer = self._generate_answer_stream(normalized, plan, prompt, on_delta) or "Вопрос нужно уточнить."
+        if _web_search_enabled() and _answer_is_uncertain(answer):
+            answer = self._web_fallback(normalized, plan, answer, on_delta)
+        answer_latency = time.perf_counter() - started
+        total_latency = time.perf_counter() - pipeline_started
+
+        _append_query_history(
+            raw_text=raw_text,
+            recovered_question=normalized,
+            answer=answer,
+            answered=True,
+            recovery_latency=recovery_latency,
+            answer_latency=answer_latency,
+            total_latency=total_latency,
+        )
+        question_id, answer_id, logged_plan = self._log_main_answer(
+            raw_text=raw_text,
+            recovered_question=normalized,
+            trusted_text=trusted_text,
+            recovery_confidence=recovery.confidence,
+            detected_topic=recovery.detected_topic,
+            answer=answer,
+            answer_latency=answer_latency,
+        )
+        effective_plan = logged_plan or plan
+        return AskResult(
+            raw_text=raw_text,
+            recovery=recovery,
+            answer=answer,
+            answered=True,
+            recovery_latency=recovery_latency,
+            answer_latency=answer_latency,
+            total_latency=total_latency,
+            question_id=question_id,
+            answer_id=answer_id,
+            plan_domain=effective_plan.domain,
+            plan_intent=effective_plan.intent,
+        )
+
     def analyze_image(self, image_b64: str, prompt: str | None = None) -> str:
         image_b64 = image_b64.strip()
         if image_b64.startswith("data:image"):
@@ -943,8 +1344,8 @@ class OllamaClient:
             return "Не удалось получить изображение."
 
         user_prompt = (prompt or "").strip() or (
-            "Определи, что находится на выделенной области экрана. "
-            "Если это DevOps/SRE материал, объясни смысл и что важно сказать."
+            "Определи, что находится на выделенной области экрана, "
+            "объясни смысл и что важно знать."
         )
         answer = self._chat(
             [
@@ -958,6 +1359,6 @@ class OllamaClient:
                 "top_p": 0.75,
             },
             timeout=300,
-            model=VISION_MODEL,
+            model=current_vision_model(),
         )
         return _strip_model_noise(answer) or "Не удалось распознать содержимое области."

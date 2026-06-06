@@ -129,6 +129,18 @@ def build_answer_plan(question: str) -> AnswerPlan:
     if "burn rate" in lowered or "burnrate" in lowered:
         required.extend(("SLO", "error budget", "burn rate ratio"))
 
+    if _is_request_diff_question(lowered):
+        required.extend(
+            (
+                "compare the same request on both servers",
+                "HTTP method/path/query/body/headers",
+                "status code/response body/timing",
+                "access logs or correlation id",
+                "upstream/app config differences",
+            )
+        )
+        code_allowed = True
+
     if intent == "command_explain":
         code_allowed = True
         if COMMAND_RE.search(lowered) or any(marker in lowered for marker in ("как вывести", "как посчитать", "топ ip", "/var/log")):
@@ -136,7 +148,7 @@ def build_answer_plan(question: str) -> AnswerPlan:
 
     depth = "deep" if intent in {"architecture", "troubleshoot"} else "normal"
     if intent == "command_explain":
-        depth = "compact"
+        depth = "normal"
 
     return AnswerPlan(
         domain=domain,
@@ -153,6 +165,9 @@ def build_answer_plan(question: str) -> AnswerPlan:
 
 
 def _detect_domain(lowered_question: str) -> str:
+    if _is_request_diff_question(lowered_question):
+        return "web_proxy"
+
     if {"deployment", "statefulset"} <= set(re.findall(r"deployment|statefulset", lowered_question)):
         return "kubernetes"
 
@@ -191,6 +206,8 @@ def _detect_domain(lowered_question: str) -> str:
 def _detect_intent(lowered_question: str) -> str:
     if _is_command_question(lowered_question):
         return "command_explain"
+    if _is_request_diff_question(lowered_question):
+        return "troubleshoot"
     if TROUBLESHOOT_RE.search(lowered_question):
         return "troubleshoot"
     if ARCHITECTURE_RE.search(lowered_question):
@@ -214,6 +231,28 @@ def _is_command_question(lowered_question: str) -> bool:
     return any(marker in lowered_question for marker in ("как вывести", "как посчитать", "топ ip", "top ip")) and any(
         file_marker in lowered_question for file_marker in ("/var/log", ".log", "лог")
     )
+
+
+def _is_request_diff_question(lowered_question: str) -> bool:
+    has_request = any(term in lowered_question for term in ("запрос", "request", "http", "api", "curl"))
+    has_server_context = any(term in lowered_question for term in ("сервер", "server", "host", "хост", "endpoint", "эндпоинт"))
+    has_diff_or_check = any(
+        term in lowered_question
+        for term in (
+            "разница",
+            "различие",
+            "отлич",
+            "сравни",
+            "сравнить",
+            "определить",
+            "проверить",
+            "найти",
+            "different",
+            "compare",
+            "diff",
+        )
+    )
+    return has_request and has_server_context and has_diff_or_check
 
 
 def _contains_trigger(lowered_question: str, trigger: str) -> bool:

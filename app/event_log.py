@@ -15,7 +15,9 @@ def append_client_event(event: str, details: dict[str, Any] | None = None) -> st
     clock = server_time.strftime("%H:%M:%S")
     logged_at = server_time.isoformat()
     log_path = Path(os.getenv("STACKWIRE_EVENT_LOG_PATH", "logs/stackwire_client_events.md"))
+    jsonl_path = Path(os.getenv("STACKWIRE_EVENT_JSONL_PATH", "logs/stackwire_client_events.jsonl"))
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     safe_event = event.strip()[:80] or "client_event"
     payload = details or {}
@@ -33,5 +35,19 @@ def append_client_event(event: str, details: dict[str, Any] | None = None) -> st
         chunks.append(f"- details: `{serialized}`\n")
         with log_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write("".join(chunks))
+        with jsonl_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "server_time": logged_at,
+                        "event": safe_event,
+                        "details": payload,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
 
     return logged_at

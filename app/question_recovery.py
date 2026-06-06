@@ -23,11 +23,18 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
 STACKWIRE_MODE = os.getenv("STACKWIRE_MODE", "fast").strip().lower()
 IS_FAST_MODE = STACKWIRE_MODE != "accurate"
 RECOVERY_LOCAL_FAST_PATH = os.getenv("RECOVERY_LOCAL_FAST_PATH", "1" if IS_FAST_MODE else "0").strip().lower() not in {"0", "false", "no", "off"}
-DEFAULT_MODEL = (
-    os.getenv("FAST_RECOVERY_MODEL", os.getenv("RECOVERY_MODEL", os.getenv("OLLAMA_RECOVERY_MODEL", "llama3.2:latest")))
-    if IS_FAST_MODE
-    else os.getenv("RECOVERY_MODEL", os.getenv("OLLAMA_RECOVERY_MODEL", "llama3.2:latest"))
-)
+DEFAULT_STACKWIRE_MODEL = "qwen3.6:latest"
+
+
+def current_recovery_model() -> str:
+    if IS_FAST_MODE:
+        value = os.getenv("FAST_RECOVERY_MODEL", os.getenv("RECOVERY_MODEL", os.getenv("OLLAMA_RECOVERY_MODEL", DEFAULT_STACKWIRE_MODEL)))
+    else:
+        value = os.getenv("RECOVERY_MODEL", os.getenv("OLLAMA_RECOVERY_MODEL", DEFAULT_STACKWIRE_MODEL))
+    return value.strip() or DEFAULT_STACKWIRE_MODEL
+
+
+DEFAULT_MODEL = current_recovery_model()
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75" if IS_FAST_MODE else "0.80"))
 MAX_CANDIDATES = 2 if IS_FAST_MODE else 3
 DEFAULT_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "3072" if IS_FAST_MODE else "4096"))
@@ -56,6 +63,10 @@ QUESTION_MARKERS = (
     "what",
     "why",
     "how",
+    "explain",
+    "compare",
+    "describe",
+    "troubleshoot",
 )
 
 TECH_POSITION_MARKERS = (
@@ -309,7 +320,7 @@ class QuestionRecovery:
         llm_complete: Callable[[str], str] | None = None,
         use_llm: bool = True,
     ) -> None:
-        self.model = model or DEFAULT_MODEL
+        self.model = model or current_recovery_model()
         self.ollama_url = ollama_url or OLLAMA_URL
         self.session = session or requests.Session()
         self.session.trust_env = False
@@ -385,7 +396,26 @@ class QuestionRecovery:
         token_count = len(re.findall(r"[A-Za-zА-Яа-яЁё0-9/+#.-]+", normalized))
 
         if self._looks_question_like(normalized) and entities and re.search(r"[A-Za-z/]", normalized):
-            confidence = 0.84 if token_count <= 16 else 0.65
+            normalized_lower = normalized.lower()
+            english_prompt = bool(
+                normalized_lower.startswith(("explain", "compare", "describe", "troubleshoot"))
+                or re.search(
+                    r"\b(?:what|how|why|when|where|explain(?:ed|s)?|compare(?:d|s)?|describe(?:d|s)?|troubleshoot(?:ing|s|ed)?)\b",
+                    normalized,
+                    flags=re.IGNORECASE,
+                )
+            )
+            token_limit = 26 if english_prompt else 16
+            confidence = 0.84 if token_count <= token_limit else 0.65
+
+        if (
+            confidence < CONFIDENCE_THRESHOLD
+            and entities
+            and re.search(r"[A-Za-z/]", normalized)
+            and re.search(r"\b(?:uses?|using|explain(?:ed|s)?|compare(?:d|s)?|debug|implement|troubleshoot)\b", normalized, flags=re.IGNORECASE)
+            and token_count <= 26
+        ):
+            confidence = 0.84
 
         if self._looks_question_like(normalized) and any(entity.startswith("/") for entity in entities):
             confidence = 0.82
@@ -478,7 +508,7 @@ class QuestionRecovery:
         fuzzy_hints = self._fuzzy_entity_hints(" ".join([*context[-RECOVERY_CONTEXT_LINES:], normalized]))
         fuzzy_hints_text = ", ".join(fuzzy_hints) if fuzzy_hints else "(none)"
         mode_hint = (
-            "FAST mode: be concise. Return one repaired transcript, no alternatives."
+            "FAST mode: return minimal JSON with one repaired transcript, no alternatives."
             if IS_FAST_MODE
             else "ACCURATE mode: return one repaired transcript and note real ambiguities."
         )
@@ -528,6 +558,7 @@ Transcript repair rules:
 - You may only replace technical terms, acronyms, product names, commands, file paths and API object names when the replacement is phonetically close to raw transcript or explicitly supported by context.
 - Do not add technologies, tools or concepts that are not present by sound in raw transcript or explicitly present in context.
 - Do not rewrite fragments into a cleaner semantic question. Do not merge several fragments into one new question.
+- Do not reduce the transcript to a definition of one detected technical term when the raw transcript contains a broader question.
 - Do not add clarifying words such as "роль", "используется", "в Linux", "в Kubernetes", "CI/CD", "networking" unless they are audible in raw transcript or present in context.
 - If raw transcript is already readable, keep it and only normalize punctuation/capitalization.
 - If confidence is not high, return the cleaned raw transcript as recovered_question, set needs_manual_fix=true, and put only that same text in candidate_questions.
@@ -575,11 +606,24 @@ Transcript repair rules:
         if recovered and recovered not in candidates:
             candidates.insert(0, recovered)
 
-        support_problem = self._transcript_support_problem(raw_text, normalized, recovered, context)
-        if support_problem:
+        recovery_problem = self._transcript_support_problem(raw_text, normalized, recovered, context)
+        if not recovery_problem:
+            recovery_problem = self._semantic_narrowing_problem(raw_text, normalized, recovered)
+
+        used_normalized_transcript = False
+        if recovery_problem:
             recovered = self._format_recovered_question(normalized)
             candidates = [recovered]
             confidence = min(confidence, 0.55)
+            entity_text = " ".join([raw_text, normalized, *context])
+            generic_entities = self._extract_generic_entities(entity_text)
+            fuzzy_entities = [
+                match["term"]
+                for match in self._fuzzy_term_matches(entity_text)
+                if self._catalog_term_is_supported(str(match["term"]), entity_text)
+            ]
+            technical_entities = self._dedupe([*generic_entities, *fuzzy_entities])
+            used_normalized_transcript = True
         else:
             recovered = self._format_recovered_question(recovered)
             supported_candidates = [
@@ -600,9 +644,14 @@ Transcript repair rules:
         contradiction_risk = self._contradiction_risk(raw_text, recovered, technical_entities)
         needs_manual_fix = result.needs_manual_fix
 
-        if support_problem:
-            needs_manual_fix = True
-            reason = f"{reason}; unsupported transcript repair: {support_problem}"
+        if recovery_problem:
+            if used_normalized_transcript and self._is_clean_supported_question(recovered):
+                confidence = max(confidence, 0.86)
+                needs_manual_fix = False
+                reason = f"{reason}; used full normalized transcript after recovery issue: {recovery_problem}"
+            else:
+                needs_manual_fix = True
+                reason = f"{reason}; unsupported transcript repair: {recovery_problem}"
 
         if self._is_clean_supported_question(recovered) and not needs_manual_fix and len(ambiguities) < 2:
             confidence = max(confidence, 0.86)
@@ -816,6 +865,40 @@ Transcript repair rules:
         unsupported_tokens = sorted(candidate_tokens - support_tokens - allowed_repair_tokens)
         if unsupported_tokens:
             return "added words " + ", ".join(unsupported_tokens[:6])
+        return ""
+
+    def _semantic_narrowing_problem(self, raw_text: str, normalized: str, candidate: str) -> str:
+        normalized_question = self._ensure_question_punctuation(normalize_lightweight(normalized or raw_text))
+        candidate_question = self._ensure_question_punctuation(normalize_lightweight(candidate))
+
+        if not self._looks_question_like(normalized_question):
+            return ""
+
+        if self._strip_punctuation(normalized_question).lower() == self._strip_punctuation(candidate_question).lower():
+            return ""
+
+        raw_tokens = self._content_tokens(normalized_question)
+        candidate_tokens = self._content_tokens(candidate_question)
+        if len(raw_tokens) < 2 or not candidate_tokens:
+            return ""
+
+        missing_tokens = sorted(raw_tokens - candidate_tokens)
+        if not missing_tokens:
+            return ""
+
+        coverage = len(raw_tokens & candidate_tokens) / max(len(raw_tokens), 1)
+        changed_shape = self._question_shape_penalty(candidate_question, normalized_question) > 0
+        narrowed_to_definition = "что такое" in candidate_question.lower() and "что такое" not in normalized_question.lower()
+
+        if changed_shape or narrowed_to_definition:
+            return "changed question shape and dropped " + ", ".join(missing_tokens[:6])
+
+        if len(raw_tokens) >= 3 and coverage < 0.67:
+            return "dropped supported words " + ", ".join(missing_tokens[:6])
+
+        if len(missing_tokens) >= 2 and len(candidate_tokens) <= max(2, len(raw_tokens) - 2):
+            return "narrowed transcript to a shorter question"
+
         return ""
 
     def _unsupported_catalog_terms(self, candidate: str, support_text: str) -> list[str]:
