@@ -1,4 +1,5 @@
 from app import storage
+from app.notes import load_notes, save_notes
 
 
 def test_storage_logs_feedback_good_answer_and_exports_session(tmp_path, monkeypatch) -> None:
@@ -47,3 +48,15 @@ def test_storage_logs_feedback_good_answer_and_exports_session(tmp_path, monkeyp
     assert recent and recent[0]["id"] == question_id
     assert "test session" in exported
     assert "Ingress is a Kubernetes API object" in exported
+
+
+def test_notes_round_trip(tmp_path) -> None:
+    path = tmp_path / "notes.md"
+
+    save_notes("first line\nsecond line", path)
+
+    assert load_notes(path) == "first line\nsecond line"
+
+
+def test_load_missing_notes_returns_empty(tmp_path) -> None:
+    assert load_notes(tmp_path / "missing.md") == ""

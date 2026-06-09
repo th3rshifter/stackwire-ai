@@ -26,6 +26,34 @@ RECOVERY_LOCAL_FAST_PATH = os.getenv("RECOVERY_LOCAL_FAST_PATH", "1" if IS_FAST_
 DEFAULT_STACKWIRE_MODEL = "qwen3.6:latest"
 
 
+def current_llm_provider() -> str:
+    provider = os.getenv("STACKWIRE_LLM_PROVIDER", os.getenv("STACKWIRE_PROVIDER", "ollama")).strip().lower()
+    if provider in {"openai", "openai-compatible", "openai_compatible", "compatible"}:
+        return "openai_compatible"
+    return "ollama"
+
+
+def current_ollama_chat_url() -> str:
+    return os.getenv("OLLAMA_URL", OLLAMA_URL).strip() or OLLAMA_URL
+
+
+def current_openai_chat_url() -> str:
+    base = os.getenv("STACKWIRE_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+    return f"{base}/chat/completions"
+
+
+def _openai_headers() -> dict[str, str]:
+    key = os.getenv("STACKWIRE_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 def current_recovery_model() -> str:
     if IS_FAST_MODE:
         value = os.getenv("FAST_RECOVERY_MODEL", os.getenv("RECOVERY_MODEL", os.getenv("OLLAMA_RECOVERY_MODEL", DEFAULT_STACKWIRE_MODEL)))
@@ -43,6 +71,7 @@ RECOVERY_CONTEXT_LINES = int(os.getenv("RECOVERY_CONTEXT_LINES", "6"))
 _RICH_CONSOLE: Any | None = None
 
 QUESTION_MARKERS = (
+    # Russian interrogatives
     "что",
     "чем",
     "как",
@@ -50,23 +79,72 @@ QUESTION_MARKERS = (
     "зачем",
     "почему",
     "где",
+    "куда",
+    "откуда",
     "какой",
     "какая",
     "какие",
+    "каков",
+    "сколько",
+    "насколько",
+    "кто",
+    "кого",
+    "кому",
+    "который",
+    "которая",
+    "которые",
+    "чей",
+    # Russian requests / imperatives — a general assistant answers these too
     "отлич",
     "сравни",
     "объясни",
     "расскажи",
     "покажи",
     "пример",
+    "опиши",
+    "перечисли",
+    "переведи",
+    "посчитай",
+    "посчитать",
+    "напиши",
+    "составь",
+    "придумай",
+    "реши",
+    "решить",
+    "помоги",
+    "подскажи",
+    "посоветуй",
+    "найди",
+    "назови",
+    "предложи",
+    "сделай",
+    "сгенерируй",
+    "проверь",
+    "исправь",
+    "сократи",
+    "продолжи",
+    "нужно",
+    "можно",
+    # English interrogatives / requests
     "when",
     "what",
     "why",
     "how",
+    "who",
+    "which",
+    "where",
+    "whose",
     "explain",
     "compare",
     "describe",
     "troubleshoot",
+    "translate",
+    "summarize",
+    "calculate",
+    "define",
+    "generate",
+    "write",
+    "create",
 )
 
 TECH_POSITION_MARKERS = (
@@ -321,7 +399,7 @@ class QuestionRecovery:
         use_llm: bool = True,
     ) -> None:
         self.model = model or current_recovery_model()
-        self.ollama_url = ollama_url or OLLAMA_URL
+        self.ollama_url = ollama_url or current_ollama_chat_url()
         self.session = session or requests.Session()
         self.session.trust_env = False
         self.llm_complete = llm_complete
@@ -470,6 +548,27 @@ class QuestionRecovery:
         if self.llm_complete is not None:
             return self.llm_complete(prompt)
 
+        if current_llm_provider() == "openai_compatible":
+            response = self.session.post(
+                current_openai_chat_url(),
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "max_tokens": DEFAULT_RECOVERY_NUM_PREDICT,
+                    "temperature": float(os.getenv("OLLAMA_RECOVERY_TEMPERATURE", "0.05")),
+                },
+                headers=_openai_headers(),
+                timeout=120,
+            )
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices") if isinstance(data, dict) else []
+            if not choices or not isinstance(choices[0], dict):
+                return ""
+            message = choices[0].get("message") or {}
+            return str(message.get("content", "")).strip()
+
         payload_dict = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -514,8 +613,11 @@ class QuestionRecovery:
         )
 
         return f"""
-You repair a noisy speech-to-text transcript from Russian technical content.
-The content can contain mixed Russian and English DevOps/SRE/IT terminology.
+You repair a noisy speech-to-text transcript for a general-purpose assistant.
+The speaker is mostly Russian and can ask about ANY topic — everyday life, science,
+history, culture, cooking, health, math, language, software, or IT. Treat the input as
+ordinary speech by default; only assume a technical/DevOps reading when the words clearly
+sound technical. The transcript may mix Russian and English terms.
 {mode_hint}
 
 Raw transcript:
@@ -533,7 +635,7 @@ Detected language hints:
 Generic entity hints from regex patterns:
 {generic_entities_text}
 
-Fuzzy technical entity hints from rapidfuzz:
+Fuzzy technical entity hints from rapidfuzz (only relevant if the speech is technical):
 {fuzzy_hints_text}
 
 Return strict JSON only:
@@ -554,7 +656,9 @@ Return strict JSON only:
 
 Transcript repair rules:
 - Your task is not to guess a new question. Repair the STT transcript.
-- Preserve all audible words, order, repeated fragments and the original question structure.
+- The input may be a question OR a request/command (translate, summarize, calculate, write, explain). Treat both as valid — keep the user's intent and structure.
+- Preserve all audible words, order, repeated fragments and the original structure.
+- A clear, readable everyday sentence needs no technical repair: keep it, set high confidence and needs_manual_fix=false. Do NOT invent a technical topic for plain speech.
 - You may only replace technical terms, acronyms, product names, commands, file paths and API object names when the replacement is phonetically close to raw transcript or explicitly supported by context.
 - Do not add technologies, tools or concepts that are not present by sound in raw transcript or explicitly present in context.
 - Do not rewrite fragments into a cleaner semantic question. Do not merge several fragments into one new question.
@@ -640,12 +744,13 @@ Transcript repair rules:
             technical_entities
             or self._has_technical_position(normalized)
             or self._has_technical_position(recovered)
+            or self._is_clean_supported_question(recovered)
         )
         contradiction_risk = self._contradiction_risk(raw_text, recovered, technical_entities)
         needs_manual_fix = result.needs_manual_fix
 
         if recovery_problem:
-            if used_normalized_transcript and self._is_clean_supported_question(recovered):
+            if used_normalized_transcript and self._is_clean_supported_question(recovered) and len(ambiguities) < 2:
                 confidence = max(confidence, 0.86)
                 needs_manual_fix = False
                 reason = f"{reason}; used full normalized transcript after recovery issue: {recovery_problem}"
@@ -657,6 +762,22 @@ Transcript repair rules:
             confidence = max(confidence, 0.86)
             needs_manual_fix = False
             reason = "clean supported question"
+
+        # A short, clean, unambiguous everyday question ("Что такое фотосинтез?",
+        # "Чем отличается кофе от чая?") must not be held for manual fix just because it
+        # carries no English/tech token. The length cap keeps rambling or garbled
+        # technical transcripts (which need real repair) out of this fast lane.
+        clean_general = (
+            self._is_clean_supported_question(recovered)
+            and len(ambiguities) < 2
+            and len(self._content_tokens(recovered)) <= 6
+        )
+        if clean_general:
+            confidence = max(confidence, 0.86)
+            needs_manual_fix = False
+            if detected_topic in {"", "NEED_CLARIFICATION"}:
+                detected_topic = "General"
+            reason = "clean general question"
 
         if self._has_unresolved_cyrillic_tech_token(recovered):
             confidence = min(confidence, 0.64)
@@ -688,7 +809,7 @@ Transcript repair rules:
             needs_manual_fix = True
             reason = f"{reason}; multiple plausible interpretations"
 
-        if candidate_quality == "raw_copy" and self._has_distortion_signal(raw_text):
+        if candidate_quality == "raw_copy" and self._has_distortion_signal(raw_text) and not clean_general:
             confidence = min(confidence, 0.45)
             needs_manual_fix = True
             reason = f"{reason}; candidate is raw transcript copy of distorted input"
@@ -1018,13 +1139,21 @@ Transcript repair rules:
         if self._is_very_noisy(normalized):
             return False
 
-        entities = self._extract_generic_entities(normalized)
-        has_latin_or_path = bool(re.search(r"[A-Za-z]", normalized)) or "/" in normalized
-
         if self._has_unresolved_cyrillic_tech_token(normalized):
             return False
 
-        return bool(has_latin_or_path)
+        has_latin_or_path = bool(re.search(r"[A-Za-z]", normalized)) or "/" in normalized
+        if has_latin_or_path:
+            return True
+
+        # General-purpose path: a clean, readable natural-language question or request
+        # (pure Russian, no English term or path) is still fully supported as long as it
+        # carries real content words. Without this, only DevOps-style questions passed.
+        return self._has_meaningful_content(normalized)
+
+    def _has_meaningful_content(self, text: str) -> bool:
+        # At least one substantive word beyond question words, fillers and stopwords.
+        return len(self._content_tokens(text)) >= 1
 
     def _semantic_fallback_candidates(self, raw_text: str, normalized: str) -> list[str]:
         text = f"{raw_text} {normalized}".lower()

@@ -14,12 +14,7 @@ def load_local_env() -> None:
         load_dotenv(LOCAL_ENV_FILE, override=False)
 
 
-DEFAULT_WHISPER_HOTWORDS = (
-    "Kubernetes kubectl kubelet Deployment StatefulSet DaemonSet Pod Service Ingress ConfigMap Secret PVC "
-    "Docker Dockerfile docker-compose GitLab CI GitHub Actions Jenkins Jenkins Pipeline Terraform Ansible "
-    "Prometheus Grafana Alertmanager Linux systemd systemctl journalctl TCP UDP DNS TLS mTLS HTTPS SSH "
-    "AWS EC2 ECS EKS IAM CloudWatch Auto Scaling load balancer Nginx HAProxy Apache"
-)
+DEFAULT_WHISPER_HOTWORDS = ""
 
 
 @dataclass(frozen=True)

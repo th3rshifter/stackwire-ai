@@ -3,6 +3,19 @@ import re
 from app.tech_terms import normalize_spoken_technical_terms
 
 
+# Interrogatives + request/imperative verbs shared by the chunking, trimming and
+# scoring helpers. A general assistant must isolate everyday questions and requests
+# ("переведи…", "сколько…", "кто…"), not only DevOps-style "что/как" questions.
+QUESTION_AND_REQUEST_MARKERS: str = (
+    r"что|чем|как|почему|зачем|когда|где|куда|откуда|"
+    r"какой|какая|какие|каков|сколько|насколько|кто|который|которая|которые|чей|"
+    r"объясни|расскажи|сравни|покажи|опиши|перечисли|переведи|посчитай|напиши|"
+    r"составь|придумай|реши|помоги|подскажи|посоветуй|найди|назови|предложи|сделай|"
+    r"сгенерируй|проверь|исправь|сократи|продолжи|"
+    r"what|how|why|when|where|who|which|whose|compare|explain|describe|troubleshoot|"
+    r"translate|summarize|calculate|define|generate|write|create"
+)
+
 QUESTION_OR_TECH_MARKERS: tuple[str, ...] = (
     "что",
     "чем",
@@ -11,6 +24,27 @@ QUESTION_OR_TECH_MARKERS: tuple[str, ...] = (
     "зачем",
     "когда",
     "где",
+    "кто",
+    "сколько",
+    "который",
+    "переведи",
+    "посчитай",
+    "напиши",
+    "составь",
+    "придумай",
+    "реши",
+    "помоги",
+    "подскажи",
+    "найди",
+    "назови",
+    "опиши",
+    "who",
+    "which",
+    "translate",
+    "summarize",
+    "calculate",
+    "define",
+    "generate",
     "kubernetes",
     "kubectl",
     "deployment",
@@ -243,10 +277,7 @@ def _drop_consecutive_duplicate_words(text: str) -> str:
 
 def _split_spoken_chunks(text: str) -> list[str]:
     normalized = re.sub(r"[\r\n]+", ". ", text)
-    marker_pattern = (
-        r"\b(?:что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
-        r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b"
-    )
+    marker_pattern = rf"\b(?:{QUESTION_AND_REQUEST_MARKERS})\b"
     normalized = re.sub(
         rf"(.{{25,}}?)\s+({marker_pattern})",
         lambda match: f"{match.group(1).strip()}. {match.group(2)}",
@@ -275,8 +306,7 @@ def _looks_like_question_chunk(chunk: str) -> bool:
     lowered = chunk.casefold()
     return bool(
         re.search(
-            r"\b(что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
-            r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b",
+            rf"\b({QUESTION_AND_REQUEST_MARKERS})\b",
             lowered,
             flags=re.IGNORECASE,
         )
@@ -286,8 +316,7 @@ def _looks_like_question_chunk(chunk: str) -> bool:
 def _trim_to_question_window(text: str) -> str:
     matches = list(
         re.finditer(
-            r"\b(что|чем|как|почему|зачем|когда|где|какой|какая|какие|"
-            r"объясни|расскажи|сравни|покажи|what|how|why|when|where|compare|explain|troubleshoot)\b",
+            rf"\b({QUESTION_AND_REQUEST_MARKERS})\b",
             text,
             flags=re.IGNORECASE,
         )

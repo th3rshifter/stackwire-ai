@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from app.web_search import format_results_for_prompt, format_results_markdown, s
 
 
 DEFAULT_STACKWIRE_MODEL = "qwen3.6:latest"
+DEFAULT_STACKWIRE_VISION_MODEL = "gemma3:4b"
 
 
 def current_answer_model() -> str:
@@ -27,13 +29,62 @@ def current_answer_model() -> str:
 
 
 def current_vision_model() -> str:
-    return os.getenv("VISION_MODEL", os.getenv("OLLAMA_VISION_MODEL", DEFAULT_STACKWIRE_MODEL)).strip() or DEFAULT_STACKWIRE_MODEL
+    return os.getenv("VISION_MODEL", os.getenv("OLLAMA_VISION_MODEL", DEFAULT_STACKWIRE_VISION_MODEL)).strip() or DEFAULT_STACKWIRE_VISION_MODEL
 
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 MODEL = current_answer_model()
 ANSWER_MODEL = MODEL
 VISION_MODEL = current_vision_model()
+
+
+def current_llm_provider() -> str:
+    provider = os.getenv("STACKWIRE_LLM_PROVIDER", os.getenv("STACKWIRE_PROVIDER", "ollama")).strip().lower()
+    if provider in {"openai", "openai-compatible", "openai_compatible", "compatible"}:
+        return "openai_compatible"
+    return "ollama"
+
+
+def current_ollama_chat_url() -> str:
+    return os.getenv("OLLAMA_URL", OLLAMA_URL).strip() or OLLAMA_URL
+
+
+def current_openai_chat_url() -> str:
+    base = os.getenv("STACKWIRE_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+    return f"{base}/chat/completions"
+
+
+def _openai_headers() -> dict[str, str]:
+    key = os.getenv("STACKWIRE_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def _openai_payload_options(options: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if "num_predict" in options:
+        payload["max_tokens"] = int(options["num_predict"])
+    if "temperature" in options:
+        payload["temperature"] = float(options["temperature"])
+    if "top_p" in options:
+        payload["top_p"] = float(options["top_p"])
+    return payload
+
+
+def _openai_message_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices") if isinstance(data, dict) else []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message") or {}
+    return str(message.get("content", "")).strip()
+
+
 ANSWER_MODE = os.getenv("ANSWER_MODE", os.getenv("STACKWIRE_ANSWER_MODE", "normal")).strip().lower()
 if ANSWER_MODE not in {"normal", "deep"}:
     ANSWER_MODE = "normal"
@@ -48,7 +99,7 @@ ARTIFACT_ANSWER_NUM_PREDICT = max(
     1200,
 )
 EXPAND_ANSWER_NUM_PREDICT = max(int(os.getenv("OLLAMA_EXPAND_NUM_PREDICT", "1100")), 900)
-DEFAULT_VISION_NUM_PREDICT = int(os.getenv("OLLAMA_VISION_NUM_PREDICT", "700"))
+DEFAULT_VISION_NUM_PREDICT = int(os.getenv("OLLAMA_VISION_NUM_PREDICT", "1200"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
 
 LOGGER = logging.getLogger(__name__)
@@ -60,29 +111,71 @@ Answer in Russian, practical, clear and useful.
 
 CRITICAL: You are NOT a DevOps assistant. You are NOT an SRE assistant. You are a general-purpose assistant. Do NOT assume the user is asking about infrastructure, Kubernetes, Docker, Linux, or any technical topic unless the question clearly contains those terms. When in doubt, treat the question as general/everyday.
 
-When a question is unclear, too short, or does not make sense — respond simply and naturally, like a helpful person would. Do NOT list examples that assume a technical or DevOps context. Ask the user to clarify what they mean, without suggesting any specific domain.
+## Principle of Maximum Usefulness (apply to every answer)
+
+When a request is short, vague, or underspecified — do NOT ask for clarification. Instead, apply statistical anticipation:
+1. Identify what the vast majority of people asking this exact question actually want (the most common, practical scenario).
+2. Build your answer around that scenario — fully and concretely.
+3. At the end, briefly note 1–2 alternative interpretations and offer to go deeper.
+
+Example of correct behaviour: "покажи ансибл код" → do not say "what do you mean?". Instead, infer "most people want a working playbook example" → provide a complete nginx/package install playbook, explain each section in a table or list, show key modules, then note "if you need a different scenario (DB, file deploy, CI/CD), say which one".
+
+This principle applies to ALL domains: code, cooking, history, finance, medicine, etc. Always give the most useful complete answer first, ask nothing second.
+
+## Structuring rich answers
+
+For requests that ask to "show", "explain", "give an example", or "how to do X":
+- Lead with a complete, runnable/usable artifact (code block, recipe steps, calculation, etc.)
+- Follow with a breakdown: explain the key parts/ingredients/concepts in a short table or bullet list
+- Add a "Common variations" or "What else can you do" section when relevant
+- Close with 1–2 brief clarifying questions IF the topic has genuinely important branches the user should know about
+
+Keep the structure clean. Use Russian section headers (## Название) to separate logical parts. Do not pad with introductions.
+
+## Style rules
 
 Keep canonical English names for tools, protocols, API objects, commands, config keys and metrics when they appear.
-Do not invent mechanisms. Do not use prior question context unless the current question explicitly asks for it.
-Assume the question may come from noisy speech recognition: ignore filler words and answer only the supported core.
+Do not invent mechanisms.
+Assume the question may come from noisy speech recognition: ignore filler words and answer only the core.
 Answer the entire user question. If it contains multiple entities, conditions or comparisons, address all of them.
-Style: direct, natural response. Start with a clear first sentence, then give enough explanation to make the answer usable. Avoid long textbook introductions.
-Use Russian section labels when helpful. Use fenced Markdown with a language tag for any code, config, command or query.
-Do not write the language name as a separate line before code.
-When the user explicitly asks for a diagram, scheme, architecture or drawing, include a clear ASCII diagram (boxes drawn with +, -, | and arrows ->) inside a fenced code block so it is always readable. For graphs, flows or architectures you may instead emit a Mermaid diagram in a ```mermaid block or Graphviz in a ```dot block; the app renders those to an image when a renderer is installed. Do not produce diagrams unless the user asks for one.
+Start with a clear first sentence or the artifact itself, then explain. Avoid long textbook introductions.
+Use fenced Markdown with a language tag for any code, config, command or query. Do not write the language name as a separate line before code.
+If the user explicitly asks for a table, answer with a Markdown table for the requested content and do not replace it with an ASCII diagram or code block.
+When the user explicitly asks for a diagram, scheme, architecture or drawing, include a clear ASCII diagram (boxes drawn with +, -, | and arrows ->) inside a fenced code block. For graphs/flows you may emit a Mermaid diagram in a ```mermaid block or Graphviz in a ```dot block. Do not produce diagrams unless the user asks for one.
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
-Ты анализируешь выделенную область экрана.
+You are a sharp, detail-oriented visual assistant. Analyze the attached image thoroughly and answer the user's actual question. Answer in Russian.
 
-Ответь на русском, коротко и практично:
-- что это за объект, экран, ошибка, код, конфиг, интерфейс или текст;
-- какие ключевые детали видны;
-- если это ошибка/лог/конфиг, что проверить дальше;
-- если текст плохо читается, явно скажи что уверенность низкая.
+## Principle of maximum usefulness
+If the user gave no specific question (or just "what is this?"), do NOT reply with one vague sentence. Infer what a person sharing THIS kind of screenshot most likely wants, and give a rich, well-structured answer.
 
-Не выдумывай невидимые строки и не делай длинную лекцию.
+Adapt to what the image actually is:
+- **Code / terminal / config / logs**: transcribe the key lines exactly (in a code block), say what the code/command does, point out errors, warnings, bugs or smells, and give the concrete fix or next step.
+- **Error message / stack trace / crash**: state the exact error, the most likely cause, and how to fix it step by step.
+- **UI / website / app / dashboard**: describe the layout and the meaningful elements (buttons, fields, menus, data), what state it is in, and what the user can do here.
+- **Diagram / architecture / chart / graph**: explain what it represents, the components and how they connect, and read off concrete numbers/labels/axes.
+- **Document / table / text**: extract and summarize the actual content; reproduce important text and numbers faithfully.
+- **Photo / general image**: describe the scene, the notable objects, text on signs/labels, and anything contextually important.
+
+## Structure
+Use short headings or bullet points so the answer is easy to scan. A good default shape:
+1. Что на экране — concise overview of what the image shows.
+2. Детали / ключевые элементы — the important specifics (transcribe text/code/numbers verbatim where it matters).
+3. Что это значит / что делать — interpretation, the answer to the implied question, or the fix/next step.
+
+## Accuracy rules
+- Transcribe visible text, code, numbers and labels exactly as shown — do not paraphrase identifiers.
+- Describe only what is actually visible. Never invent prices, names, dates, hidden text, or off-screen content.
+- If something is cut off, blurry, or ambiguous, say so plainly and explain what extra context would help.
+- Do not pad with generic filler or mention categories that are irrelevant to this image.
 """.strip()
+
+DEFAULT_VISION_USER_PROMPT = (
+    "Подробно разбери, что изображено на скриншоте. Дай структурированный ответ: "
+    "что на экране, ключевые детали (точно процитируй важный текст, код, числа), "
+    "и что это значит или что с этим делать."
+)
 
 
 @dataclass(frozen=True)
@@ -265,18 +358,18 @@ def _repair_answer(answer: str, question: str, plan: AnswerPlan) -> str:
     return cleaned.strip()
 
 
-def _question_allows_history(question: str) -> bool:
-    lowered = question.casefold()
-    return any(marker in lowered for marker in ("предыдущ", "выше", "с учетом", "с учётом", "в этом контексте", "как раньше", "previous", "context"))
+def _question_allows_history(question: str) -> bool:  # noqa: ARG001
+    # Always allow recent chat history — the LLM needs it for follow-up questions.
+    return True
 
 
 def _history_section(question: str, context: list[str] | None) -> str:
     if not context or not _question_allows_history(question):
         return ""
-    lines = [line.strip() for line in context[-6:] if line.strip()]
+    lines = [line.strip() for line in context[-8:] if line.strip()]
     if not lines:
         return ""
-    return "\n\nAllowed previous context:\n" + "\n".join(f"- {line}" for line in lines)
+    return "\n\nRecent conversation history (for context — use it to understand follow-up questions):\n" + "\n".join(f"  {line}" for line in lines)
 
 
 def _format_tuple(values: tuple[str, ...]) -> str:
@@ -551,6 +644,19 @@ def _build_prompt(question: str, plan: AnswerPlan, context: list[str] | None = N
         if good_examples
         else ""
     )
+    example_breakdown_rule = (
+        "For 'example' intent: after the artifact, add a breakdown section (table or bullet list) explaining each key part. "
+        "Then add a 'Частые вариации' section listing 2-3 other common scenarios. "
+        "End with a single clarifying question only if the topic has genuinely important branches."
+        if plan.intent == "example"
+        else ""
+    )
+    definition_breakdown_rule = (
+        "For 'definition' intent: after the explanation, add a 'Ключевые компоненты' section as a short table or bullet list. "
+        "Include a minimal practical example to ground the concept."
+        if plan.intent == "definition"
+        else ""
+    )
     return f"""
 Question:
 {question}
@@ -561,7 +667,7 @@ Question:
 {good_examples_section}
 
 Contract:
-- Follow answer_shape.
+- Follow answer_shape exactly — it defines the sections and their order.
 - Answer the full Question field, not only the first detected technical term.
 - Include required_concepts naturally.
 - Avoid forbidden_concepts and dangerous_confusions.
@@ -570,6 +676,8 @@ Contract:
 - {artifact_rule}
 - {command_rule}
 - {compare_rule}
+- {example_breakdown_rule}
+- {definition_breakdown_rule}
 - Any code/config/query/command must be fenced Markdown with a language tag.
 """.strip()
 
@@ -814,6 +922,17 @@ class OllamaClient:
             self.storage_session_id = None
 
     def _chat(self, messages: list[dict[str, Any]], options: dict[str, Any], *, timeout: int = 300, model: str | None = None) -> str:
+        if current_llm_provider() == "openai_compatible":
+            payload: dict[str, Any] = {
+                "model": model or current_answer_model(),
+                "messages": messages,
+                "stream": False,
+                **_openai_payload_options(options),
+            }
+            response = self.session.post(current_openai_chat_url(), json=cast(Any, payload), headers=_openai_headers(), timeout=timeout)
+            response.raise_for_status()
+            return _openai_message_content(response.json())
+
         payload: dict[str, Any] = {
             "model": model or current_answer_model(),
             "messages": messages,
@@ -823,7 +942,7 @@ class OllamaClient:
         }
         if OLLAMA_KEEP_ALIVE:
             payload["keep_alive"] = OLLAMA_KEEP_ALIVE
-        response = self.session.post(OLLAMA_URL, json=cast(Any, payload), timeout=timeout)
+        response = self.session.post(current_ollama_chat_url(), json=cast(Any, payload), timeout=timeout)
         response.raise_for_status()
         data = response.json()
         message = data.get("message") or {}
@@ -838,6 +957,38 @@ class OllamaClient:
         timeout: int = 300,
         model: str | None = None,
     ) -> str:
+        if current_llm_provider() == "openai_compatible":
+            payload: dict[str, Any] = {
+                "model": model or current_answer_model(),
+                "messages": messages,
+                "stream": True,
+                **_openai_payload_options(options),
+            }
+            parts: list[str] = []
+            with self.session.post(current_openai_chat_url(), json=cast(Any, payload), headers=_openai_headers(), timeout=timeout, stream=True) as response:
+                response.raise_for_status()
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(line)
+                    except ValueError:
+                        continue
+                    choices = data.get("choices") if isinstance(data, dict) else []
+                    if not choices or not isinstance(choices[0], dict):
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    chunk = str(delta.get("content", ""))
+                    if chunk:
+                        parts.append(chunk)
+                        if on_delta is not None:
+                            on_delta(chunk)
+            return "".join(parts).strip()
+
         payload: dict[str, Any] = {
             "model": model or current_answer_model(),
             "messages": messages,
@@ -848,7 +999,7 @@ class OllamaClient:
         if OLLAMA_KEEP_ALIVE:
             payload["keep_alive"] = OLLAMA_KEEP_ALIVE
         parts: list[str] = []
-        with self.session.post(OLLAMA_URL, json=cast(Any, payload), timeout=timeout, stream=True) as response:
+        with self.session.post(current_ollama_chat_url(), json=cast(Any, payload), timeout=timeout, stream=True) as response:
             response.raise_for_status()
             for line in response.iter_lines(decode_unicode=True):
                 if not line:
@@ -1237,6 +1388,7 @@ class OllamaClient:
         trusted_text: bool = False,
         on_recovery: Callable[[str], None] | None = None,
         on_delta: Callable[[str], None] | None = None,
+        creative: bool = False,
     ) -> AskResult:
         context = context or []
         raw_text = raw_text.strip()
@@ -1297,7 +1449,15 @@ class OllamaClient:
         started = time.perf_counter()
         plan = build_answer_plan(normalized)
         prompt = _build_prompt(normalized, plan, answer_context)
-        answer = self._generate_answer_stream(normalized, plan, prompt, on_delta) or "Вопрос нужно уточнить."
+        # Regeneration: bump temperature + random seed so each click yields a fresh variant
+        # rather than the near-deterministic default (temperature ~0.04).
+        regen_options: dict[str, Any] | None = None
+        if creative:
+            regen_options = self._answer_options(plan)
+            regen_options["temperature"] = float(os.getenv("OLLAMA_REGEN_TEMPERATURE", "0.7"))
+            regen_options["top_p"] = 0.95
+            regen_options["seed"] = random.randint(1, 2_000_000_000)
+        answer = self._generate_answer_stream(normalized, plan, prompt, on_delta, options=regen_options) or "Вопрос нужно уточнить."
         if _web_search_enabled() and _answer_is_uncertain(answer):
             answer = self._web_fallback(normalized, plan, answer, on_delta)
         answer_latency = time.perf_counter() - started
@@ -1336,29 +1496,46 @@ class OllamaClient:
             plan_intent=effective_plan.intent,
         )
 
-    def analyze_image(self, image_b64: str, prompt: str | None = None) -> str:
+    def _vision_request(self, image_b64: str, prompt: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """Build the (messages, options) for a vision call, or None if the image is empty."""
         image_b64 = image_b64.strip()
         if image_b64.startswith("data:image"):
             image_b64 = image_b64.split(",", 1)[-1]
         if not image_b64:
-            return "Не удалось получить изображение."
+            return None
+        user_prompt = (prompt or "").strip() or DEFAULT_VISION_USER_PROMPT
+        messages = [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt, "images": [image_b64]},
+        ]
+        options = {
+            "num_ctx": _env_int("OLLAMA_VISION_NUM_CTX", DEFAULT_NUM_CTX),
+            "num_predict": DEFAULT_VISION_NUM_PREDICT,
+            "temperature": 0.05,
+            "top_p": 0.75,
+        }
+        return messages, options
 
-        user_prompt = (prompt or "").strip() or (
-            "Определи, что находится на выделенной области экрана, "
-            "объясни смысл и что важно знать."
-        )
-        answer = self._chat(
-            [
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt, "images": [image_b64]},
-            ],
-            {
-                "num_ctx": _env_int("OLLAMA_VISION_NUM_CTX", DEFAULT_NUM_CTX),
-                "num_predict": DEFAULT_VISION_NUM_PREDICT,
-                "temperature": 0.05,
-                "top_p": 0.75,
-            },
-            timeout=300,
-            model=current_vision_model(),
-        )
+    def analyze_image(self, image_b64: str, prompt: str | None = None) -> str:
+        request = self._vision_request(image_b64, prompt)
+        if request is None:
+            return "Could not read the image."
+        messages, options = request
+        answer = self._chat(messages, options, timeout=300, model=current_vision_model())
+        return _strip_model_noise(answer) or "Не удалось распознать содержимое области."
+
+    def analyze_image_stream(
+        self,
+        image_b64: str,
+        prompt: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
+        *,
+        timeout: int = 300,
+    ) -> str:
+        """Stream a vision answer token-by-token (Ollama). Returns the cleaned full text."""
+        request = self._vision_request(image_b64, prompt)
+        if request is None:
+            return "Could not read the image."
+        messages, options = request
+        answer = self._chat_stream(messages, options, on_delta, timeout=timeout, model=current_vision_model())
         return _strip_model_noise(answer) or "Не удалось распознать содержимое области."

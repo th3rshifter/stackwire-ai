@@ -14,6 +14,7 @@ data/*.db
 data/qdrant/
 data/embed_cache/
 data/credentials.json
+data/*.json
 !docs/
 !docs/knowledge/
 !docs/knowledge/ansible.md
@@ -36,3 +37,4 @@ tests/*
 !tests/test_stt_eval.py
 !tests/test_auth.py
 /gcm-diagnose.log
+.claude/

@@ -1,11 +1,10 @@
 import base64
+import hashlib
 import html
 import json
 import logging
-import math
 import os
 import queue
-import random
 import re
 import sys
 import time
@@ -17,8 +16,9 @@ from typing import Any, cast
 from zipfile import ZipFile
 
 import requests
-from PySide6.QtCore import QByteArray, QBuffer, QEasingCurve, QEvent, QIODevice, QLineF, QObject, QPoint, QPointF, QRect, QSize, QPropertyAnimation, QThread, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QTextCursor, QWheelEvent
+import shiboken6
+from PySide6.QtCore import QBuffer, QEasingCurve, QEvent, QIODevice, QMimeData, QObject, QPoint, QRect, QSize, QPropertyAnimation, QThread, QTimer, QUrl, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QTextCursor, QTextOption, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -30,10 +30,12 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QCheckBox,
     QHBoxLayout,
+    QAbstractButton,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSizeGrip,
     QSizePolicy,
@@ -52,16 +54,39 @@ if str(ROOT_DIR) not in sys.path:
 from app.config import APP_NAME, LOCAL_ENV_FILE, get_stt_settings, is_cuda_whisper_error, load_local_env, update_stt_language_lock, whisper_language, whisper_model_attempts, whisper_vad_parameters  # noqa: E402
 from app.diagrams import is_diagram_language, render_diagram  # noqa: E402
 from app.event_log import append_client_event  # noqa: E402
+from app import chat_sessions  # noqa: E402
 
 load_local_env()
 
 LOGGER = logging.getLogger(__name__)
 
-from app.llm import ANSWER_MODE, DEFAULT_STACKWIRE_MODEL, OLLAMA_URL, AskResult, ExpandResult, OllamaClient, current_answer_model, current_vision_model  # noqa: E402
-from app.question_recovery import RecoveryResult, STACKWIRE_MODE, current_recovery_model  # noqa: E402
+from app.llm import ANSWER_MODE, DEFAULT_STACKWIRE_MODEL, AskResult, ExpandResult, current_answer_model, current_vision_model  # noqa: E402
+from app.modelhub import (  # noqa: E402
+    MODELHUB_RECOMMENDED,
+    ModelHubRefreshWorker,
+    ModelPullWorker,
+    ModelRecommendation,
+    ModelTestWorker,
+    dedupe_models as _dedupe_models,
+    hardware_recommendation_note as _hardware_recommendation_note,
+    hardware_summary as _hardware_summary,
+    installed_ollama_models as _installed_ollama_models,
+    is_vision_model as _is_vision_model,
+    llm_provider as _llm_provider,
+    ollama_base_url as _ollama_base_url,
+    ollama_chat_url as _ollama_chat_url,
+    openai_base_url as _openai_base_url,
+)
+from app.notes import notes_path  # noqa: E402
+from app.question_recovery import STACKWIRE_MODE, current_recovery_model  # noqa: E402
 from app.storage import create_session, log_feedback, save_good_answer  # noqa: E402
 from app.tech_terms import WHISPER_TECHNICAL_PROMPT, normalize_spoken_technical_terms  # noqa: E402
 from app.transcript_repair import clean_stt_output, collapse_repeated_phrases, condense_spoken_question, is_probable_stt_hallucination, repair_live_transcript  # noqa: E402
+from app.ui.actions import MAIN_RAIL_ACTIONS, RailActionSpec  # noqa: E402
+from app.ui.styles import build_window_styles as _build_window_styles  # noqa: E402
+from app.widgets.chat import AssistantRow, ChatArea, NeuralBackground, configure_chat_widgets  # noqa: E402
+from app.widgets.dialogs import ClickableImageLabel, FullImageDialog, NotesDialog, configure_dialog_widgets  # noqa: E402
+from app.workers.chat import AskStreamWorker, ExpandWorker, ImageAnalysisWorker, ImageGenWorker, SuggestionsWorker, configure_chat_workers  # noqa: E402
 
 
 def _env_float_raw(name: str, default: float) -> float:
@@ -88,8 +113,8 @@ STACKWIRE_RAIL_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.10, 0.55, 0.95)
 STACKWIRE_BUBBLE_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.08, 0.55, 0.94)
 
 ACCENT = "#9ad6bd"          # primary mint
-ACCENT2 = "#8ab4f0"         # secondary cool — role, links, selection
-CORAL = "#e8896b"           # warm — active recording indicator
+ACCENT2 = "#8ab4f0"         # secondary cool вЂ" role, links, selection
+CORAL = "#e8896b"           # warm вЂ" active recording indicator
 GOLD = "#a98cff"            # (unused, kept for back-compat)
 BLUE = "#8ab4f0"            # links / selection
 # Layered surfaces: translucent per-widget, so text stays opaque while the app
@@ -104,7 +129,7 @@ RAIL = _rgba(9, 12, 16, STACKWIRE_RAIL_OPACITY)
 TEXT = "#dbeee7"
 MUTED = "#8295a0"
 
-FONT_STACK = '"Space Grotesk", "Manrope", "Segoe UI", Arial, sans-serif'
+FONT_STACK = '"Manrope", "Segoe UI", Arial, sans-serif'
 FONT_DISPLAY = '"Space Grotesk", "Manrope", "Segoe UI", sans-serif'
 FONTS_DIR = ROOT_DIR / "assets" / "fonts"
 MODELS_DIR = ROOT_DIR / "models"
@@ -171,104 +196,73 @@ DEFAULT_MODEL_CHOICES: tuple[str, ...] = (
 )
 
 EXPAND_LABELS: dict[str, str] = {
-    "details": "Расширение: Подробнее",
-    "components": "Расширение: С компонентами",
-    "example": "Расширение: Пример",
-    "compare": "Расширение: Сравнение",
-    "troubleshoot": "Расширение: Troubleshooting",
+    "details": "Р Р°СЃС€РёСЂРµРЅРёРµ: РџРѕРґСЂРѕР±РЅРµРµ",
+    "components": "Р Р°СЃС€РёСЂРµРЅРёРµ: РЎ РєРѕРјРїРѕРЅРµРЅС‚Р°РјРё",
+    "example": "Р Р°СЃС€РёСЂРµРЅРёРµ: РџСЂРёРјРµСЂ",
+    "compare": "Р Р°СЃС€РёСЂРµРЅРёРµ: РЎСЂР°РІРЅРµРЅРёРµ",
+    "troubleshoot": "Р Р°СЃС€РёСЂРµРЅРёРµ: Troubleshooting",
 }
 
 EXPAND_MENU_ITEMS: tuple[tuple[str, str], ...] = (
-    ("details", "Подробнее"),
-    ("components", "С компонентами"),
-    ("example", "С примером кода/конфига"),
-    ("compare", "Сравнить с аналогами"),
+    ("details", "РџРѕРґСЂРѕР±РЅРµРµ"),
+    ("components", "РЎ РєРѕРјРїРѕРЅРµРЅС‚Р°РјРё"),
+    ("example", "РЎ РїСЂРёРјРµСЂРѕРј РєРѕРґР°/РєРѕРЅС„РёРіР°"),
+    ("compare", "РЎСЂР°РІРЅРёС‚СЊ СЃ Р°РЅР°Р»РѕРіР°РјРё"),
     ("troubleshoot", "Troubleshooting"),
 )
 
+# Slash commands typed into the composer. (command, short hint shown in the popup).
+SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/image", "Сгенерировать изображение по описанию"),
+    ("/clear", "Очистить текущий чат"),
+    ("/explain", "Подробно объяснить тему"),
+    ("/code", "Показать рабочий пример кода"),
+    ("/translate", "Перевести текст"),
+)
+
 LIGHTWEIGHT_STT_CORRECTIONS: tuple[tuple[str, str], ...] = (
-    (r"\bдев\s+и\s+прок\b", "/dev и /proc"),
-    (r"\bдев\b", "/dev"),
-    (r"\bпрок\b", "/proc"),
-    (r"\bетс\b", "/etc"),
-    (r"\bвар\s+лог\b", "/var/log"),
+    (r"\bРґРµРІ\s+Рё\s+РїСЂРѕРє\b", "/dev Рё /proc"),
+    (r"\bРґРµРІ\b", "/dev"),
+    (r"\bРїСЂРѕРє\b", "/proc"),
+    (r"\bРµС‚СЃ\b", "/etc"),
+    (r"\bРІР°СЂ\s+Р»РѕРі\b", "/var/log"),
 )
 
 LIVE_FILLER_WORDS = (
-    "окей",
-    "хм",
-    "хмм",
-    "мм",
-    "ммм",
-    "м",
-    "аа",
-    "ааа",
-    "ээ",
-    "эээ",
-    "ладно",
-    "слушай",
-    "смотри",
-    "значит",
-    "короче",
-    "типа",
-    "ну",
-    "вот",
-    "вообще",
-    "пожалуйста",
-    "давай",
-    "давайте",
+    "РѕРєРµР№",
+    "С…Рј",
+    "С…РјРј",
+    "РјРј",
+    "РјРјРј",
+    "Рј",
+    "Р°Р°",
+    "Р°Р°Р°",
+    "СЌСЌ",
+    "СЌСЌСЌ",
+    "Р»Р°РґРЅРѕ",
+    "СЃР»СѓС€Р°Р№",
+    "СЃРјРѕС‚СЂРё",
+    "Р·РЅР°С‡РёС‚",
+    "РєРѕСЂРѕС‡Рµ",
+    "С‚РёРїР°",
+    "РЅСѓ",
+    "РІРѕС‚",
+    "РІРѕРѕР±С‰Рµ",
+    "РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
+    "РґР°РІР°Р№",
+    "РґР°РІР°Р№С‚Рµ",
 )
 
 
-def _dedupe_models(models: list[str] | tuple[str, ...]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for model in models:
-        value = model.strip()
-        if not value or value.lower() in seen:
-            continue
-        seen.add(value.lower())
-        result.append(value)
-    return result
-
-
-def _ollama_tags_url() -> str:
-    if OLLAMA_URL.endswith("/api/chat"):
-        return f"{OLLAMA_URL[:-len('/api/chat')]}/api/tags"
-    return OLLAMA_URL.replace("/api/chat", "/api/tags")
-
-
-def _installed_ollama_models() -> list[str]:
-    session = requests.Session()
-    session.trust_env = False
-    try:
-        response = session.get(_ollama_tags_url(), timeout=1.5)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        return []
-    models = payload.get("models") if isinstance(payload, dict) else []
-    if not isinstance(models, list):
-        return []
-    names = [str(item.get("name", "")).strip() for item in models if isinstance(item, dict)]
-    return _dedupe_models(names)
-
-
 def _model_choices() -> list[str]:
-    return _dedupe_models(
-        [
-            current_answer_model(),
-            current_recovery_model(),
-            current_vision_model(),
-            *_installed_ollama_models(),
-            *DEFAULT_MODEL_CHOICES,
-        ]
-    )
+    # Selection dropdowns must reflect what can actually run now. Recommendations
+    # live in ModelHub cards, not in the active model selectors.
+    return _dedupe_models(_installed_ollama_models())
 
 
 def _save_local_env_values(values: dict[str, str]) -> None:
     existing = LOCAL_ENV_FILE.read_text(encoding="utf-8-sig").splitlines() if LOCAL_ENV_FILE.exists() else []
-    remaining = {key: value.strip() for key, value in values.items() if value.strip()}
+    remaining = {key: value.strip() for key, value in values.items()}
     lines: list[str] = []
     pattern = re.compile(r"^\s*#?\s*([A-Z0-9_]+)\s*=")
     for line in existing:
@@ -286,20 +280,20 @@ def _save_local_env_values(values: dict[str, str]) -> None:
     LOCAL_ENV_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 LIVE_FILLER_PHRASES = (
-    "в общем",
-    "на самом деле",
-    "можешь рассказать",
-    "можешь объяснить",
-    "расскажи пожалуйста",
-    "объясни пожалуйста",
+    "РІ РѕР±С‰РµРј",
+    "РЅР° СЃР°РјРѕРј РґРµР»Рµ",
+    "РјРѕР¶РµС€СЊ СЂР°СЃСЃРєР°Р·Р°С‚СЊ",
+    "РјРѕР¶РµС€СЊ РѕР±СЉСЏСЃРЅРёС‚СЊ",
+    "СЂР°СЃСЃРєР°Р¶Рё РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
+    "РѕР±СЉСЏСЃРЅРё РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
 )
 
 LIVE_TRAILING_NOISE = (
-    "знаешь",
-    "знаешь нет",
-    "понимаешь",
-    "да",
-    "нет",
+    "Р·РЅР°РµС€СЊ",
+    "Р·РЅР°РµС€СЊ РЅРµС‚",
+    "РїРѕРЅРёРјР°РµС€СЊ",
+    "РґР°",
+    "РЅРµС‚",
 )
 
 
@@ -331,8 +325,8 @@ def clean_live_transcript(text: str) -> str:
         cleaned = re.sub(rf"\b{re.escape(phrase)}\b[,\s]*", " ", cleaned, flags=re.IGNORECASE)
     filler_pattern = r"\b(?:" + "|".join(re.escape(word) for word in LIVE_FILLER_WORDS) + r")\b[,\s]*"
     cleaned = re.sub(filler_pattern, " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:а|и)\s+(?=(что|как|чем|когда|почему|зачем|расскажи|объясни)\b)", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:расскажи|рассказать|объясни|объяснить)\s+(?=что такое\b)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:Р°|Рё)\s+(?=(С‡С‚Рѕ|РєР°Рє|С‡РµРј|РєРѕРіРґР°|РїРѕС‡РµРјСѓ|Р·Р°С‡РµРј|СЂР°СЃСЃРєР°Р¶Рё|РѕР±СЉСЏСЃРЅРё)\b)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:СЂР°СЃСЃРєР°Р¶Рё|СЂР°СЃСЃРєР°Р·Р°С‚СЊ|РѕР±СЉСЏСЃРЅРё|РѕР±СЉСЏСЃРЅРёС‚СЊ)\s+(?=С‡С‚Рѕ С‚Р°РєРѕРµ\b)", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;")
 
     for phrase in LIVE_TRAILING_NOISE:
@@ -350,13 +344,13 @@ def clean_live_transcript(text: str) -> str:
 
 
 def _merge_definition_fragments(text: str) -> str:
-    parts = [part.strip(" ,.?") for part in re.split(r"\bчто такое\b", text, flags=re.IGNORECASE)]
+    parts = [part.strip(" ,.?") for part in re.split(r"\bС‡С‚Рѕ С‚Р°РєРѕРµ\b", text, flags=re.IGNORECASE)]
     if len(parts) <= 2:
         return text
 
     terms: list[str] = []
     for part in parts[1:]:
-        part = re.sub(r"\b(?:знаешь|нет|да|пожалуйста)\b", "", part, flags=re.IGNORECASE)
+        part = re.sub(r"\b(?:Р·РЅР°РµС€СЊ|РЅРµС‚|РґР°|РїРѕР¶Р°Р»СѓР№СЃС‚Р°)\b", "", part, flags=re.IGNORECASE)
         part = re.sub(r"\s+", " ", part).strip(" ,.?")
         if part:
             terms.append(part)
@@ -364,31 +358,31 @@ def _merge_definition_fragments(text: str) -> str:
     if not terms:
         return text
     if len(terms) == 1:
-        return f"что такое {terms[0]}"
-    return "что такое " + ", ".join(terms[:-1]) + " и " + terms[-1]
+        return f"С‡С‚Рѕ С‚Р°РєРѕРµ {terms[0]}"
+    return "С‡С‚Рѕ С‚Р°РєРѕРµ " + ", ".join(terms[:-1]) + " Рё " + terms[-1]
 
 
 QUESTION_MARKERS = (
-    "что",
-    "как",
-    "почему",
-    "зачем",
-    "когда",
-    "где",
-    "чем",
-    "какой",
-    "какая",
-    "какие",
-    "объясни",
-    "объяснить",
-    "расскажи",
-    "рассказать",
-    "опиши",
-    "сравни",
-    "разница",
-    "отличается",
-    "диагностировать",
-    "починить",
+    "С‡С‚Рѕ",
+    "РєР°Рє",
+    "РїРѕС‡РµРјСѓ",
+    "Р·Р°С‡РµРј",
+    "РєРѕРіРґР°",
+    "РіРґРµ",
+    "С‡РµРј",
+    "РєР°РєРѕР№",
+    "РєР°РєР°СЏ",
+    "РєР°РєРёРµ",
+    "РѕР±СЉСЏСЃРЅРё",
+    "РѕР±СЉСЏСЃРЅРёС‚СЊ",
+    "СЂР°СЃСЃРєР°Р¶Рё",
+    "СЂР°СЃСЃРєР°Р·Р°С‚СЊ",
+    "РѕРїРёС€Рё",
+    "СЃСЂР°РІРЅРё",
+    "СЂР°Р·РЅРёС†Р°",
+    "РѕС‚Р»РёС‡Р°РµС‚СЃСЏ",
+    "РґРёР°РіРЅРѕСЃС‚РёСЂРѕРІР°С‚СЊ",
+    "РїРѕС‡РёРЅРёС‚СЊ",
     "debug",
     "troubleshoot",
 )
@@ -482,6 +476,23 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
         painter.drawLine(int(s * 0.72), int(s * 0.46), int(s * 0.84), int(s * 0.38))
         painter.drawLine(int(s * 0.28), int(s * 0.62), int(s * 0.16), int(s * 0.72))
         painter.drawLine(int(s * 0.72), int(s * 0.62), int(s * 0.84), int(s * 0.72))
+    elif kind == "diff":
+        painter.drawRoundedRect(int(s * 0.18), int(s * 0.18), int(s * 0.28), int(s * 0.58), int(s * 0.05), int(s * 0.05))
+        painter.drawRoundedRect(int(s * 0.54), int(s * 0.24), int(s * 0.28), int(s * 0.58), int(s * 0.05), int(s * 0.05))
+        painter.drawLine(int(s * 0.26), int(s * 0.36), int(s * 0.38), int(s * 0.36))
+        painter.drawLine(int(s * 0.26), int(s * 0.50), int(s * 0.38), int(s * 0.50))
+        painter.drawLine(int(s * 0.62), int(s * 0.42), int(s * 0.74), int(s * 0.42))
+        painter.drawLine(int(s * 0.62), int(s * 0.56), int(s * 0.74), int(s * 0.56))
+    elif kind == "research":
+        painter.drawEllipse(int(s * 0.20), int(s * 0.20), int(s * 0.44), int(s * 0.44))
+        painter.drawLine(int(s * 0.56), int(s * 0.56), int(s * 0.80), int(s * 0.80))
+        painter.drawLine(int(s * 0.30), int(s * 0.42), int(s * 0.54), int(s * 0.42))
+        painter.drawLine(int(s * 0.42), int(s * 0.30), int(s * 0.42), int(s * 0.54))
+    elif kind == "search":
+        painter.drawEllipse(int(s * 0.20), int(s * 0.20), int(s * 0.44), int(s * 0.44))
+        painter.drawLine(int(s * 0.56), int(s * 0.56), int(s * 0.80), int(s * 0.80))
+        painter.drawLine(int(s * 0.32), int(s * 0.42), int(s * 0.52), int(s * 0.42))
+        painter.drawLine(int(s * 0.42), int(s * 0.32), int(s * 0.42), int(s * 0.52))
     elif kind == "capture":
         painter.drawLine(int(s * 0.18), int(s * 0.34), int(s * 0.18), int(s * 0.18))
         painter.drawLine(int(s * 0.18), int(s * 0.18), int(s * 0.34), int(s * 0.18))
@@ -502,6 +513,33 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
         painter.drawEllipse(int(s * 0.22), int(s * 0.44), int(s * 0.12), int(s * 0.12))
         painter.drawEllipse(int(s * 0.44), int(s * 0.44), int(s * 0.12), int(s * 0.12))
         painter.drawEllipse(int(s * 0.66), int(s * 0.44), int(s * 0.12), int(s * 0.12))
+    elif kind == "menu":
+        painter.drawLine(int(s * 0.22), int(s * 0.30), int(s * 0.78), int(s * 0.30))
+        painter.drawLine(int(s * 0.22), int(s * 0.50), int(s * 0.78), int(s * 0.50))
+        painter.drawLine(int(s * 0.22), int(s * 0.70), int(s * 0.78), int(s * 0.70))
+    elif kind == "collapse":
+        painter.drawLine(int(s * 0.26), int(s * 0.50), int(s * 0.76), int(s * 0.50))
+        painter.drawLine(int(s * 0.26), int(s * 0.50), int(s * 0.48), int(s * 0.30))
+        painter.drawLine(int(s * 0.26), int(s * 0.50), int(s * 0.48), int(s * 0.70))
+    elif kind == "chats":
+        painter.drawRoundedRect(int(s * 0.18), int(s * 0.22), int(s * 0.60), int(s * 0.44), int(s * 0.09), int(s * 0.09))
+        painter.drawLine(int(s * 0.34), int(s * 0.66), int(s * 0.24), int(s * 0.82))
+        painter.drawLine(int(s * 0.34), int(s * 0.66), int(s * 0.48), int(s * 0.66))
+    elif kind == "notes":
+        painter.drawRoundedRect(int(s * 0.24), int(s * 0.16), int(s * 0.52), int(s * 0.68), int(s * 0.06), int(s * 0.06))
+        painter.drawLine(int(s * 0.34), int(s * 0.16), int(s * 0.34), int(s * 0.84))
+        painter.drawLine(int(s * 0.42), int(s * 0.36), int(s * 0.66), int(s * 0.36))
+        painter.drawLine(int(s * 0.42), int(s * 0.50), int(s * 0.66), int(s * 0.50))
+        painter.drawLine(int(s * 0.42), int(s * 0.64), int(s * 0.58), int(s * 0.64))
+    elif kind == "plus":
+        painter.drawLine(int(s * 0.50), int(s * 0.24), int(s * 0.50), int(s * 0.76))
+        painter.drawLine(int(s * 0.24), int(s * 0.50), int(s * 0.76), int(s * 0.50))
+    elif kind == "trash":
+        painter.drawLine(int(s * 0.28), int(s * 0.30), int(s * 0.72), int(s * 0.30))
+        painter.drawLine(int(s * 0.38), int(s * 0.22), int(s * 0.62), int(s * 0.22))
+        painter.drawRoundedRect(int(s * 0.34), int(s * 0.36), int(s * 0.32), int(s * 0.42), int(s * 0.05), int(s * 0.05))
+        painter.drawLine(int(s * 0.44), int(s * 0.44), int(s * 0.44), int(s * 0.70))
+        painter.drawLine(int(s * 0.56), int(s * 0.44), int(s * 0.56), int(s * 0.70))
     elif kind == "settings":
         painter.drawEllipse(int(s * 0.34), int(s * 0.34), int(s * 0.32), int(s * 0.32))
         painter.drawLine(int(s * 0.50), int(s * 0.16), int(s * 0.50), int(s * 0.28))
@@ -536,6 +574,53 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
         painter.drawLine(int(s * 0.38), int(s * 0.40), int(s * 0.62), int(s * 0.40))
         painter.drawLine(int(s * 0.38), int(s * 0.52), int(s * 0.62), int(s * 0.52))
         painter.drawLine(int(s * 0.38), int(s * 0.64), int(s * 0.54), int(s * 0.64))
+    elif kind == "live":
+        # Broadcast / radar: filled centre dot + two concentric arcs
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(int(s * 0.41), int(s * 0.41), int(s * 0.18), int(s * 0.18))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(int(s * 0.29), int(s * 0.29), int(s * 0.42), int(s * 0.42))
+        painter.drawEllipse(int(s * 0.16), int(s * 0.16), int(s * 0.68), int(s * 0.68))
+    elif kind == "image":
+        # Picture frame with mountains + sun
+        painter.drawRoundedRect(int(s * 0.16), int(s * 0.16), int(s * 0.68), int(s * 0.68), int(s * 0.08), int(s * 0.08))
+        # small sun circle top-right
+        painter.drawEllipse(int(s * 0.60), int(s * 0.24), int(s * 0.14), int(s * 0.14))
+        # mountain peak left
+        painter.drawLine(int(s * 0.22), int(s * 0.72), int(s * 0.44), int(s * 0.46))
+        painter.drawLine(int(s * 0.44), int(s * 0.46), int(s * 0.62), int(s * 0.66))
+        # mountain peak right
+        painter.drawLine(int(s * 0.54), int(s * 0.56), int(s * 0.72), int(s * 0.72))
+    elif kind == "vision":
+        painter.drawArc(int(s * 0.18), int(s * 0.30), int(s * 0.64), int(s * 0.40), 25 * 16, 130 * 16)
+        painter.drawArc(int(s * 0.18), int(s * 0.30), int(s * 0.64), int(s * 0.40), 205 * 16, 130 * 16)
+        painter.drawEllipse(int(s * 0.42), int(s * 0.42), int(s * 0.16), int(s * 0.16))
+    elif kind == "stop_gen":
+        # Filled rounded square — stop/interrupt generation
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(int(s * 0.28), int(s * 0.28), int(s * 0.44), int(s * 0.44), int(s * 0.08), int(s * 0.08))
+    elif kind == "regen":
+        # Circular refresh arrow — regenerate / new variant
+        rect = QRect(int(s * 0.24), int(s * 0.24), int(s * 0.52), int(s * 0.52))
+        painter.drawArc(rect, 60 * 16, 280 * 16)
+        # arrowhead at the arc's open end (top-right, ~60°)
+        ax, ay = int(s * 0.70), int(s * 0.30)
+        painter.drawLine(ax, ay, int(s * 0.70), int(s * 0.46))
+        painter.drawLine(ax, ay, int(s * 0.54), int(s * 0.32))
+    elif kind == "mini":
+        # Picture-in-picture: outer frame + small filled inner box (compact chat)
+        painter.drawRoundedRect(int(s * 0.18), int(s * 0.22), int(s * 0.64), int(s * 0.50), int(s * 0.06), int(s * 0.06))
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(int(s * 0.48), int(s * 0.44), int(s * 0.30), int(s * 0.24), int(s * 0.04), int(s * 0.04))
+    elif kind == "mini_exit":
+        # Expand arrows pointing outward (leave mini mode)
+        painter.drawLine(int(s * 0.30), int(s * 0.30), int(s * 0.46), int(s * 0.46))
+        painter.drawLine(int(s * 0.30), int(s * 0.30), int(s * 0.30), int(s * 0.44))
+        painter.drawLine(int(s * 0.30), int(s * 0.30), int(s * 0.44), int(s * 0.30))
+        painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.54), int(s * 0.54))
+        painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.70), int(s * 0.56))
+        painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.56), int(s * 0.70))
 
     painter.end()
     return pixmap
@@ -549,7 +634,7 @@ def pixmap_to_base64_png(pixmap: QPixmap) -> str:
     buffer = QBuffer()
     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
     pixmap.save(buffer, "PNG")
-    return buffer.data().toBase64().data().decode("ascii")
+    return base64.b64encode(bytes(buffer.data().data())).decode("ascii")
 
 
 def thinking_bar_png(phase: int, width: int, height: int) -> str:
@@ -585,7 +670,7 @@ def balance_streaming_markdown(text: str) -> str:
     balance bold and inline code in the trailing outside-code segment (where the
     cursor is), so code that legitimately contains a backtick is never disturbed."""
     segments = text.split("```")
-    inside_open_fence = len(segments) % 2 == 0  # an odd number of ``` ⇒ inside a block
+    inside_open_fence = len(segments) % 2 == 0  # an odd number of ``` в‡’ inside a block
     if inside_open_fence:
         return f"{text}\n```"
     tail = segments[-1]  # text after the last closed fence (plain markdown context)
@@ -648,6 +733,11 @@ strong {{
 .code-body {{
   background: #14171d;
 }}
+.code-foot-cell {{
+  padding: {_px(6)}px {_px(11)}px {_px(8)}px;
+  background: #14171d;
+  text-align: right;
+}}
 .code-lang {{
   color: #9ad6bd;
   font-weight: 700;
@@ -662,6 +752,11 @@ pre {{
   font-size: {_px(14)}px;
   line-height: 1.55;
   white-space: pre-wrap;
+}}
+.code-diagram {{
+  font-size: {_px(12)}px;
+  line-height: 1.35;
+  white-space: pre;
 }}
 .code-comment {{
   color: #7f94b8;
@@ -682,6 +777,29 @@ pre {{
 .code-op {{
   color: #d1d5db;
   font-weight: 800;
+}}
+.md-table {{
+  border-collapse: collapse;
+  width: 100%;
+  margin: {_px(10)}px 0 {_px(14)}px;
+  font-size: {_px(14)}px;
+}}
+.md-table th {{
+  background: rgba(154, 214, 189, 0.10);
+  color: #e4e9f0;
+  font-weight: 700;
+  padding: {_px(6)}px {_px(10)}px;
+  border: 1px solid rgba(154, 214, 189, 0.14);
+  text-align: left;
+}}
+.md-table td {{
+  padding: {_px(5)}px {_px(10)}px;
+  border: 1px solid rgba(154, 214, 189, 0.09);
+  color: #c7d1db;
+  vertical-align: top;
+}}
+.md-table tr:nth-child(even) td {{
+  background: rgba(255, 255, 255, 0.025);
 }}
 </style>
 """
@@ -781,6 +899,11 @@ def build_chat_style() -> str:
 # Raw code per fenced block of the current render, so the in-card copy button works.
 # Cleared at the start of each render_chat pass; ids are stable within one render.
 CODE_SNIPPETS: list[str] = []
+CODE_BLOCK_KEYS: list[str] = []
+EXPANDED_CODE_BLOCKS: set[str] = set()
+CODE_PREVIEW_LINES = 14
+# Generated images cache: id → base64 PNG string (cleared on each render_chat).
+_GENERATED_IMAGES: dict[int, str] = {}
 
 
 def _document_css() -> str:
@@ -793,46 +916,116 @@ def _document_css() -> str:
 _DIAGRAM_RENDER = {"enabled": True}
 
 
+def _code_block_key(language: str, raw_code: str) -> str:
+    payload = f"{language.strip().lower()}\0{raw_code}".encode("utf-8", errors="replace")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def _looks_like_ascii_diagram(raw_code: str) -> bool:
+    lines = [line for line in raw_code.splitlines() if line.strip()]
+    if len(lines) < 6:
+        return False
+    diagram_chars = sum(raw_code.count(char) for char in "+-|<>^v")
+    box_lines = sum(1 for line in lines if re.search(r"[+|][-+| ]{4,}", line))
+    return diagram_chars >= 24 and box_lines >= 2
+
+
+def _is_collapsible_code_block(language: str, raw_code: str) -> bool:
+    lines = raw_code.splitlines()
+    return (
+        len(lines) > CODE_PREVIEW_LINES + 4
+        or len(raw_code) > 1600
+        or _looks_like_ascii_diagram(raw_code)
+        or language.strip().lower() in {"text", "txt"} and len(lines) > 10
+    )
+
+
+def _code_preview(raw_code: str) -> str:
+    lines = raw_code.splitlines()
+    if len(lines) <= CODE_PREVIEW_LINES:
+        return raw_code
+    return "\n".join(lines[:CODE_PREVIEW_LINES])
+
+
+def _code_action_link(kind: str, href: str, *, size: int = 13, color: str = "#8b97a6") -> str:
+    icon = pixmap_to_base64_png(icon_pixmap(kind, _px(size), color))
+    px_size = _px(size)
+    return f"<a href='{href}'><img src='data:image/png;base64,{icon}' width='{px_size}' height='{px_size}' /></a>"
+
+
+def _code_block_html(raw_language: str, raw_code: str) -> str:
+    language = html.escape(raw_language or "code")
+    block_key = _code_block_key(raw_language, raw_code)
+    collapsible = _is_collapsible_code_block(raw_language, raw_code)
+    expanded = not collapsible or block_key in EXPANDED_CODE_BLOCKS
+    display_code = raw_code if expanded else _code_preview(raw_code)
+    code = highlight_code(raw_language, display_code)
+
+    snippet_id = len(CODE_SNIPPETS)
+    CODE_SNIPPETS.append(raw_code)
+    CODE_BLOCK_KEYS.append(block_key)
+
+    copy_link = _code_action_link("copy", f"copycode:{snippet_id}")
+    footer = ""
+    pre_class = "code-diagram" if _looks_like_ascii_diagram(raw_code) else ""
+    if collapsible:
+        icon_kind = "collapse" if expanded else "expand"
+        toggle_link = _code_action_link(icon_kind, f"togglecode:{snippet_id}", size=15)
+        footer = f'<tr><td class="code-foot-cell">{toggle_link}</td></tr>'
+
+    return (
+        f'<table class="code-card" width="100%" cellspacing="0" cellpadding="0">'
+        f'<tr><td class="code-head-cell">'
+        f'<table width="100%" cellspacing="0" cellpadding="0"><tr>'
+        f'<td class="code-lang">{language}</td>'
+        f'<td align="right">{copy_link}</td>'
+        f"</tr></table>"
+        f"</td></tr>"
+        f'<tr><td class="code-body"><pre class="{pre_class}">{code}</pre></td></tr>'
+        f"{footer}"
+        f"</table>"
+    )
+
+
 def markdown_to_html(markdown: str) -> str:
     markdown = normalize_unfenced_code_blocks(markdown)
     parts: list[str] = []
-    pattern = re.compile(r"```([a-zA-Z0-9_.+-]*)\n(.*?)```", re.DOTALL)
+    # Combined pattern: code blocks OR generated_image tags
+    pattern = re.compile(
+        r"```([a-zA-Z0-9_.+-]*)\n(.*?)```"
+        r"|\[\[generated_image:([A-Za-z0-9+/=]+)\]\]",
+        re.DOTALL,
+    )
     cursor = 0
 
     for match in pattern.finditer(markdown):
         parts.append(text_to_html(markdown[cursor : match.start()]))
-        raw_language = match.group(1) or "code"
-        language = html.escape(raw_language)
-        raw_code = match.group(2).strip("\n")
 
-        if _DIAGRAM_RENDER["enabled"] and is_diagram_language(raw_language):
-            diagram_png = render_diagram(raw_language, raw_code)
-            if diagram_png:
-                parts.append(
-                    f'<div class="diagram-card"><img src="data:image/png;base64,{diagram_png}" /></div>'
-                )
-                cursor = match.end()
-                continue
+        if match.group(3) is not None:
+            # Generated image: render as clickable thumbnail
+            b64 = match.group(3)
+            gen_id = len(_GENERATED_IMAGES)
+            _GENERATED_IMAGES[gen_id] = b64
+            img_w = _px(340)
+            safe_src = html.escape(b64, quote=True)
+            parts.append(
+                f"<p><a href='viewimage:{gen_id}'>"
+                f"<img src='data:image/png;base64,{safe_src}' width='{img_w}' /></a></p>"
+            )
+        else:
+            raw_language = match.group(1) or "code"
+            raw_code = match.group(2).strip("\n")
 
-        code = highlight_code(raw_language, raw_code)
-        snippet_id = len(CODE_SNIPPETS)
-        CODE_SNIPPETS.append(raw_code)
-        copy_png = pixmap_to_base64_png(icon_pixmap("copy", _px(13), "#8b97a6"))
-        copy_link = (
-            f"<a href='copycode:{snippet_id}'>"
-            f"<img src='data:image/png;base64,{copy_png}' width='{_px(13)}' height='{_px(13)}' /></a>"
-        )
-        parts.append(
-            f'<table class="code-card" width="100%" cellspacing="0" cellpadding="0">'
-            f'<tr><td class="code-head-cell">'
-            f'<table width="100%" cellspacing="0" cellpadding="0"><tr>'
-            f'<td class="code-lang">{language}</td>'
-            f'<td align="right">{copy_link}</td>'
-            f"</tr></table>"
-            f"</td></tr>"
-            f'<tr><td class="code-body"><pre>{code}</pre></td></tr>'
-            f"</table>"
-        )
+            if _DIAGRAM_RENDER["enabled"] and is_diagram_language(raw_language):
+                diagram_png = render_diagram(raw_language, raw_code)
+                if diagram_png:
+                    parts.append(
+                        f'<div class="diagram-card"><img src="data:image/png;base64,{diagram_png}" /></div>'
+                    )
+                    cursor = match.end()
+                    continue
+
+            parts.append(_code_block_html(raw_language, raw_code))
         cursor = match.end()
 
     parts.append(text_to_html(markdown[cursor:]))
@@ -863,14 +1056,14 @@ CODE_LABEL_LANGUAGES: dict[str, str] = {
 }
 
 SECTION_HEADINGS = {
-    "коротко:",
-    "как работает:",
-    "практика:",
-    "пример:",
-    "нюанс:",
+    "РєРѕСЂРѕС‚РєРѕ:",
+    "РєР°Рє СЂР°Р±РѕС‚Р°РµС‚:",
+    "РїСЂР°РєС‚РёРєР°:",
+    "РїСЂРёРјРµСЂ:",
+    "РЅСЋР°РЅСЃ:",
     "best practices:",
-    "основной ответ:",
-    "подробный ответ:",
+    "РѕСЃРЅРѕРІРЅРѕР№ РѕС‚РІРµС‚:",
+    "РїРѕРґСЂРѕР±РЅС‹Р№ РѕС‚РІРµС‚:",
 }
 
 
@@ -957,7 +1150,7 @@ def _looks_like_code_line(text: str, language: str) -> bool:
 def _looks_like_plain_text(text: str) -> bool:
     if len(text) < 45:
         return False
-    return bool(re.search(r"[а-яА-Я]", text)) and not bool(re.search(r"[{}:=#;/\\[\\]$]", text))
+    return bool(re.search(r"[Р°-СЏРђ-РЇ]", text)) and not bool(re.search(r"[{}:=#;/\\[\\]$]", text))
 
 
 def highlight_code(language: str, code: str) -> str:
@@ -1038,7 +1231,7 @@ def render_message_fragment(markdown: str) -> str:
         bar = thinking_bar_png(phase, _px(200), _px(6))
         return (
             "<div class='thinking'>"
-            "<div class='thinking-label'>Думаю</div>"
+            "<div class='thinking-label'>Thinking</div>"
             f"<img src='data:image/png;base64,{bar}' width='{_px(200)}' height='{_px(6)}' />"
             "</div>"
         )
@@ -1060,7 +1253,7 @@ def render_message_fragment(markdown: str) -> str:
     for screenshot in screenshots:
         safe_src = html.escape(screenshot, quote=True)
         # Compact thumbnail (GPT/Claude style): a plain inline image in a tight
-        # paragraph — no table/card wrapper, so Qt does not add big block spacing
+        # paragraph вЂ" no table/card wrapper, so Qt does not add big block spacing
         # around it. A modest fixed width keeps it a neat preview.
         img_w = _px(240)
         fragments.append(
@@ -1072,10 +1265,59 @@ def render_message_fragment(markdown: str) -> str:
 
 
 def render_user_message_fragment(markdown: str) -> str:
-    # Older sessions stored a "Вопрос N" prefix; strip it so no label/stripe is shown.
-    match = re.match(r"^Вопрос\s+\d+\s*\n\n(.+)$", markdown.strip(), flags=re.DOTALL)
+    # Older sessions stored a "Р’РѕРїСЂРѕСЃ N" prefix; strip it so no label/stripe is shown.
+    match = re.match(r"^Р’РѕРїСЂРѕСЃ\s+\d+\s*\n\n(.+)$", markdown.strip(), flags=re.DOTALL)
     body = match.group(1).strip() if match else markdown
     return render_message_fragment(body)
+
+
+def _table_lines_to_html(raw_lines: list[str]) -> str:
+    """Convert a Markdown table block (already HTML-escaped) to an HTML table."""
+    if len(raw_lines) < 2:
+        return "".join(f"<p>{line}</p>" for line in raw_lines)
+
+    def split_row(line: str) -> list[str]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [cell.strip() for cell in stripped.split("|")]
+
+    # Second row must look like a separator (---, :---, etc.)
+    sep = raw_lines[1].strip()
+    if not re.fullmatch(r"[\s|:\-]+", sep):
+        return "".join(f"<p>{line}</p>" for line in raw_lines)
+
+    headers = split_row(raw_lines[0])
+    th = "".join(f"<th>{_inline_format(c)}</th>" for c in headers)
+    rows_html = f"<thead><tr>{th}</tr></thead>"
+
+    body_rows = []
+    for line in raw_lines[2:]:
+        cells = split_row(line)
+        # Pad or trim to match header count
+        while len(cells) < len(headers):
+            cells.append("")
+        cells = cells[: len(headers)]
+        td = "".join(f"<td>{_inline_format(c)}</td>" for c in cells)
+        body_rows.append(f"<tr>{td}</tr>")
+    if body_rows:
+        rows_html += f"<tbody>{''.join(body_rows)}</tbody>"
+
+    return f'<table class="md-table">{rows_html}</table>'
+
+
+def _inline_format(text: str) -> str:
+    """Apply inline markdown: backtick code, bold, links."""
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(
+        r"(https?://[^\s<]+)",
+        lambda m: f'<a href="{m.group(1)}" style="color:{BLUE};text-decoration:none">{m.group(1)}</a>',
+        text,
+    )
+    return text
 
 
 def text_to_html(text: str) -> str:
@@ -1083,30 +1325,52 @@ def text_to_html(text: str) -> str:
     if not escaped:
         return ""
 
-    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = re.sub(
-        r"(https?://[^\s<]+)",
-        lambda m: f'<a href="{m.group(1)}" style="color:{BLUE};text-decoration:none">{m.group(1)}</a>',
-        escaped,
-    )
     lines = escaped.splitlines()
     out: list[str] = []
     in_list = False
+    in_table = False
+    table_lines: list[str] = []
+
+    def flush_list() -> None:
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    def flush_table() -> None:
+        nonlocal in_table, table_lines
+        if in_table:
+            out.append(_table_lines_to_html(table_lines))
+            table_lines = []
+            in_table = False
 
     for line in lines:
         stripped = line.strip()
+
+        # Blank line — flush open blocks
         if not stripped:
-            if in_list:
-                out.append("</ul>")
-                in_list = False
+            flush_list()
+            flush_table()
             continue
+
+        # Table row detection: starts with | and has at least one more |
+        if stripped.startswith("|") and stripped.count("|") >= 2:
+            flush_list()
+            in_table = True
+            table_lines.append(stripped)
+            continue
+
+        # Non-table line while in table → flush table first
+        if in_table:
+            flush_table()
+
+        formatted = _inline_format(stripped)
 
         if stripped.startswith(("- ", "* ")):
             if not in_list:
                 out.append("<ul>")
                 in_list = True
-            out.append(f"<li>{stripped[2:]}</li>")
+            out.append(f"<li>{_inline_format(stripped[2:])}</li>")
             continue
 
         numbered = re.match(r"^\d+\.\s+(.+)$", stripped)
@@ -1114,40 +1378,115 @@ def text_to_html(text: str) -> str:
             if not in_list:
                 out.append("<ul>")
                 in_list = True
-            out.append(f"<li>{numbered.group(1)}</li>")
+            out.append(f"<li>{_inline_format(numbered.group(1))}</li>")
             continue
 
-        if in_list:
-            out.append("</ul>")
-            in_list = False
+        flush_list()
 
-        if stripped.endswith(":") and len(stripped) < 80:
-            out.append(f"<h2>{stripped}</h2>")
+        if stripped.startswith("## "):
+            out.append(f"<h2>{_inline_format(stripped[3:])}</h2>")
+        elif stripped.startswith("# "):
+            out.append(f"<h2>{_inline_format(stripped[2:])}</h2>")
+        elif stripped.endswith(":") and len(stripped) < 80 and "|" not in stripped:
+            out.append(f"<h2>{formatted}</h2>")
         else:
-            out.append(f"<p>{stripped}</p>")
+            out.append(f"<p>{formatted}</p>")
 
-    if in_list:
-        out.append("</ul>")
+    flush_list()
+    flush_table()
 
     return "".join(out)
 
 
 class PromptEdit(QTextEdit):
     submitted = Signal()
+    image_pasted = Signal(str, str)   # emits (base64 PNG, filename)
+
+    slash_accepted = Signal(str)   # keyboard-accepted slash command, e.g. "/image"
 
     def __init__(self) -> None:
         super().__init__()
+        self._min_height = _px(40)
+        self._max_height = _px(132)
+        self.slash_popup: "SlashPopup | None" = None
+        self.setAcceptRichText(False)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.document().setDocumentMargin(0)
+        self.textChanged.connect(self.sync_height)
         self.keep_arrow_cursor()
+        self.sync_height()
+
+    def set_height_limits(self, minimum: int, maximum: int) -> None:
+        self._min_height = minimum
+        self._max_height = max(minimum, maximum)
+        self.sync_height()
+
+    def sync_height(self) -> None:
+        self.document().setTextWidth(max(1, self.viewport().width()))
+        doc_height = int(self.document().documentLayout().documentSize().height())
+        wanted = max(self._min_height, min(self._max_height, doc_height + _px(18)))
+        if self.height() != wanted:
+            self.setFixedHeight(wanted)
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if wanted >= self._max_height else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        if self.verticalScrollBarPolicy() != policy:
+            self.setVerticalScrollBarPolicy(policy)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.sync_height)
 
     def keep_arrow_cursor(self) -> None:
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        # While the slash-command popup is open, arrows/Tab/Enter drive it.
+        popup = self.slash_popup
+        if popup is not None and popup.isVisible():
+            key = event.key()
+            if key == Qt.Key.Key_Down:
+                popup.move_active(1); event.accept(); return
+            if key == Qt.Key.Key_Up:
+                popup.move_active(-1); event.accept(); return
+            if key == Qt.Key.Key_Escape:
+                popup.hide(); event.accept(); return
+            if key in (Qt.Key.Key_Tab, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                cmd = popup.current_command()
+                if cmd:
+                    self.slash_accepted.emit(cmd)
+                    event.accept(); return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             self.submitted.emit()
             return
         super().keyPressEvent(event)
+
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        """Intercept Ctrl+V: if clipboard has an image, emit image_pasted instead of inserting."""
+        from PySide6.QtGui import QImage
+        # Check file URLs FIRST — Windows copies a file to clipboard with both a URL and image
+        # data; checking URLs first lets us preserve the original filename.
+        if source.hasUrls():
+            for url in source.urls():
+                path = url.toLocalFile()
+                if path and Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
+                    try:
+                        raw = Path(path).read_bytes()
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        self.image_pasted.emit(b64, Path(path).name)
+                        return
+                    except Exception:
+                        pass
+        # Fall back to raw image data (screenshot from Win+Shift+S, PrtSc, etc.)
+        img = source.imageData()
+        if isinstance(img, QImage) and not img.isNull():
+            b64 = pixmap_to_base64_png(QPixmap.fromImage(img))
+            self.image_pasted.emit(b64, "clipboard.png")
+            return
+        super().insertFromMimeData(source)
 
     def enterEvent(self, event) -> None:  # noqa: ANN001
         self.keep_arrow_cursor()
@@ -1159,6 +1498,75 @@ class PromptEdit(QTextEdit):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         event.accept()
+
+
+class SlashPopup(QFrame):
+    """Suggestion popup that lists /slash commands while the user types '/'."""
+
+    command_chosen = Signal(str)  # mouse-clicked command, e.g. "/image"
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("slashPopup")
+        self.setVisible(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # never steal focus from the input
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(_px(6), _px(6), _px(6), _px(6))
+        lay.setSpacing(_px(2))
+        self._rows: list[QPushButton] = []
+        for cmd, hint in SLASH_COMMANDS:
+            btn = QPushButton(f"{cmd}   {hint}")
+            btn.setObjectName("slashRow")
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setProperty("cmd", cmd)
+            btn.clicked.connect(lambda _=False, c=cmd: self.command_chosen.emit(c))
+            lay.addWidget(btn)
+            self._rows.append(btn)
+        self._visible_rows: list[QPushButton] = []
+        self._active = 0
+
+    def update_for(self, text: str) -> bool:
+        """Show rows whose command starts with the typed token. Returns True if shown."""
+        # Only while typing the command token itself (before any space/argument).
+        if not text.startswith("/") or " " in text or "\n" in text:
+            self.hide()
+            return False
+        prefix = text.lower()
+        self._visible_rows = []
+        for btn in self._rows:
+            cmd = str(btn.property("cmd"))
+            match = cmd.startswith(prefix)
+            btn.setVisible(match)
+            if match:
+                self._visible_rows.append(btn)
+        if not self._visible_rows:
+            self.hide()
+            return False
+        self._active = 0
+        self._refresh_highlight()
+        self.adjustSize()
+        self.setVisible(True)
+        self.raise_()
+        return True
+
+    def _refresh_highlight(self) -> None:
+        for i, btn in enumerate(self._visible_rows):
+            btn.setProperty("active", i == self._active)
+            style = btn.style()
+            style.unpolish(btn)
+            style.polish(btn)
+
+    def move_active(self, delta: int) -> None:
+        if not self._visible_rows:
+            return
+        self._active = (self._active + delta) % len(self._visible_rows)
+        self._refresh_highlight()
+
+    def current_command(self) -> str | None:
+        if self._visible_rows and 0 <= self._active < len(self._visible_rows):
+            return str(self._visible_rows[self._active].property("cmd"))
+        return None
 
 
 class NoWheelComboBox(QComboBox):
@@ -1178,7 +1586,7 @@ class LoginDialog(QDialog):
         self.username = ""
         self._mode = "login"  # or "register"
 
-        self.setWindowTitle("Stackwire — вход")
+        self.setWindowTitle("Stackwire - sign in")
         self.setModal(True)
         self.setObjectName("settingsDialog")
         self.setMinimumWidth(_px(420))
@@ -1187,9 +1595,9 @@ class LoginDialog(QDialog):
         layout.setContentsMargins(_px(22), _px(20), _px(22), _px(18))
         layout.setSpacing(_px(12))
 
-        title = QLabel("Вход в Stackwire")
+        title = QLabel("Sign in to Stackwire")
         title.setObjectName("dialogTitle")
-        self._subtitle = QLabel("Войдите в аккаунт, чтобы пользоваться чатом.")
+        self._subtitle = QLabel("Sign in to use chat.")
         self._subtitle.setObjectName("dialogNote")
         self._subtitle.setWordWrap(True)
 
@@ -1199,21 +1607,21 @@ class LoginDialog(QDialog):
 
         self.username_edit = QLineEdit()
         self.username_edit.setObjectName("settingsCombo")
-        self.username_edit.setPlaceholderText("логин")
+        self.username_edit.setPlaceholderText("username")
         self.username_edit.setText(default_username)
         self.password_edit = QLineEdit()
         self.password_edit.setObjectName("settingsCombo")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_edit.setPlaceholderText("пароль")
+        self.password_edit.setPlaceholderText("password")
         self.password_edit.returnPressed.connect(self._submit)
 
         server_label = self._auth_client.auth_base_url()
-        self._server_hint = QLabel(f"Сервер: {server_label}")
+        self._server_hint = QLabel(f"Server: {server_label}")
         self._server_hint.setObjectName("dialogNote")
         self._server_hint.setWordWrap(True)
 
-        form.addRow("Логин", self.username_edit)
-        form.addRow("Пароль", self.password_edit)
+        form.addRow("Username", self.username_edit)
+        form.addRow("Password", self.password_edit)
 
         self._error = QLabel("")
         self._error.setObjectName("dialogError")
@@ -1221,12 +1629,12 @@ class LoginDialog(QDialog):
         self._error.setVisible(False)
 
         actions = QHBoxLayout()
-        self._toggle_button = QPushButton("Создать аккаунт")
+        self._toggle_button = QPushButton("Create account")
         self._toggle_button.setObjectName("ghostButton")
         self._toggle_button.clicked.connect(self._toggle_mode)
         actions.addWidget(self._toggle_button)
         actions.addStretch(1)
-        self._primary = QPushButton("Войти")
+        self._primary = QPushButton("Sign in")
         self._primary.setObjectName("dialogPrimaryButton")
         self._primary.clicked.connect(self._submit)
         actions.addWidget(self._primary)
@@ -1241,13 +1649,13 @@ class LoginDialog(QDialog):
     def _toggle_mode(self) -> None:
         self._mode = "register" if self._mode == "login" else "login"
         if self._mode == "register":
-            self._primary.setText("Зарегистрироваться")
-            self._toggle_button.setText("У меня уже есть аккаунт")
-            self._subtitle.setText("Создайте локальный аккаунт (мин. 6 символов в пароле).")
+            self._primary.setText("Register")
+            self._toggle_button.setText("I already have an account")
+            self._subtitle.setText("Create a local account. Password must be at least 6 characters.")
         else:
-            self._primary.setText("Войти")
-            self._toggle_button.setText("Создать аккаунт")
-            self._subtitle.setText("Войдите в аккаунт, чтобы пользоваться чатом.")
+            self._primary.setText("Sign in")
+            self._toggle_button.setText("Create account")
+            self._subtitle.setText("Sign in to use chat.")
         self._error.setVisible(False)
 
     def _show_error(self, message: str) -> None:
@@ -1258,7 +1666,7 @@ class LoginDialog(QDialog):
         username = self.username_edit.text().strip()
         password = self.password_edit.text()
         if not username or not password:
-            self._show_error("Введите логин и пароль.")
+            self._show_error("Enter username and password.")
             return
         self._primary.setEnabled(False)
         try:
@@ -1279,37 +1687,47 @@ class LoginDialog(QDialog):
         self.accept()
 
 
+
 class SettingsDialog(QDialog):
-    """Detailed, tabbed settings — everything editable from the UI, no env hand-editing."""
+    """Detailed, tabbed settings вЂ" everything editable from the UI, no env hand-editing."""
 
     def __init__(self, parent: QWidget, models: list[str], audio_devices: list[str], current_audio_device: str) -> None:
         super().__init__(parent)
-        self._window = parent
+        # The parent is the main StackWire window, which exposes custom attributes
+        # (authenticated, logout, prompt_login, ...) not on QWidget. Access is guarded
+        # with hasattr/getattr at runtime; type as Any so the checker allows it.
+        self._window: Any = parent
         self.setWindowTitle("Stackwire settings")
         self.setModal(True)
         self.setObjectName("settingsDialog")
-        self.setMinimumWidth(_px(560))
+        self.setMinimumWidth(_px(940))
+        self.setMinimumHeight(_px(690))
+        self._modelhub_threads: list[QThread] = []
+        self._installed_models: set[str] = set(_installed_ollama_models())
+        self._model_cards: dict[str, QFrame] = {}
+        self._modelhub_pull_active = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(_px(18), _px(16), _px(18), _px(16))
         layout.setSpacing(_px(12))
 
-        heading = QLabel("Настройки")
+        heading = QLabel("Settings")
         heading.setObjectName("dialogTitle")
 
         tabs = QTabWidget()
         tabs.setObjectName("settingsTabs")
-        tabs.addTab(self._build_account_tab(), "Аккаунт")
-        tabs.addTab(self._build_models_tab(models), "Модели")
-        tabs.addTab(self._build_speech_tab(audio_devices, current_audio_device), "Речь")
-        tabs.addTab(self._build_knowledge_tab(), "База и поиск")
+        tabs.addTab(self._build_account_tab(), "Account")
+        tabs.addTab(self._build_models_tab(models), "ModelHub")
+        tabs.addTab(self._build_speech_tab(audio_devices, current_audio_device), "Speech")
+        tabs.addTab(self._build_knowledge_tab(), "Knowledge")
+        tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
 
         actions = QHBoxLayout()
         actions.addStretch(1)
-        cancel = QPushButton("Отмена")
+        cancel = QPushButton("Cancel")
         cancel.setObjectName("ghostButton")
         cancel.clicked.connect(self.reject)
-        save = QPushButton("Сохранить")
+        save = QPushButton("Save")
         save.setObjectName("dialogPrimaryButton")
         save.clicked.connect(self.accept)
         actions.addWidget(cancel)
@@ -1318,6 +1736,14 @@ class SettingsDialog(QDialog):
         layout.addWidget(heading)
         layout.addWidget(tabs)
         layout.addLayout(actions)
+        QTimer.singleShot(0, self.refresh_modelhub)
+
+    def done(self, result: int) -> None:
+        if any(thread.isRunning() for thread in getattr(self, "_modelhub_threads", [])):
+            action = "download" if getattr(self, "_modelhub_pull_active", False) else "check/test"
+            self.modelhub_status.setText(f"ModelHub {action} is still running. Wait until it finishes before closing settings.")
+            return
+        super().done(result)
 
     # -- tabs ----------------------------------------------------------- #
     def _form_page(self) -> tuple[QWidget, QFormLayout]:
@@ -1336,10 +1762,10 @@ class SettingsDialog(QDialog):
         username = str(getattr(self._window, "auth_username", "") or "")
         required = bool(getattr(self._window, "auth_required", False))
 
-        status = "не требуется" if not required else (f"вошёл как {username}" if authed else "не выполнен вход")
+        status = "not required" if not required else (f"signed in as {username}" if authed else "not signed in")
         self._account_status = QLabel(status)
         self._account_status.setObjectName("dialogNote")
-        form.addRow("Статус", self._account_status)
+        form.addRow("Status", self._account_status)
 
         self.auth_url_edit = QLineEdit()
         self.auth_url_edit.setObjectName("settingsCombo")
@@ -1347,10 +1773,10 @@ class SettingsDialog(QDialog):
 
         self.auth_url_edit.setText(os.getenv("STACKWIRE_AUTH_URL", "").strip() or auth_client.auth_base_url())
         self.auth_url_edit.setPlaceholderText("http://127.0.0.1:8000")
-        form.addRow("Сервер авторизации", self.auth_url_edit)
+        form.addRow("Auth server", self.auth_url_edit)
 
         buttons = QHBoxLayout()
-        self._login_button = QPushButton("Выйти" if authed else "Войти")
+        self._login_button = QPushButton("Sign out" if authed else "Sign in")
         self._login_button.setObjectName("ghostButton")
         self._login_button.clicked.connect(self._account_action)
         buttons.addWidget(self._login_button)
@@ -1359,7 +1785,7 @@ class SettingsDialog(QDialog):
         holder.setLayout(buttons)
         form.addRow("", holder)
 
-        note = QLabel("Аккаунт нужен один раз — токен запоминается и подставляется автоматически.")
+        note = QLabel("Account state is managed here; the token is cached locally after sign in.")
         note.setObjectName("dialogNote")
         note.setWordWrap(True)
         form.addRow("", note)
@@ -1374,23 +1800,403 @@ class SettingsDialog(QDialog):
             window.prompt_login()
         authed = bool(getattr(window, "authenticated", False))
         username = str(getattr(window, "auth_username", "") or "")
-        self._login_button.setText("Выйти" if authed else "Войти")
-        self._account_status.setText(f"вошёл как {username}" if authed else "не выполнен вход")
+        self._login_button.setText("Sign out" if authed else "Sign in")
+        self._account_status.setText(f"signed in as {username}" if authed else "not signed in")
 
     def _build_models_tab(self, models: list[str]) -> QWidget:
-        page, form = self._form_page()
-        self.answer_model = self._model_combo(models, current_answer_model())
-        self.recovery_model = self._model_combo(models, current_recovery_model())
-        self.vision_model = self._model_combo(models, current_vision_model())
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(_px(6), _px(10), _px(6), _px(6))
+        layout.setSpacing(_px(12))
+
+        model_box = QFrame()
+        model_box.setObjectName("modelHubPanel")
+        model_form = QFormLayout(model_box)
+        model_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        model_form.setHorizontalSpacing(_px(12))
+        model_form.setVerticalSpacing(_px(8))
+        model_form.setContentsMargins(_px(12), _px(10), _px(12), _px(10))
+        installed_models = _dedupe_models(models)
+        installed_vision_models = [model for model in installed_models if _is_vision_model(model)]
+        self.answer_model = self._model_combo(installed_models, current_answer_model())
+        self.recovery_model = self._model_combo(installed_models, current_recovery_model())
+        self.vision_model = self._model_combo(installed_vision_models or installed_models, current_vision_model())
         self.answer_mode = NoWheelComboBox()
         self.answer_mode.setObjectName("settingsCombo")
         self.answer_mode.addItems(["normal", "deep"])
         self.answer_mode.setCurrentText(os.getenv("ANSWER_MODE", os.getenv("STACKWIRE_ANSWER_MODE", "normal")).strip().lower() or "normal")
-        form.addRow("Ответы", self.answer_model)
-        form.addRow("Распознавание вопроса", self.recovery_model)
-        form.addRow("Зрение (скриншоты)", self.vision_model)
-        form.addRow("Режим ответа", self.answer_mode)
+        model_form.addRow("Answer model", self.answer_model)
+        model_form.addRow("Question recovery", self.recovery_model)
+        model_form.addRow("Vision model", self.vision_model)
+        model_form.addRow("Answer mode", self.answer_mode)
+
+        provider_box = QFrame()
+        provider_box.setObjectName("modelHubPanel")
+        provider_form = QFormLayout(provider_box)
+        provider_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        provider_form.setHorizontalSpacing(_px(12))
+        provider_form.setVerticalSpacing(_px(8))
+        provider_form.setContentsMargins(_px(12), _px(10), _px(12), _px(10))
+
+        self.provider_combo = NoWheelComboBox()
+        self.provider_combo.setObjectName("settingsCombo")
+        self.provider_combo.addItems(["ollama", "openai_compatible"])
+        self.provider_combo.setCurrentText(_llm_provider())
+        self.provider_combo.currentTextChanged.connect(lambda _text: self._on_provider_changed(refresh=True))
+
+        self.ollama_endpoint_edit = QLineEdit()
+        self.ollama_endpoint_edit.setObjectName("settingsCombo")
+        self.ollama_endpoint_edit.setText(_ollama_base_url())
+        self.ollama_endpoint_edit.setPlaceholderText("http://127.0.0.1:11434")
+        self.ollama_endpoint_edit.editingFinished.connect(self.refresh_modelhub)
+
+        self.openai_endpoint_edit = QLineEdit()
+        self.openai_endpoint_edit.setObjectName("settingsCombo")
+        self.openai_endpoint_edit.setText(_openai_base_url())
+        self.openai_endpoint_edit.setPlaceholderText("http://127.0.0.1:11434/v1")
+        self.openai_endpoint_edit.editingFinished.connect(self.refresh_modelhub)
+
+        self.openai_key_edit = QLineEdit()
+        self.openai_key_edit.setObjectName("settingsCombo")
+        self.openai_key_edit.setText(os.getenv("STACKWIRE_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip())
+        self.openai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openai_key_edit.setPlaceholderText("optional API key")
+        self.openai_key_edit.editingFinished.connect(self.refresh_modelhub)
+
+        provider_form.addRow("Provider", self.provider_combo)
+        provider_form.addRow("Ollama endpoint", self.ollama_endpoint_edit)
+        provider_form.addRow("OpenAI-compatible", self.openai_endpoint_edit)
+        provider_form.addRow("API key", self.openai_key_edit)
+
+        health_row = QHBoxLayout()
+        self.modelhub_status = QLabel("ModelHub: checking...")
+        self.modelhub_status.setObjectName("dialogNote")
+        self.modelhub_status.setWordWrap(True)
+        self.modelhub_refresh_button = QPushButton("Refresh")
+        self.modelhub_refresh_button.setObjectName("ghostButton")
+        self.modelhub_refresh_button.clicked.connect(self.refresh_modelhub)
+        self.modelhub_test_button = QPushButton("Test prompt")
+        self.modelhub_test_button.setObjectName("ghostButton")
+        self.modelhub_test_button.clicked.connect(lambda: self.test_model(self.answer_model.currentText().strip()))
+        health_row.addWidget(self.modelhub_status, 1)
+        health_row.addWidget(self.modelhub_refresh_button)
+        health_row.addWidget(self.modelhub_test_button)
+        health_holder = QWidget()
+        health_holder.setLayout(health_row)
+
+        self.hardware_label = QLabel(_hardware_summary()[0])
+        self.hardware_label.setObjectName("dialogNote")
+        self.hardware_label.setWordWrap(True)
+
+        self.modelhub_progress = QProgressBar()
+        self.modelhub_progress.setObjectName("modelHubProgress")
+        self.modelhub_progress.setRange(0, 100)
+        self.modelhub_progress.setValue(0)
+        self.modelhub_progress.setVisible(False)
+        self.modelhub_progress_label = QLabel("")
+        self.modelhub_progress_label.setObjectName("dialogNote")
+        self.modelhub_progress_label.setVisible(False)
+
+        self.model_cards_container = QWidget()
+        self.model_cards_container.setObjectName("modelCardsContainer")
+        self.model_cards_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.model_cards_layout = QVBoxLayout(self.model_cards_container)
+        self.model_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.model_cards_layout.setSpacing(_px(8))
+        self.model_cards_layout.addStretch(1)
+        cards_scroll = QScrollArea()
+        cards_scroll.setObjectName("modelHubScroll")
+        cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        cards_scroll.setWidgetResizable(True)
+        cards_scroll.setMinimumHeight(_px(310))
+        cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        cards_scroll.setWidget(self.model_cards_container)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(_px(10))
+        top_row.addWidget(model_box, 1)
+        top_row.addWidget(provider_box, 1)
+        top_holder = QWidget()
+        top_holder.setLayout(top_row)
+
+        layout.addWidget(top_holder)
+        layout.addWidget(health_holder)
+        layout.addWidget(self.hardware_label)
+        layout.addWidget(cards_scroll, 1)
+        layout.addWidget(self.modelhub_progress)
+        layout.addWidget(self.modelhub_progress_label)
+        self._on_provider_changed()
+        self.render_model_cards()
         return page
+
+    def _on_provider_changed(self, *, refresh: bool = False) -> None:
+        provider = self.provider_combo.currentText().strip()
+        is_openai = provider == "openai_compatible"
+        self.ollama_endpoint_edit.setEnabled(not is_openai)
+        self.openai_endpoint_edit.setEnabled(is_openai)
+        self.openai_key_edit.setEnabled(is_openai)
+        if hasattr(self, "modelhub_test_button"):
+            self.modelhub_test_button.setEnabled(True)
+        if hasattr(self, "model_cards_layout"):
+            self.render_model_cards()
+        if refresh and hasattr(self, "modelhub_refresh_button"):
+            QTimer.singleShot(0, self.refresh_modelhub)
+
+    def _run_modelhub_worker(self, worker: QObject) -> None:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        finished_signal = getattr(worker, "finished", None)
+        failed_signal = getattr(worker, "failed", None)
+        if finished_signal is not None:
+            finished_signal.connect(lambda *args, t=thread: t.quit())
+            finished_signal.connect(lambda *args, w=worker: w.deleteLater())
+        if failed_signal is not None:
+            failed_signal.connect(lambda *args, t=thread: t.quit())
+            failed_signal.connect(lambda *args, w=worker: w.deleteLater())
+        thread.finished.connect(lambda t=thread: self._modelhub_threads.remove(t) if t in self._modelhub_threads else None)
+        thread.finished.connect(thread.deleteLater)
+        self._modelhub_threads.append(thread)
+        thread.start()
+
+    def refresh_modelhub(self) -> None:
+        if not hasattr(self, "provider_combo"):
+            return
+        if getattr(self, "_modelhub_pull_active", False):
+            return
+        if hasattr(self, "modelhub_refresh_button") and not self.modelhub_refresh_button.isEnabled():
+            return
+        self.modelhub_refresh_button.setEnabled(False)
+        self.modelhub_status.setText("ModelHub: checking provider and installed models...")
+        worker = ModelHubRefreshWorker(
+            provider=self.provider_combo.currentText().strip(),
+            ollama_endpoint=self.ollama_endpoint_edit.text().strip(),
+            openai_endpoint=self.openai_endpoint_edit.text().strip(),
+            api_key=self.openai_key_edit.text().strip(),
+        )
+        worker.finished.connect(self._on_modelhub_refreshed)
+        worker.failed.connect(self._on_modelhub_failed)
+        self._run_modelhub_worker(worker)
+
+    @Slot(dict)
+    def _on_modelhub_refreshed(self, data: dict) -> None:
+        self.modelhub_refresh_button.setEnabled(True)
+        installed = {model for model in data.get("installed", []) if isinstance(model, str) and model.strip()}
+        self._installed_models = installed
+        version = str(data.get("version", "unknown"))
+        provider = str(data.get("provider", "ollama"))
+        count = len(installed)
+        if provider == "openai_compatible":
+            self.modelhub_status.setText(f"OpenAI-compatible endpoint OK - {count} models")
+        else:
+            self.modelhub_status.setText(f"Ollama OK - version {version} - {count} installed models")
+        self._sync_model_combos(installed)
+        self.render_model_cards()
+
+    @Slot(str)
+    def _on_modelhub_failed(self, message: str) -> None:
+        self.modelhub_refresh_button.setEnabled(True)
+        self.modelhub_status.setText(
+            "ModelHub: provider is unreachable. For local Ollama start it with `ollama serve` "
+            f"or check endpoint. Details: {message}"
+        )
+        self._installed_models = set()
+        self._sync_model_combos(set())
+        self.render_model_cards()
+
+    def _sync_model_combos(self, models: set[str]) -> None:
+        current_values = [self.answer_model.currentText(), self.recovery_model.currentText(), self.vision_model.currentText()]
+        choices = _dedupe_models(sorted(model.strip() for model in models if model.strip()))
+        vision_choices = [model for model in choices if _is_vision_model(model)]
+
+        def selected(current: str, available: list[str]) -> str:
+            current = current.strip()
+            if current in available:
+                return current
+            return available[0] if available else ""
+
+        for combo, current in ((self.answer_model, current_values[0]), (self.recovery_model, current_values[1]), (self.vision_model, current_values[2])):
+            available = vision_choices or choices if combo is self.vision_model else choices
+            next_value = selected(current, available)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(available)
+            combo.setEnabled(bool(available))
+            if next_value:
+                combo.setCurrentText(next_value)
+            combo.blockSignals(False)
+
+    def render_model_cards(self) -> None:
+        if not hasattr(self, "model_cards_layout"):
+            return
+        while self.model_cards_layout.count() > 1:
+            item = self.model_cards_layout.takeAt(0)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._model_cards = {}
+        hardware, ram_gb, vram_gb = _hardware_summary()
+        self.hardware_label.setText(hardware)
+        installed_only = [
+            model
+            for model in sorted(self._installed_models)
+            if model not in {recommendation.name for recommendation in MODELHUB_RECOMMENDED}
+        ]
+        for recommendation in MODELHUB_RECOMMENDED:
+            self.model_cards_layout.insertWidget(self.model_cards_layout.count() - 1, self._make_model_card(recommendation, ram_gb, vram_gb))
+        for model in installed_only:
+            recommendation = ModelRecommendation(model, model, "installed", "custom", "Already installed in provider.", 0)
+            self.model_cards_layout.insertWidget(self.model_cards_layout.count() - 1, self._make_model_card(recommendation, ram_gb, vram_gb))
+        self.model_cards_layout.activate()
+        self.model_cards_container.adjustSize()
+        self.model_cards_container.updateGeometry()
+        self.model_cards_container.update()
+
+    def _make_model_card(self, recommendation: ModelRecommendation, ram_gb: int, vram_gb: int) -> QFrame:
+        installed = recommendation.name in self._installed_models
+        suitability = _hardware_recommendation_note(recommendation, ram_gb, vram_gb)
+        card = QFrame()
+        card.setObjectName("modelCard")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(_px(12), _px(10), _px(12), _px(10))
+        layout.setSpacing(_px(10))
+
+        icon = QLabel()
+        icon.setObjectName("modelIcon")
+        icon.setPixmap(icon_pixmap("mark", _px(24), ACCENT if installed else MUTED))
+
+        text_box = QVBoxLayout()
+        title = QLabel(recommendation.title)
+        title.setObjectName("modelCardTitle")
+        meta = QLabel(f"{recommendation.name} - {recommendation.kind} - {recommendation.size} - {suitability}")
+        meta.setObjectName("dialogNote")
+        meta.setWordWrap(True)
+        note = QLabel(recommendation.note)
+        note.setObjectName("dialogNote")
+        note.setWordWrap(True)
+        text_box.addWidget(title)
+        text_box.addWidget(meta)
+        text_box.addWidget(note)
+
+        status_text = "available" if installed else ("not listed" if self.provider_combo.currentText().strip() == "openai_compatible" else "not installed")
+        status = QLabel(status_text)
+        status.setObjectName("modelState")
+
+        use = QPushButton("Use")
+        use.setObjectName("ghostButton")
+        use.setEnabled(installed)
+        use.clicked.connect(lambda _checked=False, model=recommendation.name: self.use_model(model))
+
+        pull = QPushButton("Pull")
+        pull.setObjectName("ghostButton")
+        pull.setEnabled(not installed and self.provider_combo.currentText().strip() == "ollama")
+        pull.clicked.connect(lambda _checked=False, model=recommendation.name: self.pull_model(model))
+
+        test = QPushButton("Test")
+        test.setObjectName("ghostButton")
+        test.setEnabled(installed)
+        test.clicked.connect(lambda _checked=False, model=recommendation.name: self.test_model(model))
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(status)
+        buttons.addWidget(use)
+        buttons.addWidget(pull)
+        buttons.addWidget(test)
+
+        layout.addWidget(icon)
+        layout.addLayout(text_box, 1)
+        layout.addLayout(buttons)
+        self._model_cards[recommendation.name] = card
+        return card
+
+    def use_model(self, model: str) -> None:
+        if not model:
+            return
+        if _is_vision_model(model):
+            self.vision_model.setCurrentText(model)
+            self.modelhub_status.setText(f"Selected {model} for screenshot/image analysis. Save settings to apply.")
+            return
+        self.answer_model.setCurrentText(model)
+        self.recovery_model.setCurrentText(model)
+        self.modelhub_status.setText(f"Selected {model} for answer and recovery. Save settings to apply.")
+
+    def pull_model(self, model: str) -> None:
+        if not model:
+            return
+        self.modelhub_progress.setVisible(True)
+        self.modelhub_progress_label.setVisible(True)
+        self.modelhub_progress.setRange(0, 100)
+        self.modelhub_progress.setValue(0)
+        self.modelhub_progress_label.setText(f"Pulling {model}...")
+        self._modelhub_pull_active = True
+        self.modelhub_refresh_button.setEnabled(False)
+        worker = ModelPullWorker(model, self.ollama_endpoint_edit.text().strip())
+        worker.progress.connect(self._on_pull_progress)
+        worker.finished.connect(self._on_pull_finished)
+        worker.failed.connect(self._on_pull_failed)
+        self._run_modelhub_worker(worker)
+
+    @Slot(str, str, int, int, str)
+    def _on_pull_progress(self, model: str, status: str, completed: int, total: int, speed: str) -> None:
+        if total > 0:
+            percent = max(0, min(100, int(completed * 100 / total)))
+            self.modelhub_progress.setValue(percent)
+            size = f"{completed / (1024**3):.2f}/{total / (1024**3):.2f} GB"
+            self.modelhub_progress_label.setText(f"{model}: {percent}% - {size}" + (f" - {speed}" if speed else f" - {status}"))
+        else:
+            self.modelhub_progress.setRange(0, 0)
+            self.modelhub_progress_label.setText(f"{model}: {status}")
+
+    @Slot(str)
+    def _on_pull_finished(self, model: str) -> None:
+        self.modelhub_progress.setRange(0, 100)
+        self.modelhub_progress.setValue(100)
+        self.modelhub_progress_label.setText(f"{model}: downloaded. Refreshing installed models...")
+        self._modelhub_pull_active = False
+        self._installed_models.add(model)
+        self.modelhub_refresh_button.setEnabled(True)
+        self.render_model_cards()
+        self.refresh_modelhub()
+
+    @Slot(str, str)
+    def _on_pull_failed(self, model: str, message: str) -> None:
+        self.modelhub_progress.setRange(0, 100)
+        self.modelhub_progress.setValue(0)
+        self.modelhub_progress_label.setText(f"{model}: pull failed - {message}")
+        self._modelhub_pull_active = False
+        self.modelhub_refresh_button.setEnabled(True)
+
+    def test_model(self, model: str) -> None:
+        model = model.strip()
+        if not model:
+            self.modelhub_status.setText("Choose a model before test.")
+            return
+        self.modelhub_test_button.setEnabled(False)
+        self.modelhub_status.setText(f"Testing {model}...")
+        worker = ModelTestWorker(
+            provider=self.provider_combo.currentText().strip(),
+            model=model,
+            ollama_endpoint=self.ollama_endpoint_edit.text().strip(),
+            openai_endpoint=self.openai_endpoint_edit.text().strip(),
+            api_key=self.openai_key_edit.text().strip(),
+        )
+        worker.finished.connect(self._on_test_finished)
+        worker.failed.connect(self._on_test_failed)
+        self._run_modelhub_worker(worker)
+
+    @Slot(str, float, str)
+    def _on_test_finished(self, model: str, latency: float, text: str) -> None:
+        self.modelhub_test_button.setEnabled(True)
+        self.modelhub_status.setText(f"{model}: test OK - {latency * 1000:.0f} ms - output: {text or '-'}")
+
+    @Slot(str, str)
+    def _on_test_failed(self, model: str, message: str) -> None:
+        self.modelhub_test_button.setEnabled(True)
+        self.modelhub_status.setText(f"{model}: test failed - {message}")
 
     def _build_speech_tab(self, devices: list[str], current_device: str) -> QWidget:
         page, form = self._form_page()
@@ -1403,13 +2209,13 @@ class SettingsDialog(QDialog):
         self.beam_size.setObjectName("settingsCombo")
         self.beam_size.addItems(["1", "3", "5", "8"])
         self.beam_size.setCurrentText(os.getenv("WHISPER_BEAM_SIZE", "5").strip() or "5")
-        self.vad_filter = QCheckBox("Фильтр тишины (VAD)")
+        self.vad_filter = QCheckBox("Silence filter (VAD)")
         self.vad_filter.setChecked(os.getenv("WHISPER_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"})
-        form.addRow("Аудио-устройство", self.audio_device)
-        form.addRow("Язык речи", self.language_mode)
-        form.addRow("Точность (beam)", self.beam_size)
+        form.addRow("Audio device", self.audio_device)
+        form.addRow("Speech language", self.language_mode)
+        form.addRow("Beam size", self.beam_size)
         form.addRow("", self.vad_filter)
-        hint = QLabel("Зафиксируйте язык (ru/en), если речь на одном языке — точность выше.")
+        hint = QLabel("Use a fixed language (ru/en) when speech is mostly one language for better accuracy.")
         hint.setObjectName("dialogNote")
         hint.setWordWrap(True)
         form.addRow("", hint)
@@ -1417,9 +2223,9 @@ class SettingsDialog(QDialog):
 
     def _build_knowledge_tab(self) -> QWidget:
         page, form = self._form_page()
-        self.web_search = QCheckBox("Искать в интернете при неуверенности (DuckDuckGo)")
+        self.web_search = QCheckBox("Use web search when the model is unsure (DuckDuckGo)")
         self.web_search.setChecked(os.getenv("STACKWIRE_WEB_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"})
-        self.remember_answers = QCheckBox("Запоминать ответы в локальную базу")
+        self.remember_answers = QCheckBox("Save useful answers to the local knowledge base")
         self.remember_answers.setChecked(os.getenv("STACKWIRE_REMEMBER_ANSWERS", "1").strip().lower() not in {"0", "false", "no", "off"})
         form.addRow("", self.web_search)
         form.addRow("", self.remember_answers)
@@ -1429,17 +2235,17 @@ class SettingsDialog(QDialog):
 
             info = vectorstore.stats()
             if info.get("available"):
-                state = f"Qdrant: {info.get('points', 0)} записей · модель {str(info.get('model','')).split('/')[-1]}"
+                state = f"Qdrant: {info.get('points', 0)} records - model {str(info.get('model','')).split('/')[-1]}"
             else:
-                state = "Векторная база выключена (нет qdrant-client/fastembed)."
+                state = "Vector store is disabled (qdrant-client/fastembed is not installed)."
         except Exception:
-            state = "Векторная база недоступна."
+            state = "Vector store is unavailable."
         self._vector_state = QLabel(state)
         self._vector_state.setObjectName("dialogNote")
         self._vector_state.setWordWrap(True)
-        form.addRow("Локальная база", self._vector_state)
+        form.addRow("Local store", self._vector_state)
 
-        reindex = QPushButton("Переиндексировать знания")
+        reindex = QPushButton("Reindex knowledge")
         reindex.setObjectName("ghostButton")
         reindex.clicked.connect(self._reindex)
         holder = QWidget()
@@ -1456,18 +2262,34 @@ class SettingsDialog(QDialog):
 
             vectorstore.ensure_indexed(force=True)
             info = vectorstore.stats()
-            self._vector_state.setText(f"Готово · {info.get('points', 0)} записей в базе.")
+            self._vector_state.setText(f"Ready - {info.get('points', 0)} records in store.")
         except Exception as exc:  # noqa: BLE001
-            self._vector_state.setText(f"Ошибка переиндексации: {_short_error(exc)}")
+            self._vector_state.setText(f"Reindex failed: {_short_error(exc)}")
+
+    def _build_diagnostics_tab(self) -> QWidget:
+        page, form = self._form_page()
+        self.runtime_debug_panel = QCheckBox("Show runtime diagnostics panel")
+        self.runtime_debug_panel.setChecked(bool(getattr(self._window, "debug_expanded", False)))
+        form.addRow("", self.runtime_debug_panel)
+
+        note = QLabel("This is StackWire's internal panel with STT/recovery/latency diagnostics. The rail Debug button is reserved for answer troubleshooting.")
+        note.setObjectName("dialogNote")
+        note.setWordWrap(True)
+        form.addRow("", note)
+        return page
 
     # -- helpers -------------------------------------------------------- #
     def _model_combo(self, models: list[str], current: str) -> NoWheelComboBox:
         combo = NoWheelComboBox()
         combo.setEditable(False)
         combo.setObjectName("settingsCombo")
-        choices = _dedupe_models([current, *models])
+        choices = _dedupe_models(models)
         combo.addItems(choices)
-        combo.setCurrentText(current)
+        combo.setEnabled(bool(choices))
+        if current in choices:
+            combo.setCurrentText(current)
+        elif choices:
+            combo.setCurrentIndex(0)
         return combo
 
     def _audio_combo(self, devices: list[str], current: str) -> NoWheelComboBox:
@@ -1487,6 +2309,10 @@ class SettingsDialog(QDialog):
             "FAST_RECOVERY_MODEL": recovery,
             "VISION_MODEL": self.vision_model.currentText().strip(),
             "ANSWER_MODE": self.answer_mode.currentText().strip(),
+            "STACKWIRE_LLM_PROVIDER": self.provider_combo.currentText().strip(),
+            "OLLAMA_URL": _ollama_chat_url(self.ollama_endpoint_edit.text().strip()),
+            "STACKWIRE_OPENAI_BASE_URL": _openai_base_url(self.openai_endpoint_edit.text().strip()),
+            "STACKWIRE_OPENAI_API_KEY": self.openai_key_edit.text().strip(),
             "STACKWIRE_AUDIO_DEVICE": self.audio_device.currentText().strip(),
             "STT_LANGUAGE_MODE": self.language_mode.currentText().strip(),
             "WHISPER_BEAM_SIZE": self.beam_size.currentText().strip(),
@@ -1494,6 +2320,7 @@ class SettingsDialog(QDialog):
             "STACKWIRE_WEB_SEARCH": "1" if self.web_search.isChecked() else "0",
             "STACKWIRE_REMEMBER_ANSWERS": "1" if self.remember_answers.isChecked() else "0",
             "STACKWIRE_AUTH_URL": self.auth_url_edit.text().strip(),
+            "STACKWIRE_SHOW_DEBUG_PANEL": "1" if self.runtime_debug_panel.isChecked() else "0",
         }
 
 
@@ -1503,339 +2330,6 @@ class AnswerBrowser(QTextBrowser):
             event.accept()
             return
         super().wheelEvent(event)
-
-
-class NeuralBackground(QWidget):
-    """Animated particle / neural-network backdrop shown on the welcome screen.
-
-    A drifting set of nodes connected by fading lines, plus a sparse dust layer.
-    Painted natively with QPainter, transparent to mouse events, and only ticks
-    while visible so it costs nothing during a conversation.
-    """
-
-    NODE_COUNT = 40
-    DUST_COUNT = 48
-    LINK_DISTANCE = 150.0
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._nodes: list[list[float]] = []  # [x, y, vx, vy]
-        self._dust: list[list[float]] = []  # [x, y, vx, vy, radius]
-        self._w = 0.0
-        self._h = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(16)  # ~60fps for smooth motion
-        self._timer.timeout.connect(self._tick)
-
-    def _seed(self) -> None:
-        w = max(1, self.width())
-        h = max(1, self.height())
-        self._w, self._h = float(w), float(h)
-        self._nodes = [
-            [random.uniform(0, w), random.uniform(0, h), random.uniform(-0.14, 0.14), random.uniform(-0.14, 0.14)]
-            for _ in range(self.NODE_COUNT)
-        ]
-        self._dust = [
-            [random.uniform(0, w), random.uniform(0, h), random.uniform(-0.06, 0.06), random.uniform(-0.10, 0.02), random.uniform(0.6, 1.9)]
-            for _ in range(self.DUST_COUNT)
-        ]
-
-    def start(self) -> None:
-        if not self._nodes:
-            self._seed()
-        if not self._timer.isActive():
-            self._timer.start()
-
-    def stop(self) -> None:
-        self._timer.stop()
-
-    def _tick(self) -> None:
-        w = max(1.0, self._w)
-        h = max(1.0, self._h)
-        for node in self._nodes:
-            node[0] += node[2]
-            node[1] += node[3]
-            if node[0] <= 0 or node[0] >= w:
-                node[2] *= -1
-                node[0] = min(max(node[0], 0.0), w)
-            if node[1] <= 0 or node[1] >= h:
-                node[3] *= -1
-                node[1] = min(max(node[1], 0.0), h)
-        for dust in self._dust:
-            dust[0] = (dust[0] + dust[2]) % (w + 6)
-            dust[1] = (dust[1] + dust[3]) % (h + 6)
-        self.update()
-
-    def resizeEvent(self, event) -> None:  # noqa: ANN001
-        new_w = float(max(1, self.width()))
-        new_h = float(max(1, self.height()))
-        # Rescale existing points instead of reseeding so the field does not
-        # shimmer/jump while the window is being dragged.
-        if self._nodes and self._w > 0 and self._h > 0:
-            sx = new_w / self._w
-            sy = new_h / self._h
-            for node in self._nodes:
-                node[0] *= sx
-                node[1] *= sy
-            for dust in self._dust:
-                dust[0] *= sx
-                dust[1] *= sy
-        self._w, self._h = new_w, new_h
-        super().resizeEvent(event)
-
-    def paintEvent(self, event) -> None:  # noqa: ANN001
-        if not self._nodes:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(154, 214, 189, 22))
-        for dust in self._dust:
-            painter.drawEllipse(QPointF(dust[0], dust[1]), dust[4], dust[4])
-
-        link = self.LINK_DISTANCE
-        for i, a in enumerate(self._nodes):
-            ax, ay = a[0], a[1]
-            for b in self._nodes[i + 1 :]:
-                dx = ax - b[0]
-                dy = ay - b[1]
-                dist2 = dx * dx + dy * dy
-                if dist2 >= link * link:
-                    continue
-                alpha = int(44 * (1.0 - (dist2 ** 0.5) / link))
-                if alpha <= 0:
-                    continue
-                painter.setPen(QPen(QColor(154, 214, 189, alpha), 1.0))
-                painter.drawLine(QLineF(ax, ay, b[0], b[1]))
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(154, 214, 189, 130))
-        for node in self._nodes:
-            painter.drawEllipse(QPointF(node[0], node[1]), 2.2, 2.2)
-        painter.end()
-
-
-class ThinkingDots(QWidget):
-    """Three softly pulsing mint dots shown while the assistant is thinking."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._phase = 0.0
-        self.setFixedHeight(_px(20))
-        self.setMinimumWidth(_px(60))
-        self._timer = QTimer(self)
-        self._timer.setInterval(33)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-
-    def _tick(self) -> None:
-        self._phase += 0.16
-        self.update()
-
-    def stop(self) -> None:
-        self._timer.stop()
-
-    def paintEvent(self, event) -> None:  # noqa: ANN001
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        radius = _px(4)
-        gap = _px(15)
-        cx = radius + _px(2)
-        cy = self.height() / 2
-        for index in range(3):
-            wave = math.sin(self._phase - index * 0.7) * 0.5 + 0.5
-            alpha = int(90 + 150 * wave)
-            scale = 0.65 + 0.5 * wave
-            painter.setBrush(QColor(154, 214, 189, alpha))
-            r = radius * scale
-            painter.drawEllipse(QPointF(cx + index * gap, cy), r, r)
-        painter.end()
-
-
-class ChatMessageBrowser(QTextBrowser):
-    """A per-message rich-text view that auto-sizes to its content height so the
-    outer scroll area (not the browser) does the scrolling."""
-
-    def __init__(self, on_anchor) -> None:  # noqa: ANN001
-        super().__init__()
-        self.setObjectName("msgBrowser")
-        self.setOpenLinks(False)
-        self.setOpenExternalLinks(False)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.viewport().setAutoFillBackground(False)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.anchorClicked.connect(on_anchor)
-
-    def set_html(self, markup: str) -> None:
-        self.setHtml(markup)
-        self._fit()
-
-    def _fit(self) -> None:
-        doc = self.document()
-        doc.setTextWidth(max(1, self.viewport().width()))
-        self.setFixedHeight(int(doc.size().height()) + _px(4))
-
-    def resizeEvent(self, event) -> None:  # noqa: ANN001
-        super().resizeEvent(event)
-        self._fit()
-
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        event.ignore()  # let the outer scroll area handle scrolling
-
-
-class AssistantRow(QWidget):
-    """Assistant message: 'Ассистент' label + content (thinking dots or rich text) + copy."""
-
-    def __init__(self, index: int, on_anchor, on_copy) -> None:  # noqa: ANN001
-        super().__init__()
-        self.index = index
-        self._on_anchor = on_anchor
-        self.browser: ChatMessageBrowser | None = None
-        self.thinking: ThinkingDots | None = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(_px(2), _px(2), _px(2), _px(2))
-        layout.setSpacing(_px(4))
-        # Role line: small brand avatar + "Ассистент".
-        role_row = QHBoxLayout()
-        role_row.setContentsMargins(0, 0, 0, 0)
-        role_row.setSpacing(_px(7))
-        avatar = QLabel()
-        avatar.setPixmap(icon_pixmap("mark", _px(16), ACCENT))
-        role = QLabel("Ассистент")
-        role.setObjectName("roleLabel")
-        role_row.addWidget(avatar)
-        role_row.addWidget(role)
-        role_row.addStretch(1)
-        layout.addLayout(role_row)
-        self._holder = QWidget()
-        self._hl = QVBoxLayout(self._holder)
-        self._hl.setContentsMargins(0, 0, 0, 0)
-        self._hl.setSpacing(0)
-        layout.addWidget(self._holder)
-        self._copy = _flat_icon_button("copy", "Скопировать", lambda: on_copy(self.index))
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.addWidget(self._copy)
-        actions.addStretch(1)
-        self._actions_holder = QWidget()
-        self._actions_holder.setLayout(actions)
-        layout.addWidget(self._actions_holder)
-        self._actions_holder.setVisible(False)
-
-    def _clear_holder(self) -> None:
-        while self._hl.count():
-            item = self._hl.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)  # remove from view immediately (deleteLater is async)
-                widget.deleteLater()
-        self.thinking = None
-        self.browser = None
-
-    def show_thinking(self) -> None:
-        self._clear_holder()
-        self.thinking = ThinkingDots()
-        self._hl.addWidget(self.thinking)
-        self._actions_holder.setVisible(False)
-
-    def show_html(self, markup: str, *, final: bool = False) -> None:
-        if self.browser is None:
-            self._clear_holder()
-            self.browser = ChatMessageBrowser(self._on_anchor)
-            self._hl.addWidget(self.browser)
-        self.browser.set_html(markup)
-        self._actions_holder.setVisible(final)
-
-
-class ChatArea(QWidget):
-    """Modern chat surface: an animated welcome backdrop when empty, and a scrollable
-    column of message-bubble widgets when there is a conversation."""
-
-    def __init__(self, background: QWidget) -> None:
-        super().__init__()
-        self.setObjectName("chatArea")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._background = background
-        background.setParent(self)
-
-        self.welcome = QWidget(self)
-        self.welcome.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        wl = QVBoxLayout(self.welcome)
-        wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        wl.setSpacing(_px(8))
-        logo = QLabel()
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setPixmap(icon_pixmap("mark", _px(56), ACCENT))
-        title = QLabel("Stackwire")
-        title.setObjectName("welcomeTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("Think faster. Work locally.")
-        sub.setObjectName("welcomeSub")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        wl.addWidget(logo)
-        wl.addWidget(title)
-        wl.addWidget(sub)
-
-        self.scroll = QScrollArea(self)
-        self.scroll.setObjectName("chatScroll")
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.container = QWidget()
-        self.container.setObjectName("chatContainer")
-        # Full-width column: assistant rows hug the left, user bubbles hug the right.
-        self.col = QVBoxLayout(self.container)
-        self.col.setContentsMargins(_px(16), _px(12), _px(16), _px(12))
-        self.col.setSpacing(_px(8))
-        self.col.addStretch(1)
-        self.scroll.setWidget(self.container)
-
-        background.lower()
-
-    def resizeEvent(self, event) -> None:  # noqa: ANN001
-        rect = self.rect()
-        self._background.setGeometry(rect)
-        self.welcome.setGeometry(rect)
-        self.scroll.setGeometry(rect)
-        super().resizeEvent(event)
-
-    def add_row(self, widget: QWidget) -> None:
-        # Insert before the trailing stretch so messages stack top-to-bottom.
-        self.col.insertWidget(self.col.count() - 1, widget)
-
-    def clear_rows(self) -> None:
-        while self.col.count() > 1:  # keep the trailing stretch
-            item = self.col.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)  # remove from view immediately (deleteLater is async)
-                widget.deleteLater()
-
-    def show_welcome(self) -> None:
-        self._background.show()
-        self._background.start()
-        self.welcome.show()
-        self.welcome.raise_()
-        self.scroll.hide()
-
-    def show_list(self) -> None:
-        self._background.stop()
-        self._background.hide()
-        self.welcome.hide()
-        self.scroll.show()
-        self.scroll.raise_()
-
-    def scroll_to_bottom(self) -> None:
-        bar = self.scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
 
 
 def _flat_icon_button(kind: str, tooltip: str, on_click) -> QPushButton:  # noqa: ANN001
@@ -1849,6 +2343,10 @@ def _flat_icon_button(kind: str, tooltip: str, on_click) -> QPushButton:  # noqa
     return button
 
 
+configure_chat_widgets(px=_px, icon_pixmap=icon_pixmap, flat_icon_button=_flat_icon_button, accent=ACCENT)
+configure_dialog_widgets(px=_px)
+
+
 def _soft_shadow(widget: QWidget, *, blur: int = 28, dy: int = 8, alpha: int = 130) -> None:
     """Attach a soft drop shadow. NOTE: a widget can hold only one QGraphicsEffect,
     so never combine this with a fade-in opacity effect on the same widget."""
@@ -1859,17 +2357,18 @@ def _soft_shadow(widget: QWidget, *, blur: int = 28, dy: int = 8, alpha: int = 1
     widget.setGraphicsEffect(effect)
 
 
-def _animate_in(widget: QWidget, *, duration: int = 170) -> None:
-    """Fade a freshly added row in (opacity 0→1)."""
+def _animate_in(widget: QWidget, *, duration: int = 130) -> None:
+    """Fade a freshly added row in (opacity 0в†’1)."""
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
     anim = QPropertyAnimation(effect, b"opacity", widget)
     anim.setDuration(duration)
-    anim.setStartValue(0.0)
+    anim.setStartValue(0.45)
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
     # Drop the effect when done so it doesn't keep intercepting paints.
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    # Qt accepts None to clear the effect; cast quiets the over-strict stub.
+    anim.finished.connect(lambda: widget.setGraphicsEffect(cast(QGraphicsOpacityEffect, None)))
     widget._fade_anim = anim  # keep a reference so it isn't GC'd  # type: ignore[attr-defined]
     anim.start()
 
@@ -1917,32 +2416,6 @@ def _rounded_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
     return rounded
 
 
-class ActionPopup(QFrame):
-    def __init__(self, parent: QWidget, items: tuple[tuple[str, str], ...], callback) -> None:  # noqa: ANN001
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self.setObjectName("actionPopup")
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-        for value, label in items:
-            button = QPushButton(label)
-            button.setObjectName("popupButton")
-            button.clicked.connect(lambda _checked=False, selected=value: self._select(callback, selected))
-            layout.addWidget(button)
-
-    def _select(self, callback, value: str) -> None:  # noqa: ANN001
-        self.hide()
-        callback(value)
-
-    def show_below(self, anchor: QWidget) -> None:
-        self.adjustSize()
-        point = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        self.move(point.x(), point.y() + _px(4))
-        self.show()
-        self.raise_()
-
-
 def _request_response_text(exc: RequestException) -> str:
     response = getattr(exc, "response", None)
     if response is None:
@@ -1967,6 +2440,23 @@ def _remote_request_error(prefix: str, api_url: str, exc: RequestException) -> s
         )
 
     if not api_url:
+        if status_code is not None:
+            detail = (response_text or str(exc)).strip()
+            if prefix.lower().startswith("image"):
+                return (
+                    f"{prefix}: local Ollama is running, but rejected the image request "
+                    f"(HTTP {status_code}). Current VISION_MODEL={current_vision_model()}. "
+                    "Use a vision-capable model for screenshots, for example gemma3:4b or qwen2.5vl:7b "
+                    "in Settings > ModelHub. If the model is still loading or stuck, run `ollama ps` "
+                    "and restart/stop the stuck model. "
+                    f"Details: {detail}"
+                )
+            return (
+                f"{prefix}: local Ollama is running, but the chat request failed "
+                f"(HTTP {status_code}). The selected model may be still loading, stuck, too heavy, "
+                "or rejected the request payload. Run `ollama ps`, restart Ollama, or choose a smaller model. "
+                f"Details: {detail}"
+            )
         if "remote end closed connection without response" in error_text or "connection aborted" in error_text:
             return (
                 f"{prefix}: local Ollama accepted the connection but closed the chat request without a response. "
@@ -1988,298 +2478,14 @@ def _remote_request_error(prefix: str, api_url: str, exc: RequestException) -> s
         f"Details: {exc}"
     )
 
-class AskWorker(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
 
-    def __init__(self, raw_text: str, context: list[str], *, trusted_text: bool = False, storage_session_id: int | None = None) -> None:
-        super().__init__()
-        self.raw_text = raw_text
-        self.context = context
-        self.trusted_text = trusted_text
-        self.storage_session_id = storage_session_id
-        self.api_url = STACKWIRE_API_URL
-        self.client = None if self.api_url else OllamaClient(storage_session_id=storage_session_id)
-        self.session = requests.Session()
-        self.session.trust_env = False
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            if self.api_url:
-                self.finished.emit(self._ask_remote())
-                return
-            if self.client is None:
-                raise RuntimeError("Local Ollama client is not initialized")
-            self.finished.emit(self.client.ask(self.raw_text, self.context, trusted_text=self.trusted_text))
-        except RequestException as exc:
-            self.failed.emit(_remote_request_error("Processing request failed", self.api_url, exc))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-    def _ask_remote(self) -> AskResult:
-        payload = json.dumps(
-            {"text": self.raw_text, "context": self.context, "trusted_text": self.trusted_text},
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-        response = self.session.post(
-            f"{self.api_url}/ask",
-            data=payload,
-            headers={"Content-Type": "application/json; charset=utf-8", **_auth_headers()},
-            timeout=(STACKWIRE_API_CONNECT_TIMEOUT, STACKWIRE_API_TIMEOUT),
-        )
-        self._raise_for_status(response, "/ask")
-        data = response.json()
-        recovery_payload = data.get("recovery") or {}
-        technical_entities = recovery_payload.get("technical_entities") or []
-        ambiguities = recovery_payload.get("ambiguities") or []
-        candidate_questions = recovery_payload.get("candidate_questions") or []
-        candidate_details = recovery_payload.get("candidate_details") or []
-        recovery = RecoveryResult(
-            confidence=self._as_float(recovery_payload.get("confidence"), 0.0),
-            recovered_question=str(recovery_payload.get("recovered_question", "")),
-            detected_topic=str(recovery_payload.get("detected_topic", "NEED_CLARIFICATION")),
-            reason=str(recovery_payload.get("reason", "")),
-            technical_entities=[str(item) for item in technical_entities if str(item).strip()],
-            ambiguities=[str(item) for item in ambiguities if str(item).strip()],
-            needs_manual_fix=bool(recovery_payload.get("needs_manual_fix", False)),
-            candidate_questions=[str(item) for item in candidate_questions if str(item).strip()],
-            candidate_quality=str(recovery_payload.get("candidate_quality", "unclear")),
-            candidate_details=[item for item in candidate_details if isinstance(item, dict)],
-        )
-        return AskResult(
-            raw_text=str(data.get("raw_text", self.raw_text)),
-            recovery=recovery,
-            answer=str(data.get("answer", "")),
-            answered=bool(data.get("answered", False)),
-            recovery_latency=self._as_float(data.get("recovery_latency"), 0.0),
-            answer_latency=self._as_float(data.get("answer_latency"), 0.0),
-            total_latency=self._as_float(data.get("total_latency"), 0.0),
-            question_id=self._as_int(data.get("question_id")),
-            answer_id=self._as_int(data.get("answer_id")),
-            plan_domain=str(data.get("plan_domain") or "") or None,
-            plan_intent=str(data.get("plan_intent") or "") or None,
-        )
-
-    def _as_int(self, value: object) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, int | float | str):
-            try:
-                parsed = int(value)
-            except ValueError:
-                return None
-            return parsed if parsed > 0 else None
-        return None
-
-    def _as_float(self, value: object, default: float) -> float:
-        if isinstance(value, int | float | str):
-            try:
-                return float(value)
-            except ValueError:
-                return default
-        return default
-
-    def _raise_for_status(self, response: requests.Response, endpoint: str) -> None:
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = response.text
-            try:
-                payload = response.json()
-                detail = str(payload.get("detail", payload))
-            except ValueError:
-                pass
-            raise RuntimeError(
-                f"Remote API {endpoint} returned {response.status_code}: {detail[:500]}"
-            ) from exc
-
-
-class AskStreamWorker(QObject):
-    """Streams the answer token-by-token from local Ollama; falls back to a single
-    non-streamed response in remote API mode (server has no streaming endpoint)."""
-
-    recovered = Signal(str)
-    delta = Signal(str)
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, raw_text: str, context: list[str], *, trusted_text: bool = False, storage_session_id: int | None = None) -> None:
-        super().__init__()
-        self.raw_text = raw_text
-        self.context = context
-        self.trusted_text = trusted_text
-        self.storage_session_id = storage_session_id
-        self.api_url = STACKWIRE_API_URL
-        self.client = None if self.api_url else OllamaClient(storage_session_id=storage_session_id)
-        self.session = requests.Session()
-        self.session.trust_env = False
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            if self.api_url:
-                remote = AskWorker(self.raw_text, self.context, trusted_text=self.trusted_text, storage_session_id=self.storage_session_id)
-                result = remote._ask_remote()
-                if result.answer:
-                    self.delta.emit(result.answer)
-                self.finished.emit(result)
-                return
-            if self.client is None:
-                raise RuntimeError("Local Ollama client is not initialized")
-            result = self.client.ask_stream(
-                self.raw_text,
-                self.context,
-                trusted_text=self.trusted_text,
-                on_recovery=self.recovered.emit,
-                on_delta=self.delta.emit,
-            )
-            self.finished.emit(result)
-        except RequestException as exc:
-            self.failed.emit(_remote_request_error("Processing request failed", self.api_url, exc))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-
-class ExpandWorker(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, question: str, previous_answer: str, mode: str, storage_session_id: int | None = None) -> None:
-        super().__init__()
-        self.question = question
-        self.previous_answer = previous_answer
-        self.mode = mode
-        self.storage_session_id = storage_session_id
-        self.api_url = STACKWIRE_API_URL
-        self.client = None if self.api_url else OllamaClient(storage_session_id=storage_session_id)
-        self.session = requests.Session()
-        self.session.trust_env = False
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            if self.api_url:
-                self.finished.emit(self._expand_remote())
-                return
-            if self.client is None:
-                raise RuntimeError("Local Ollama client is not initialized")
-            self.finished.emit(self.client.expand(self.question, self.previous_answer, self.mode))
-        except RequestException as exc:
-            self.failed.emit(_remote_request_error("Expand request failed", self.api_url, exc))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-    def _expand_remote(self) -> ExpandResult:
-        payload = {
-            "question": self.question,
-            "previous_answer": self.previous_answer,
-            "mode": self.mode,
-        }
-        response = self.session.post(
-            f"{self.api_url}/expand",
-            json=cast(Any, payload),
-            headers=_auth_headers(),
-            timeout=(STACKWIRE_API_CONNECT_TIMEOUT, STACKWIRE_API_TIMEOUT),
-        )
-        self._raise_for_status(response, "/expand")
-        data = response.json()
-        return ExpandResult(
-            question=self.question,
-            previous_answer=self.previous_answer,
-            answer=str(data.get("answer", "")),
-            mode=str(data.get("mode", self.mode)),
-            latency=self._as_float(data.get("latency"), 0.0),
-            question_id=self._as_int(data.get("question_id")),
-            answer_id=self._as_int(data.get("answer_id")),
-            plan_domain=str(data.get("plan_domain") or "") or None,
-            plan_intent=str(data.get("plan_intent") or "") or None,
-        )
-
-    def _as_int(self, value: object) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, int | float | str):
-            try:
-                parsed = int(value)
-            except ValueError:
-                return None
-            return parsed if parsed > 0 else None
-        return None
-
-    def _as_float(self, value: object, default: float) -> float:
-        if isinstance(value, int | float | str):
-            try:
-                return float(value)
-            except ValueError:
-                return default
-        return default
-
-    def _raise_for_status(self, response: requests.Response, endpoint: str) -> None:
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = response.text
-            try:
-                payload = response.json()
-                detail = str(payload.get("detail", payload))
-            except ValueError:
-                pass
-            raise RuntimeError(
-                f"Remote API {endpoint} returned {response.status_code}: {detail[:500]}"
-            ) from exc
-
-
-class ImageAnalysisWorker(QObject):
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, image_b64: str, prompt: str) -> None:
-        super().__init__()
-        self.image_b64 = image_b64
-        self.prompt = prompt
-        self.api_url = STACKWIRE_API_URL
-        self.client = None if self.api_url else OllamaClient()
-        self.session = requests.Session()
-        self.session.trust_env = False
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            if self.api_url:
-                self.finished.emit(self._analyze_remote())
-                return
-            if self.client is None:
-                raise RuntimeError("Local Ollama client is not initialized")
-            self.finished.emit(self.client.analyze_image(self.image_b64, self.prompt))
-        except RequestException as exc:
-            self.failed.emit(_remote_request_error("Image analysis request failed", self.api_url, exc))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-    def _analyze_remote(self) -> str:
-        payload: dict[str, str] = {"image_b64": self.image_b64, "prompt": self.prompt}
-        response = self.session.post(
-            f"{self.api_url}/analyze-image",
-            json=cast(Any, payload),
-            headers=_auth_headers(),
-            timeout=(STACKWIRE_API_CONNECT_TIMEOUT, STACKWIRE_API_TIMEOUT),
-        )
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = response.text
-            try:
-                payload = response.json()
-                detail = str(payload.get("detail", payload))
-            except ValueError:
-                pass
-            raise RuntimeError(
-                f"Remote API /analyze-image returned {response.status_code}: {detail[:500]}"
-            ) from exc
-        data = response.json()
-        return str(data.get("answer", "")).strip()
+configure_chat_workers(
+    api_url=STACKWIRE_API_URL,
+    api_connect_timeout=STACKWIRE_API_CONNECT_TIMEOUT,
+    api_timeout=STACKWIRE_API_TIMEOUT,
+    auth_headers=_auth_headers,
+    remote_request_error=_remote_request_error,
+)
 
 
 class RegionSelector(QWidget):
@@ -2345,7 +2551,6 @@ class RegionSelector(QWidget):
             self.close()
             return
         self.hide()
-        QApplication.processEvents()
         QTimer.singleShot(120, self._capture_selection)
 
     def paintEvent(self, event) -> None:  # noqa: ANN001
@@ -2362,32 +2567,153 @@ class RegionSelector(QWidget):
         painter.end()
 
     def _capture_selection(self) -> None:
-        rect = self.selection.normalized()
-        screen = QApplication.screenAt(rect.center()) or QApplication.primaryScreen()
-        if screen is None:
+        try:
+            rect = self.selection.normalized()
+            screen = QApplication.screenAt(rect.center()) or QApplication.primaryScreen()
+            if screen is None:
+                self.canceled.emit()
+                self.close()
+                return
+
+            screen_rect = screen.geometry()
+            local_rect = QRect(
+                rect.x() - screen_rect.x(),
+                rect.y() - screen_rect.y(),
+                rect.width(),
+                rect.height(),
+            ).intersected(QRect(0, 0, screen_rect.width(), screen_rect.height()))
+            if local_rect.width() < 12 or local_rect.height() < 12:
+                self.canceled.emit()
+                self.close()
+                return
+
+            # On Windows, prefer the Win32 BitBlt path: Qt's grabWindow(0) can trigger
+            # a C++ crash inside GPU driver code that Python try/except cannot catch.
+            if sys.platform == "win32":
+                pixmap = self._capture_win32_fallback(local_rect, screen_rect)
+                if pixmap is None or pixmap.isNull():
+                    full = screen.grabWindow(0)
+                    pixmap = full.copy(local_rect) if not full.isNull() else None
+            else:
+                full = screen.grabWindow(0)
+                pixmap = full.copy(local_rect) if not full.isNull() else None
+
+            if pixmap is None or pixmap.isNull():
+                LOGGER.warning("screen capture returned null pixmap rect=%s", local_rect)
+                self.canceled.emit()
+                self.close()
+                return
+
+            buffer = QBuffer()
+            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+                LOGGER.warning("screen capture buffer open failed")
+                self.canceled.emit()
+                self.close()
+                return
+            if not pixmap.save(buffer, "PNG"):
+                LOGGER.warning("screen capture pixmap save failed rect=%s", local_rect)
+                self.canceled.emit()
+                self.close()
+                return
+            self.captured.emit(base64.b64encode(bytes(buffer.data().data())).decode("ascii"))
+            self.close()
+        except Exception:
+            LOGGER.exception("screen capture failed")
             self.canceled.emit()
             self.close()
-            return
 
-        screen_rect = screen.geometry()
-        local_rect = QRect(
-            rect.x() - screen_rect.x(),
-            rect.y() - screen_rect.y(),
-            rect.width(),
-            rect.height(),
-        ).intersected(QRect(0, 0, screen_rect.width(), screen_rect.height()))
-        if local_rect.width() < 12 or local_rect.height() < 12:
-            self.canceled.emit()
-            self.close()
-            return
+    def _capture_win32_fallback(self, local_rect: QRect, screen_rect: QRect) -> QPixmap | None:
+        """Win32 BitBlt fallback when QScreen.grabWindow returns null."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
 
-        pixmap = screen.grabWindow(0, local_rect.x(), local_rect.y(), local_rect.width(), local_rect.height())
-        payload = QByteArray()
-        buffer = QBuffer(payload)
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        pixmap.save(buffer, "PNG")
-        self.captured.emit(base64.b64encode(payload.data()).decode("ascii"))
-        self.close()
+            x = screen_rect.x() + local_rect.x()
+            y = screen_rect.y() + local_rect.y()
+            w = local_rect.width()
+            h = local_rect.height()
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            # Must set BOTH restype AND argtypes for handle-bearing functions.
+            # Without argtypes, ctypes cannot marshal the 64-bit c_void_p int back
+            # into the next call's argument slot, causing OverflowError on Win64.
+            _HDC  = ctypes.c_void_p
+            _HWND = ctypes.c_void_p
+            _HBMP = ctypes.c_void_p
+            _INT  = ctypes.c_int
+            _UINT = ctypes.c_uint
+            _LONG = ctypes.c_long
+
+            user32.GetDC.restype = _HDC
+            user32.GetDC.argtypes = [_HWND]
+            user32.ReleaseDC.restype = _INT
+            user32.ReleaseDC.argtypes = [_HWND, _HDC]
+
+            gdi32.CreateCompatibleDC.restype = _HDC
+            gdi32.CreateCompatibleDC.argtypes = [_HDC]
+            gdi32.CreateCompatibleBitmap.restype = _HBMP
+            gdi32.CreateCompatibleBitmap.argtypes = [_HDC, _INT, _INT]
+            gdi32.SelectObject.restype = ctypes.c_void_p
+            gdi32.SelectObject.argtypes = [_HDC, ctypes.c_void_p]
+            gdi32.BitBlt.restype = _INT
+            gdi32.BitBlt.argtypes = [_HDC, _INT, _INT, _INT, _INT, _HDC, _INT, _INT, ctypes.c_uint32]
+            gdi32.GetDIBits.restype = _INT
+            gdi32.GetDIBits.argtypes = [_HDC, _HBMP, _UINT, _UINT, ctypes.c_void_p, ctypes.c_void_p, _UINT]
+            gdi32.DeleteObject.restype = _INT
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteDC.restype = _INT
+            gdi32.DeleteDC.argtypes = [_HDC]
+
+            hdc_screen = user32.GetDC(0)
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+            hbitmap = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+            gdi32.SelectObject(hdc_mem, hbitmap)
+            SRCCOPY = 0x00CC0020
+            gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, SRCCOPY)
+
+            # Read bitmap bits into bytes
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                    ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                    ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                    ("biClrImportant", wt.DWORD),
+                ]
+
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth = w
+            bmi.biHeight = -h  # top-down
+            bmi.biPlanes = 1
+            bmi.biBitCount = 32
+            bmi.biCompression = 0  # BI_RGB
+
+            buf = (ctypes.c_char * (w * h * 4))()
+            gdi32.GetDIBits(hdc_mem, hbitmap, 0, h, buf, ctypes.byref(bmi), 0)
+
+            gdi32.DeleteObject(hbitmap)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(0, hdc_screen)
+
+            from PySide6.QtGui import QImage
+            # GetDIBits BI_RGB 32bpp = bytes B,G,R,0x00 — Format_RGB32 matches this layout
+            # and Qt ignores the high byte, treating the image as fully opaque.
+            # IMPORTANT: keep raw_bytes in a named variable — QImage(bytes(...), ...) creates a
+            # shallow view; the anonymous temporary would be freed immediately after the ctor
+            # returns, leaving the QImage with a dangling pointer → crash in fromImage().
+            raw_bytes = bytes(buf)
+            img = QImage(raw_bytes, w, h, w * 4, QImage.Format.Format_RGB32)
+            pm = QPixmap.fromImage(img)  # deep-copies the pixel data into the QPixmap
+            del img, raw_bytes  # safe to release now
+            return pm if not pm.isNull() else None
+        except Exception:
+            LOGGER.exception("win32 capture fallback failed")
+            return None
 
 
 @dataclass
@@ -2957,7 +3283,7 @@ class SpeechWorker(QObject):
             import sounddevice as sd
             from vosk import KaldiRecognizer, Model
         except ImportError:
-            self.failed.emit("Нет audio-зависимостей. Выполни: python -m pip install -r requirements.txt")
+            self.failed.emit("Audio dependencies are missing. Run: python -m pip install -r requirements.txt")
             self.stopped.emit()
             return
 
@@ -3020,7 +3346,7 @@ class SpeechWorker(QObject):
                     self.final.emit(final_text)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(
-                f"{exc}\n\nВыбери другое устройство. На Windows чаще всего работает WASAPI microphone или System audio WASAPI, а MME часто дает PaError -9999."
+                f"{exc}\n\nSelect another device. On Windows, WASAPI microphone or System audio WASAPI usually works better than MME."
             )
         finally:
             self.stopped.emit()
@@ -3029,7 +3355,7 @@ class SpeechWorker(QObject):
         try:
             import pyaudiowpatch as pyaudio
         except ImportError:
-            self.failed.emit("Для системного звука нужен пакет pyaudiowpatch: python -m pip install pyaudiowpatch")
+            self.failed.emit("System audio capture requires pyaudiowpatch: python -m pip install pyaudiowpatch")
             self.stopped.emit()
             return
 
@@ -3092,7 +3418,7 @@ class SpeechWorker(QObject):
             path = Path(env_path)
             if path.is_dir():
                 return path
-            self.failed.emit(f"VOSK_MODEL_PATH не найден: {path}")
+            self.failed.emit(f"VOSK_MODEL_PATH not found: {path}")
             return None
 
         if DEFAULT_VOSK_MODEL_DIR.is_dir():
@@ -3107,7 +3433,7 @@ class SpeechWorker(QObject):
                 archive.extractall(MODELS_DIR)
             return DEFAULT_VOSK_MODEL_DIR
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"Не удалось скачать Vosk model: {exc}")
+            self.failed.emit(f"Could not download Vosk model: {exc}")
             return None
 
     def _ensure_fallback_model(self) -> Path | None:
@@ -3123,7 +3449,7 @@ class SpeechWorker(QObject):
                 archive.extractall(MODELS_DIR)
             return FALLBACK_VOSK_MODEL_DIR
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"Не удалось скачать fallback Vosk model: {exc}")
+            self.failed.emit(f"Could not download fallback Vosk model: {exc}")
             return None
 
     def _load_vosk_model(self, model_class, model_path: Path):  # noqa: ANN001
@@ -3164,6 +3490,13 @@ class SpeechWorker(QObject):
         return np.clip(data, -32768, 32767).astype(np.int16).tobytes()
 
 class OverlayWindow(QMainWindow):
+    chats_button: QPushButton
+    notes_button: QPushButton
+    capture_button: QPushButton
+    diff_button: QPushButton
+    search_button: QPushButton
+    debug_button: QPushButton
+
     def __init__(self) -> None:
         super().__init__()
         self.ask_thread: QThread | None = None
@@ -3176,11 +3509,25 @@ class OverlayWindow(QMainWindow):
         self._typing_phase = 0
         self._stream_anchor = 0
         self._stream_prefix_snippets = 0
+        self._stream_generation = 0
+        self._active_stream_generation = 0
+        self._ask_threads: list[QThread] = []
+        self._generating = False          # True while LLM is producing tokens
         self.typing_timer = QTimer(self)
         self.typing_timer.setInterval(60)
         self.typing_timer.timeout.connect(self._tick_typing)
+        # Follow-up suggestions state
+        self._suggestions_thread: QThread | None = None
+        self._suggestions_worker: "SuggestionsWorker | None" = None
+        self._suggestions_generation = 0
         self.image_thread: QThread | None = None
         self.image_worker: ImageAnalysisWorker | None = None
+        self._image_generation = 0
+        self._active_image_generation = 0
+        self.imagegen_thread: QThread | None = None
+        self.imagegen_worker: ImageGenWorker | None = None
+        self._imagegen_generation = 0
+        self._active_imagegen_generation = 0
         self.region_selector: RegionSelector | None = None
         self.speech_thread: QThread | None = None
         self.speech_worker: SpeechWorker | None = None
@@ -3198,13 +3545,20 @@ class OverlayWindow(QMainWindow):
         self.last_question_candidate = ""
         self.pending_capture_b64 = ""
         self.pending_attachment: dict[str, str] | None = None
+        # Multi-turn vision: the last analyzed screenshot stays pinned so follow-up
+        # text questions can ask about the SAME image without re-capturing.
+        self._vision_context_b64 = ""
+        self._last_vision_b64 = ""
         self.visibility_hotkey_down = False
         self.record_hotkey_down = False
         self.submit_after_speech_stop = False
         self.speech_input_locked = False
-        self.debug_expanded = False
+        self.live_mode = False          # continuous listen→answer→listen loop
+        self.debug_expanded = os.getenv("STACKWIRE_SHOW_DEBUG_PANEL", "0").strip().lower() in {"1", "true", "yes", "on"}
         self._first_show_done = False
         self._fade_animation: QPropertyAnimation | None = None
+        self._modal_overlay: QWidget | None = None
+        self._modal_dialog: QDialog | None = None
         # Authentication state (server account). Token cached locally between launches.
         self.auth_required = STACKWIRE_REQUIRE_AUTH
         self.auth_username: str = ""
@@ -3218,7 +3572,10 @@ class OverlayWindow(QMainWindow):
         )
         default_zoom = 0.86 if self.compact_screen else 1.0
         self.ui_zoom = self._clamp_zoom(_env_float("STACKWIRE_UI_SCALE", default_zoom))
-        self.chat_messages: list[tuple[str, str]] = []
+        self.rail_expanded = os.getenv("STACKWIRE_RAIL_EXPANDED", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.chats_panel_visible = False
+        self.chat_session_id = chat_sessions.current_session_id()
+        self.chat_messages: list[tuple[str, str]] = chat_sessions.load_session(self.chat_session_id) if self.chat_session_id else []
         self.last_answer_question = ""
         self.last_answer_text = ""
         self.last_main_answer_text = ""
@@ -3235,6 +3592,11 @@ class OverlayWindow(QMainWindow):
         self.auto_ask_timer.setSingleShot(True)
         self.auto_ask_timer.setInterval(2200)
         self.auto_ask_timer.timeout.connect(self.refresh_question_candidate)
+        # Live-mode timer: fires ~1.2 s after the last speech fragment to auto-submit
+        self.live_submit_timer = QTimer(self)
+        self.live_submit_timer.setSingleShot(True)
+        self.live_submit_timer.setInterval(1200)
+        self.live_submit_timer.timeout.connect(self._live_auto_submit)
         self.global_hotkey_timer = QTimer(self)
         self.global_hotkey_timer.setInterval(120)
         self.global_hotkey_timer.timeout.connect(self.poll_global_hotkeys)
@@ -3298,12 +3660,12 @@ class OverlayWindow(QMainWindow):
             self.authenticated = True
             set_auth_token(dialog.token)
             if hasattr(self, "status"):
-                self.status.setText(f"Вы вошли как {dialog.username}")
+                self.status.setText(f"Signed in as {dialog.username}")
             self.update_account_chip()
             self.render_chat()
             return True
         if hasattr(self, "status"):
-            self.status.setText("Вход не выполнен — чат недоступен.")
+            self.status.setText("Sign in canceled")
         return False
 
     def _require_login(self) -> bool:
@@ -3322,7 +3684,7 @@ class OverlayWindow(QMainWindow):
         self.authenticated = not self.auth_required
         self.update_account_chip()
         if self.auth_required:
-            self.status.setText("Вы вышли из аккаунта.")
+            self.status.setText("Signed out")
             QTimer.singleShot(150, self.prompt_login)
 
     def update_account_chip(self) -> None:
@@ -3332,9 +3694,10 @@ class OverlayWindow(QMainWindow):
         if self.authenticated and self.auth_username:
             chip.setText(self.auth_username)
         elif self.auth_required:
-            chip.setText("гость")
+            chip.setText("guest")
         else:
             chip.setText("")
+        chip.setVisible(False)
 
     def _warm_vector_store(self) -> None:
         try:
@@ -3404,6 +3767,13 @@ class OverlayWindow(QMainWindow):
             self.expand_thread = None
             self.expand_worker = None
 
+        suggestions_thread = self._suggestions_thread
+        if not self._shutdown_thread(suggestions_thread, "suggestions", timeout_ms=1_000):
+            shutdown_pending = True
+        else:
+            self._suggestions_thread = None
+            self._suggestions_worker = None
+
         image_thread = self.image_thread
         if self.image_worker:
             try:
@@ -3417,6 +3787,18 @@ class OverlayWindow(QMainWindow):
         else:
             self.image_thread = None
             self.image_worker = None
+
+        imagegen_thread = self.imagegen_thread
+        if self.imagegen_worker:
+            try:
+                self.imagegen_worker.session.close()
+            except RuntimeError:
+                pass
+        if not self._shutdown_thread(imagegen_thread, "imagegen", timeout_ms=5_000):
+            shutdown_pending = True
+        else:
+            self.imagegen_thread = None
+            self.imagegen_worker = None
 
         if shutdown_pending:
             self._close_retry_count += 1
@@ -3488,7 +3870,271 @@ class OverlayWindow(QMainWindow):
             return False
         except RuntimeError:
             return True
-        
+
+    def _make_rail_button(self, kind: str, label: str, tooltip: str, handler, *, checkable: bool = False) -> QPushButton:  # noqa: ANN001
+        button = QPushButton(label if self.rail_expanded else "")
+        button.setObjectName("railButton")
+        button.setProperty("kind", kind)
+        button.setProperty("label", label)
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setCheckable(checkable)
+        button.clicked.connect(handler)
+        return button
+
+    def _rail_action_handler(self, spec: RailActionSpec):  # noqa: ANN001
+        handler = getattr(self, spec.handler)
+        if spec.expand_mode:
+            return lambda _checked=False, mode=spec.expand_mode: handler(mode)
+        return handler
+
+    def _schedule_chat_sessions_refresh(self) -> None:
+        if hasattr(self, "chat_sessions_layout"):
+            QTimer.singleShot(0, self.refresh_chat_sessions)
+
+    def _persist_current_chat(self, *, refresh: bool = False) -> None:
+        try:
+            if not self.chat_session_id and not self.chat_messages:
+                return
+            was_draft = not self.chat_session_id
+            self.chat_session_id = chat_sessions.save_session(self.chat_session_id, self.chat_messages)
+            if refresh or was_draft:
+                self._schedule_chat_sessions_refresh()
+        except Exception:
+            LOGGER.debug("chat session save failed", exc_info=True)
+
+    def new_chat_session(self) -> None:
+        self._stop_streaming(discard_generation=True)
+        self._hide_suggestions()
+        if not self.chat_messages and not self.input.toPlainText().strip() and not self.chat_session_id:
+            self.input.setFocus()
+            self.status.setText("New chat draft")
+            return
+        self.chat_session_id = ""
+        chat_sessions.set_current_session("")
+        self.chat_messages = []
+        self.input.clear()
+        self.clear_attachment()  # drop any staged screenshot / pinned vision context
+        self.last_answer_question = ""
+        self.last_answer_text = ""
+        self.last_main_answer_text = ""
+        self.last_answer_id = None
+        self.render_chat()
+        self._schedule_chat_sessions_refresh()
+        self.input.setFocus()
+        self.status.setText("New chat draft")
+
+    def open_chat_session(self, session_id: str) -> None:
+        if not session_id or session_id == self.chat_session_id:
+            return
+        self._stop_streaming(discard_generation=True)
+        self.chat_session_id = session_id
+        chat_sessions.set_current_session(session_id)
+        self.chat_messages = chat_sessions.load_session(session_id)
+        self.input.clear()
+        self.clear_attachment()  # drop any staged screenshot / pinned vision context
+        self.render_chat(focus_latest_assistant=True)
+        self._schedule_chat_sessions_refresh()
+        self.status.setText("Chat opened")
+
+    def show_delete_chat_confirm(self, session_id: str, title: str) -> None:
+        dialog = QDialog(self)
+        dialog.setObjectName("deleteChatDialog")
+        dialog.setWindowTitle("Delete chat")
+        dialog.setMinimumWidth(_px(420))
+        dialog.setMaximumWidth(_px(500))
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(_px(18), _px(16), _px(18), _px(16))
+        layout.setSpacing(_px(11))
+
+        heading = QLabel("Delete chat?")
+        heading.setObjectName("deleteChatTitle")
+        message = QLabel(f"This will delete: <b>{html.escape(title or 'New chat')}</b>")
+        message.setObjectName("deleteChatText")
+        message.setTextFormat(Qt.TextFormat.RichText)
+        message.setWordWrap(True)
+        note = QLabel("Cannot be undone.")
+        note.setObjectName("deleteChatNote")
+        note.setWordWrap(True)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("deleteCancelButton")
+        delete = QPushButton("Delete")
+        delete.setObjectName("deleteDangerButton")
+        cancel.clicked.connect(dialog.reject)
+        delete.clicked.connect(dialog.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(delete)
+
+        layout.addWidget(heading)
+        layout.addWidget(message)
+        layout.addWidget(note)
+        layout.addLayout(actions)
+        self._show_embedded_dialog(dialog, on_accept=lambda _dialog: self._delete_chat_session_confirmed(session_id))
+
+    def delete_chat_session(self, session_id: str, title: str = "") -> None:
+        if not session_id:
+            return
+        resolved_title = title or next((item.title for item in chat_sessions.list_sessions() if item.id == session_id), "New chat")
+        self.show_delete_chat_confirm(session_id, resolved_title)
+
+    def _delete_chat_session_confirmed(self, session_id: str) -> None:
+        self._stop_streaming(discard_generation=True)
+        next_id = chat_sessions.delete_session(session_id)
+        if session_id == self.chat_session_id:
+            self.chat_session_id = next_id
+            self.chat_messages = chat_sessions.load_session(self.chat_session_id) if self.chat_session_id else []
+            self.render_chat(focus_latest_assistant=True)
+        self._schedule_chat_sessions_refresh()
+        self.status.setText("Chat deleted")
+
+    def refresh_chat_sessions(self) -> None:
+        if not hasattr(self, "chat_sessions_layout"):
+            return
+        while self.chat_sessions_layout.count() > 1:
+            item = self.chat_sessions_layout.takeAt(0)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        summaries = chat_sessions.list_sessions()
+        for summary in summaries:
+            self.chat_sessions_layout.insertWidget(self.chat_sessions_layout.count() - 1, self._make_chat_session_row(summary))
+        self.chat_sessions_layout.activate()
+        self.chat_sessions_container.updateGeometry()
+        self.chat_sessions_container.update()
+
+    def rename_chat_session(self, session_id: str, current_title: str) -> None:
+        dialog = QDialog(self)
+        dialog.setObjectName("inlineFormDialog")
+        dialog.setWindowTitle("Rename chat")
+        dialog.setMinimumWidth(_px(420))
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(_px(20), _px(18), _px(20), _px(18))
+        layout.setSpacing(_px(12))
+        title = QLabel("Rename chat")
+        title.setObjectName("dialogTitle")
+        field = QLineEdit()
+        field.setObjectName("settingsCombo")
+        field.setText(current_title)
+        field.selectAll()
+        field.returnPressed.connect(dialog.accept)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("ghostButton")
+        save = QPushButton("Save")
+        save.setObjectName("dialogPrimaryButton")
+        cancel.clicked.connect(dialog.reject)
+        save.clicked.connect(dialog.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addWidget(title)
+        layout.addWidget(field)
+        layout.addLayout(actions)
+
+        def apply_rename(_dialog: QDialog) -> None:
+            clean_title = " ".join(field.text().strip().split())
+            if clean_title and chat_sessions.rename_session(session_id, clean_title):
+                self.refresh_chat_sessions()
+                self.status.setText("Chat renamed")
+
+        self._show_embedded_dialog(dialog, on_accept=apply_rename)
+        field.setFocus()
+
+    def _make_chat_session_row(self, summary: chat_sessions.ChatSessionSummary) -> QFrame:
+        row = QFrame()
+        row.setObjectName("chatSessionItem")
+        row.setProperty("active", summary.id == self.chat_session_id)
+        row.setMinimumHeight(_px(46))
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 7, 6, 7)
+        layout.setSpacing(6)
+        title = summary.title.strip() or "New chat"
+        open_button = QPushButton()
+        open_button.setObjectName("chatSessionButton")
+        open_button.setMinimumWidth(0)
+        open_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        open_button.setText(open_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, _px(160)))
+        open_button.setToolTip(title)
+        open_button.clicked.connect(lambda _checked=False, session_id=summary.id: self.open_chat_session(session_id))
+        rename_button = QPushButton()
+        rename_button.setObjectName("chatRenameButton")
+        rename_button.setToolTip("Rename chat")
+        rename_button.setIcon(make_icon("edit", _px(13), "#8290a0"))
+        rename_button.setIconSize(QSize(_px(13), _px(13)))
+        rename_button.setFixedSize(_px(28), _px(28))
+        rename_button.clicked.connect(lambda _checked=False, session_id=summary.id, title=summary.title: self.rename_chat_session(session_id, title))
+        delete_button = QPushButton()
+        delete_button.setObjectName("chatDeleteButton")
+        delete_button.setToolTip("Delete chat")
+        delete_button.setIcon(make_icon("trash", _px(13), "#8290a0"))
+        delete_button.setIconSize(QSize(_px(13), _px(13)))
+        delete_button.setFixedSize(_px(28), _px(28))
+        delete_button.clicked.connect(lambda _checked=False, session_id=summary.id, title=summary.title: self.delete_chat_session(session_id, title))
+        layout.addWidget(open_button, 1)
+        layout.addWidget(rename_button, 0)
+        layout.addWidget(delete_button, 0)
+        return row
+
+    def toggle_chats_panel(self) -> None:
+        self.chats_panel_visible = not self.chats_panel_visible
+        self.chat_panel.setVisible(self.chats_panel_visible)
+        self.chats_button.setChecked(self.chats_panel_visible)
+        if self.chats_panel_visible:
+            self.refresh_chat_sessions()
+        self.apply_icons()
+
+    def toggle_rail_expanded(self) -> None:
+        self.rail_expanded = not self.rail_expanded
+        os.environ["STACKWIRE_RAIL_EXPANDED"] = "1" if self.rail_expanded else "0"
+        try:
+            _save_local_env_values({"STACKWIRE_RAIL_EXPANDED": os.environ["STACKWIRE_RAIL_EXPANDED"]})
+        except Exception:
+            LOGGER.debug("rail state save failed", exc_info=True)
+        self.apply_ui_zoom()
+
+    def toggle_mini_mode(self) -> None:
+        """Compact mode: hide the sidebar + chats panel, leaving just the chat + composer
+        (type or use voice). Toggle again to restore the full layout."""
+        self._mini_mode = not getattr(self, "_mini_mode", False)
+        mini = self._mini_mode
+        self.rail.setVisible(not mini)
+        # Round all four corners of the content panel — in full mode the left corners are
+        # squared because the rail/chat-panel sit against them; in mini mode content is alone.
+        self.content.setProperty("mini", "true" if mini else "false")
+        style = self.content.style()
+        style.unpolish(self.content)
+        style.polish(self.content)
+        # The shell's dark drop-shadow gets clipped at the window edge and pools as black
+        # blobs in the rounded corners when the window is small — turn it off in mini mode.
+        if getattr(self, "_shell_shadow", None) is not None:
+            self._shell_shadow.setEnabled(not mini)
+        if mini:
+            self._normal_geometry = self.geometry()
+            self.chat_panel.setVisible(False)
+            # Hard-cap the width so the window genuinely shrinks (children just wrap),
+            # regardless of any wide message bubble's minimum-size hint.
+            compact_w, compact_h = _px(1230), _px(600)
+            self.setMinimumSize(0, 0)
+            self.setMaximumWidth(compact_w)
+            self.resize(compact_w, compact_h)
+        else:
+            self.setMaximumWidth(16_777_215)  # QWIDGETSIZE_MAX — lift the cap
+            self.chat_panel.setVisible(self.chats_panel_visible)
+            geo = getattr(self, "_normal_geometry", None)
+            if geo is not None:
+                self.setGeometry(geo)
+        self.mini_button.setToolTip("Выйти из mini mode" if mini else "Mini mode (компактный чат)")
+        self.apply_icons()
+        self.status.setText("Mini mode" if mini else "Ready")
+
     def _build_ui(self) -> None:
         root = QWidget()
         root.setObjectName("root")
@@ -3504,6 +4150,7 @@ class OverlayWindow(QMainWindow):
         shadow.setOffset(0, 8)
         shadow.setColor(QColor(0, 0, 0, 210))
         shell.setGraphicsEffect(shadow)
+        self._shell_shadow = shadow  # toggled off in mini mode (its dark halo pools in the rounded corners)
         shell_layout = QHBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
@@ -3518,7 +4165,6 @@ class OverlayWindow(QMainWindow):
         self.title.setObjectName("title")
         self.subtitle = QLabel("overlay")
         self.subtitle.setObjectName("subtitle")
-        self.subtitle.setVisible(True)
 
         self.device_combo = NoWheelComboBox()
         self.device_combo.setObjectName("deviceCombo")
@@ -3528,27 +4174,22 @@ class OverlayWindow(QMainWindow):
         self.listen_button.setToolTip("Listen")
         self.listen_button.clicked.connect(self.toggle_listening)
 
-        self.clear_button = QPushButton()
-        self.clear_button.setObjectName("iconButton")
-        self.clear_button.setToolTip("Clear")
-        self.clear_button.clicked.connect(self.clear_answer)
+        self.rail_toggle_button = self._make_rail_button("menu", "Compact", "Expand/collapse sidebar", self.toggle_rail_expanded)
+        for spec in MAIN_RAIL_ACTIONS:
+            button = self._make_rail_button(
+                spec.kind,
+                spec.label,
+                spec.tooltip,
+                self._rail_action_handler(spec),
+                checkable=spec.checkable,
+            )
+            setattr(self, spec.attr, button)
+        self.settings_button = self._make_rail_button("settings", "Settings", "Settings", self.show_settings_dialog)
 
-        self.capture_button = QPushButton()
-        self.capture_button.setObjectName("iconButton")
-        self.capture_button.setToolTip("Capture screen")
-        self.capture_button.clicked.connect(self.start_region_capture)
-
-        self.debug_button = QPushButton()
-        self.debug_button.setObjectName("iconButton")
-        self.debug_button.setToolTip("Debug")
-        self.debug_button.setCheckable(True)
-        self.debug_button.setChecked(False)
-        self.debug_button.clicked.connect(self.toggle_debug_panel)
-
-        self.settings_button = QPushButton()
-        self.settings_button.setObjectName("iconButton")
-        self.settings_button.setToolTip("Settings")
-        self.settings_button.clicked.connect(self.show_settings_dialog)
+        self.mini_button = QPushButton()
+        self.mini_button.setObjectName("closeButton")  # share the title-bar button styling
+        self.mini_button.setToolTip("Mini mode (компактный чат)")
+        self.mini_button.clicked.connect(self.toggle_mini_mode)
 
         self.close_button = QPushButton()
         self.close_button.setObjectName("closeButton")
@@ -3569,13 +4210,54 @@ class OverlayWindow(QMainWindow):
         brand.addWidget(self.subtitle, 0, Qt.AlignmentFlag.AlignHCenter)
         rail_layout.addLayout(brand)
         rail_layout.addSpacing(14)
-        for button in (self.capture_button, self.clear_button, self.debug_button):
-            rail_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail_layout.addWidget(self.rail_toggle_button, 0, Qt.AlignmentFlag.AlignHCenter)
         rail_layout.addStretch(1)
+
+        rail_nav = QWidget()
+        rail_nav.setObjectName("railNav")
+        rail_nav_layout = QVBoxLayout(rail_nav)
+        rail_nav_layout.setContentsMargins(0, 0, 0, 0)
+        rail_nav_layout.setSpacing(10)
+        for spec in MAIN_RAIL_ACTIONS:
+            rail_nav_layout.addWidget(getattr(self, spec.attr))
+        rail_layout.addWidget(rail_nav, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail_layout.addStretch(2)
         rail_layout.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.chat_panel = QFrame()
+        self.chat_panel.setObjectName("chatPanel")
+        self.chat_panel.setVisible(self.chats_panel_visible)
+        chat_panel_layout = QVBoxLayout(self.chat_panel)
+        chat_panel_layout.setContentsMargins(12, 14, 12, 14)
+        chat_panel_layout.setSpacing(10)
+        chat_header = QHBoxLayout()
+        chat_title = QLabel("Chats")
+        chat_title.setObjectName("chatPanelTitle")
+        self.new_chat_button = QPushButton("New")
+        self.new_chat_button.setObjectName("ghostButton")
+        self.new_chat_button.setIcon(make_icon("plus", _px(14), ACCENT))
+        self.new_chat_button.clicked.connect(self.new_chat_session)
+        chat_header.addWidget(chat_title)
+        chat_header.addStretch(1)
+        chat_header.addWidget(self.new_chat_button)
+        self.chat_sessions_container = QWidget()
+        self.chat_sessions_container.setObjectName("chatSessionsContainer")
+        self.chat_sessions_layout = QVBoxLayout(self.chat_sessions_container)
+        self.chat_sessions_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_sessions_layout.setSpacing(6)
+        self.chat_sessions_layout.addStretch(1)
+        self.chat_sessions_scroll = QScrollArea()
+        self.chat_sessions_scroll.setObjectName("chatSessionsScroll")
+        self.chat_sessions_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_sessions_scroll.setWidgetResizable(True)
+        self.chat_sessions_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_sessions_scroll.setWidget(self.chat_sessions_container)
+        chat_panel_layout.addLayout(chat_header)
+        chat_panel_layout.addWidget(self.chat_sessions_scroll, 1)
 
         content = QFrame()
         content.setObjectName("content")
+        self.content = content
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(18, 14, 18, 16)
         content_layout.setSpacing(12)
@@ -3584,16 +4266,17 @@ class OverlayWindow(QMainWindow):
         self.status.setObjectName("status")
         self.model_chip = QLabel(current_answer_model())
         self.model_chip.setObjectName("modelChip")
+        self.model_chip.setVisible(False)
         self.api_chip = QLabel("remote" if STACKWIRE_API_URL else "local")
         self.api_chip.setObjectName("apiChip")
+        self.api_chip.setVisible(False)
         self.account_chip = QLabel("")
         self.account_chip.setObjectName("accountChip")
+        self.account_chip.setVisible(False)
 
-        header.addWidget(self.model_chip)
-        header.addWidget(self.api_chip)
-        header.addWidget(self.account_chip)
         header.addStretch(1)
         header.addWidget(self.status)
+        header.addWidget(self.mini_button)
         header.addWidget(self.close_button)
         self.update_account_chip()
 
@@ -3623,7 +4306,7 @@ class OverlayWindow(QMainWindow):
         attach_bar_layout.setSpacing(8)
         self.attach_chip = QLabel("")
         self.attach_chip.setObjectName("attachChip")
-        self.attach_remove = QPushButton("✕")
+        self.attach_remove = QPushButton("вњ•")
         self.attach_remove.setObjectName("attachRemove")
         self.attach_remove.setFixedSize(22, 22)
         self.attach_remove.clicked.connect(self.clear_attachment)
@@ -3643,8 +4326,9 @@ class OverlayWindow(QMainWindow):
         self.input = PromptEdit()
         self.input.setObjectName("prompt")
         self.input.setPlaceholderText("Message StackWire...")
-        self.input.setFixedHeight(_px(40))
+        self.input.set_height_limits(_px(40), _px(132))
         self.input.submitted.connect(self.submit_question)
+        self.input.image_pasted.connect(self._on_clipboard_image)
         # Focus ring: highlight the composer pill while the input is focused.
         self.input.installEventFilter(self)
 
@@ -3657,31 +4341,56 @@ class OverlayWindow(QMainWindow):
         self.ask_button.setFixedSize(_px(40), _px(40))
         self.ask_button.clicked.connect(self.submit_question)
 
-        footer.addWidget(self.attach_button)
+        footer.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         footer.addWidget(self.input, 1)
-        footer.addWidget(self.listen_button)
-        footer.addWidget(self.ask_button)
+        footer.addWidget(self.listen_button, 0, Qt.AlignmentFlag.AlignBottom)
+        footer.addWidget(self.ask_button, 0, Qt.AlignmentFlag.AlignBottom)
         composer_layout.addLayout(footer)
 
         self.debug_panel = QLabel()
         self.debug_panel.setObjectName("debugPanel")
         self.debug_panel.setWordWrap(True)
         self.debug_panel.setMaximumHeight(140)
-        self.debug_panel.setVisible(False)
+        self.debug_panel.setVisible(self.debug_expanded)
 
         bottom = QHBoxLayout()
         bottom.addStretch(1)
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignmentFlag.AlignRight)
 
+        # Follow-up suggestion chips (hidden until after an answer is received).
+        self.suggestions_bar = QWidget()
+        self.suggestions_bar.setObjectName("suggestionsBar")
+        self.suggestions_bar.setVisible(False)
+        sugg_layout = QHBoxLayout(self.suggestions_bar)
+        sugg_layout.setContentsMargins(_px(2), _px(4), _px(2), _px(2))
+        sugg_layout.setSpacing(_px(6))
+        self._suggestion_buttons: list[QPushButton] = []
+        for _ in range(3):
+            btn = QPushButton()
+            btn.setObjectName("suggestionChip")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, b=btn: self._on_suggestion_clicked(b.text()))
+            sugg_layout.addWidget(btn, 1)
+            self._suggestion_buttons.append(btn)
+
         content_layout.addLayout(header)
         content_layout.addWidget(self.chat_area, 1)
+        content_layout.addWidget(self.suggestions_bar)
         content_layout.addWidget(composer)
         content_layout.addWidget(self.debug_panel)
         content_layout.addLayout(bottom)
         shell_layout.addWidget(rail)
+        shell_layout.addWidget(self.chat_panel)
         shell_layout.addWidget(content, 1)
         layout.addWidget(shell)
         self.setCentralWidget(root)
+
+        # Slash-command suggestion popup, floating above the composer.
+        self.slash_popup = SlashPopup(root)
+        self.input.slash_popup = self.slash_popup
+        self.input.textChanged.connect(self._update_slash_popup)
+        self.input.slash_accepted.connect(self._insert_slash_command)
+        self.slash_popup.command_chosen.connect(self._insert_slash_command)
 
         self.setStyleSheet(STYLES)
         self.install_zoom_shortcuts()
@@ -3690,6 +4399,69 @@ class OverlayWindow(QMainWindow):
         self.update_answer_actions()
         self.update_debug_panel()
         self.render_chat()
+        self.refresh_chat_sessions()
+        self.input.setFocus()
+
+    def _ensure_modal_overlay(self) -> QWidget:
+        root = self.centralWidget()
+        if self._modal_overlay is None or self._modal_overlay.parentWidget() is not root:
+            overlay = QWidget(root)
+            overlay.setObjectName("modalOverlay")
+            overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            overlay.setVisible(False)
+            overlay_layout = QVBoxLayout(overlay)
+            overlay_layout.setContentsMargins(_px(24), _px(24), _px(24), _px(24))
+            overlay_layout.setSpacing(0)
+            overlay_layout.addStretch(1)
+            center = QHBoxLayout()
+            center.setContentsMargins(0, 0, 0, 0)
+            center.addStretch(1)
+            center.addStretch(1)
+            overlay_layout.addLayout(center)
+            overlay_layout.addStretch(1)
+            self._modal_overlay = overlay
+            self._modal_center_layout = center
+        if root is not None:
+            self._modal_overlay.setGeometry(root.rect())
+        return self._modal_overlay
+
+    def _show_embedded_dialog(self, dialog: QDialog, on_accept=None, on_reject=None) -> None:  # noqa: ANN001
+        overlay = self._ensure_modal_overlay()
+        if self._modal_dialog is not None:
+            self._finish_embedded_dialog(self._modal_dialog, accepted=False, callback=None)
+
+        dialog.setParent(overlay)
+        dialog.setWindowFlags(Qt.WindowType.Widget)
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        dialog.setStyleSheet(build_window_styles(self.ui_zoom))
+        available = overlay.size() - QSize(_px(48), _px(48))
+        max_width = max(dialog.minimumWidth(), available.width())
+        max_height = max(dialog.minimumHeight(), available.height())
+        dialog.setMaximumSize(max_width, max_height)
+        self._modal_dialog = dialog
+
+        center = self._modal_center_layout
+        center.insertWidget(center.count() - 1, dialog, 0, Qt.AlignmentFlag.AlignCenter)
+        dialog.accepted.connect(lambda d=dialog: self._finish_embedded_dialog(d, accepted=True, callback=on_accept))
+        dialog.rejected.connect(lambda d=dialog: self._finish_embedded_dialog(d, accepted=False, callback=on_reject))
+        overlay.show()
+        overlay.raise_()
+        dialog.show()
+        dialog.raise_()
+
+    def _finish_embedded_dialog(self, dialog: QDialog, *, accepted: bool, callback) -> None:  # noqa: ANN001
+        if dialog is not self._modal_dialog:
+            return
+        if callback is not None:
+            callback(dialog)
+        if hasattr(self, "_modal_center_layout"):
+            self._modal_center_layout.removeWidget(dialog)
+        dialog.setParent(None)
+        dialog.deleteLater()
+        self._modal_dialog = None
+        if self._modal_overlay is not None:
+            self._modal_overlay.hide()
         self.input.setFocus()
 
     def install_zoom_shortcuts(self) -> None:
@@ -3754,18 +4526,20 @@ class OverlayWindow(QMainWindow):
         global UI_ZOOM
         UI_ZOOM = self.ui_zoom
 
-        font = QFont("Space Grotesk")
+        font = QFont("Manrope")
         font.setPointSizeF(10 * self.ui_zoom)
         self.setFont(font)
 
         self.chat_area.setMinimumHeight(_px(300))
-        self.input.setFixedHeight(_px(40))
+        self.input.set_height_limits(_px(40), _px(132))
         self.input.keep_arrow_cursor()
         self.ask_button.setFixedSize(_px(40), _px(40))
         for _btn in (self.attach_button, self.listen_button):
             _btn.setFixedSize(_px(38), _px(38))
         if hasattr(self, "rail"):
-            self.rail.setFixedWidth(_px(116))
+            self.rail.setFixedWidth(_px(190 if self.rail_expanded else 116))
+        if hasattr(self, "chat_panel"):
+            self.chat_panel.setFixedWidth(_px(270))
         self.debug_panel.setMaximumHeight(_px(140))
         self.setStyleSheet(build_window_styles(self.ui_zoom))
         self.apply_icons()
@@ -3774,36 +4548,62 @@ class OverlayWindow(QMainWindow):
         icon_size = _px(16)
         self.title_mark.setPixmap(icon_pixmap("mark", _px(24), ACCENT))
         listening = self._speech_is_running()
+        self.rail_toggle_button.setIcon(make_icon("collapse" if self.rail_expanded else "menu", icon_size, "#83aeb8"))
+        self.rail_toggle_button.setToolTip("Collapse sidebar" if self.rail_expanded else "Expand sidebar")
+        self.chats_button.setChecked(self.chats_panel_visible)
+        self.chats_button.setIcon(make_icon("chats", icon_size, ACCENT if self.chats_panel_visible else "#83aeb8"))
+        self.notes_button.setIcon(make_icon("notes", icon_size, "#83aeb8"))
         self.listen_button.setIcon(make_icon("stop" if listening else "listen", icon_size, CORAL if listening else ACCENT))
         self.listen_button.setToolTip("Stop listening" if listening else "Listen")
-        self.clear_button.setIcon(make_icon("clear", icon_size, "#83aeb8"))
         self.capture_button.setIcon(make_icon("capture", icon_size, "#83aeb8"))
+        self.diff_button.setIcon(make_icon("diff", icon_size, "#83aeb8"))
+        self.search_button.setIcon(make_icon("search", icon_size, "#83aeb8"))
         self.debug_button.setIcon(make_icon("debug", icon_size, "#83aeb8"))
         self.settings_button.setIcon(make_icon("settings", icon_size, "#83aeb8"))
         self.attach_button.setIcon(make_icon("attach", icon_size, "#83aeb8"))
-        self.ask_button.setIcon(make_icon("ask", icon_size, "#10131a"))
+        if self._generating:
+            self.ask_button.setIcon(make_icon("stop_gen", icon_size, "#10131a"))
+            self.ask_button.setToolTip("Stop generation (ESC)")
+        else:
+            self.ask_button.setIcon(make_icon("ask", icon_size, "#10131a"))
+            self.ask_button.setToolTip("Ask")
         self.close_button.setIcon(make_icon("close", icon_size, "#6f8793"))
+        self.mini_button.setIcon(make_icon("mini_exit" if getattr(self, "_mini_mode", False) else "mini", icon_size, "#83aeb8"))
         for button in (
+            self.rail_toggle_button,
+            self.chats_button,
+            self.notes_button,
             self.listen_button,
-            self.clear_button,
             self.capture_button,
+            self.diff_button,
+            self.search_button,
             self.debug_button,
             self.settings_button,
             self.attach_button,
             self.ask_button,
+            self.mini_button,
             self.close_button,
         ):
             button.setIconSize(QSize(icon_size, icon_size))
         # Rail icon buttons stay 34px squares; composer icons (attach/listen) keep their
         # 38px pill sizing set in apply_ui_zoom — don't resize them here.
         for button in (
-            self.clear_button,
+            self.rail_toggle_button,
+            self.chats_button,
+            self.notes_button,
             self.capture_button,
+            self.diff_button,
+            self.search_button,
             self.debug_button,
             self.settings_button,
         ):
-            button.setFixedSize(_px(34), _px(34))
+            label = str(button.property("label") or "")
+            button.setText(label if self.rail_expanded else "")
+            if button is self.rail_toggle_button and self.rail_expanded:
+                button.setText("Compact")
+            button.setFixedSize(_px(166 if self.rail_expanded else 34), _px(36 if self.rail_expanded else 34))
         self.close_button.setFixedSize(_px(34), _px(34))
+        self.mini_button.setFixedSize(_px(34), _px(34))
 
     def _clamp_zoom(self, value: float) -> float:
         return max(MIN_UI_ZOOM, min(MAX_UI_ZOOM, value))
@@ -3828,7 +4628,7 @@ class OverlayWindow(QMainWindow):
 
     def _apply_acrylic(self) -> None:
         """Best-effort Windows 11 'matte glass' backdrop (blurs the desktop behind the
-        window). No-op on non-Windows or older builds — the app still looks fine."""
+        window). No-op on non-Windows or older builds вЂ" the app still looks fine."""
         if not STACKWIRE_ACRYLIC or sys.platform != "win32":
             return
         try:
@@ -3866,6 +4666,106 @@ class OverlayWindow(QMainWindow):
         self.hide()
         QTimer.singleShot(180, self.show_region_selector)
 
+    def _launch_image_analysis(self, image_b64: str, prompt: str) -> None:
+        if self.image_thread is not None:
+            return
+        self._last_vision_b64 = image_b64  # pinned as follow-up context once the answer lands
+        self._image_generation += 1
+        image_generation = self._image_generation
+        self._active_image_generation = image_generation
+        self.image_thread = QThread()
+        # Stream the vision answer through the SAME pipeline as text answers: deltas are
+        # tagged with the active stream generation so on_answer_delta renders them live.
+        self.image_worker = ImageAnalysisWorker(
+            image_b64, prompt,
+            image_generation=image_generation,
+            stream_generation=self._active_stream_generation,
+        )
+        self.image_worker.moveToThread(self.image_thread)
+        self.image_thread.started.connect(self.image_worker.run)
+        self.image_worker.delta.connect(self.on_answer_delta)
+        self.image_worker.finished.connect(self.on_image_answer)
+        self.image_worker.failed.connect(self.on_image_error)
+        self.image_worker.done.connect(self.image_thread.quit)
+        self.image_worker.done.connect(self.image_worker.deleteLater)
+        self.image_thread.finished.connect(self.on_image_thread_finished)
+        self.image_thread.finished.connect(self.image_thread.deleteLater)
+        self.image_thread.start()
+
+    # ------------------------------------------------------------------ image gen
+    def start_image_generation(self, prompt: str | None = None) -> None:
+        """Generate an image. Invoked via the /image slash command with the prompt text."""
+        if not self._require_login():
+            return
+        if self.imagegen_thread is not None:
+            self.status.setText("Генерация уже идёт...")
+            return
+        prompt = (prompt if prompt is not None else self.input.toPlainText()).strip()
+        if not prompt:
+            self.status.setText("Использование: /image <описание картинки>")
+            return
+        self.input.clear()
+        self.chat_messages.append(("user", prompt))
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self._begin_streaming()
+        self.ask_button.setEnabled(False)
+        self.status.setText("Генерирую изображение…")
+
+        self._imagegen_generation += 1
+        gen = self._imagegen_generation
+        self._active_imagegen_generation = gen
+        self.imagegen_thread = QThread()
+        self.imagegen_worker = ImageGenWorker(prompt, generation=gen)
+        self.imagegen_worker.moveToThread(self.imagegen_thread)
+        self.imagegen_thread.started.connect(self.imagegen_worker.run)
+        self.imagegen_worker.finished.connect(self.on_imagegen_finished)
+        self.imagegen_worker.failed.connect(self.on_imagegen_error)
+        self.imagegen_worker.done.connect(self.imagegen_thread.quit)
+        self.imagegen_worker.done.connect(self.imagegen_worker.deleteLater)
+        self.imagegen_thread.finished.connect(self.on_imagegen_thread_finished)
+        self.imagegen_thread.finished.connect(self.imagegen_thread.deleteLater)
+        self.imagegen_thread.start()
+
+    @Slot(int, str, str)
+    def on_imagegen_finished(self, generation: int, image_b64: str, prompt: str) -> None:
+        if generation != self._active_imagegen_generation:
+            return
+        self._active_imagegen_generation = 0
+        self._stop_streaming(discard_generation=True)
+        answer = f"[[generated_image:{image_b64}]]\n\n*Сгенерировано: {prompt}*"
+        self.replace_last_assistant(answer)
+        self.last_answer_text = answer
+        self.ask_button.setEnabled(True)
+        self.status.setText("Готово")
+        self.update_answer_actions()
+
+    @Slot(int, str)
+    def on_imagegen_error(self, generation: int, message: str) -> None:
+        if generation != self._active_imagegen_generation:
+            return
+        self._active_imagegen_generation = 0
+        self.show_error(message)
+        self.ask_button.setEnabled(True)
+
+    def on_imagegen_thread_finished(self) -> None:
+        self.imagegen_worker = None
+        self.imagegen_thread = None
+        self._active_imagegen_generation = 0
+        self.ask_button.setEnabled(True)
+
+    def _show_image_viewer(self, pixmap_or_b64: QPixmap | str) -> None:
+        """Open FullImageDialog for a screenshot or generated image."""
+        if isinstance(pixmap_or_b64, str):
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(pixmap_or_b64))
+        else:
+            pixmap = pixmap_or_b64
+        if pixmap.isNull():
+            return
+        dialog = FullImageDialog(pixmap, self)
+        dialog.exec()
+
+    # ------------------------------------------------------------------ region capture
     def show_region_selector(self) -> None:
         selector = RegionSelector()
         self.region_selector = selector
@@ -3889,38 +4789,19 @@ class OverlayWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+        self.capture_button.setEnabled(True)
         if not image_b64:
-            self.capture_button.setEnabled(True)
             self.status.setText("Capture failed")
             return
 
-        # Analyze the capture immediately — no labels, no forced prompt; let the model decide.
-        self.speech_input_locked = True
-        self.auto_ask_timer.stop()
-        self.current_partial_speech = ""
-        self.pending_capture_b64 = ""
-        self.ask_button.setEnabled(False)
-        self.capture_button.setEnabled(False)
-        self.chat_messages.append(("user", f"[[screenshot:{image_b64}]]"))
-        self.chat_messages.append(("assistant", "[[thinking:0]]"))
-        self._begin_streaming()
-        self.render_chat()
-        self._scroll_to_message(len(self.chat_messages) - 2)
-        self.status.setText("Анализирую…")
-
-        self.image_thread = QThread()
-        self.image_worker = ImageAnalysisWorker(image_b64, "")
-        self.image_worker.moveToThread(self.image_thread)
-        self.image_thread.started.connect(self.image_worker.run)
-        self.image_worker.finished.connect(self.show_image_answer)
-        self.image_worker.failed.connect(self.show_error)
-        self.image_worker.finished.connect(self.image_thread.quit)
-        self.image_worker.failed.connect(self.image_thread.quit)
-        self.image_worker.finished.connect(self.image_worker.deleteLater)
-        self.image_worker.failed.connect(self.image_worker.deleteLater)
-        self.image_thread.finished.connect(self.on_image_thread_finished)
-        self.image_thread.finished.connect(self.image_thread.deleteLater)
-        self.image_thread.start()
+        # Stage the screenshot as a pending attachment so the user can type a question
+        # (e.g. "почему тут ошибка?") and press Enter — or just press Enter with no text
+        # for a full automatic analysis. Submission flows through submit_with_attachment().
+        self._vision_context_b64 = ""  # fresh capture: drop any prior follow-up context
+        self.pending_attachment = {"kind": "image", "name": "screenshot.png", "data": image_b64}
+        self._refresh_attachment_bar()
+        self.status.setText("Скриншот готов — задайте вопрос и Enter, или просто Enter для разбора")
+        self.input.setFocus()
 
     def submit_capture_question(self, prompt: str) -> None:
         image_b64 = self.pending_capture_b64
@@ -3929,29 +4810,40 @@ class OverlayWindow(QMainWindow):
         if not self._require_login():
             return
 
-        prompt = prompt.strip() or "Что изображено на скриншоте и что важно?"
+        prompt = prompt.strip() or "What is shown in the screenshot and what is important?"
         self.pending_capture_b64 = ""
         self.ask_button.setEnabled(False)
         self.capture_button.setEnabled(False)
-        self.chat_messages.append(("user", f"Запрос к скриншоту\n\n{prompt}"))
-        self.chat_messages.append(("assistant", "Анализирую область экрана..."))
+        self.chat_messages.append(("user", f"Screenshot request\n\n{prompt}"))
+        self.chat_messages.append(("assistant", "Analyzing selected screen area..."))
         self.input.clear()
         self.render_chat(focus_latest_assistant=True)
         self.status.setText("Analyzing captured area...")
 
-        self.image_thread = QThread()
-        self.image_worker = ImageAnalysisWorker(image_b64, prompt)
-        self.image_worker.moveToThread(self.image_thread)
-        self.image_thread.started.connect(self.image_worker.run)
-        self.image_worker.finished.connect(self.show_image_answer)
-        self.image_worker.failed.connect(self.show_error)
-        self.image_worker.finished.connect(self.image_thread.quit)
-        self.image_worker.failed.connect(self.image_thread.quit)
-        self.image_worker.finished.connect(self.image_worker.deleteLater)
-        self.image_worker.failed.connect(self.image_worker.deleteLater)
-        self.image_thread.finished.connect(self.on_image_thread_finished)
-        self.image_thread.finished.connect(self.image_thread.deleteLater)
-        self.image_thread.start()
+        self._launch_image_analysis(image_b64, prompt)
+
+    def submit_vision_followup(self, question: str) -> None:
+        """Answer a follow-up question about the screenshot pinned in context.
+
+        The image is re-sent to the vision model silently — only the user's question
+        text appears as a new bubble (the screenshot is already shown earlier in the
+        chat, so we don't duplicate it)."""
+        image_b64 = self._vision_context_b64
+        if not image_b64:
+            return
+        if not self._require_login():
+            return
+        self._hide_suggestions()
+        self.stop_speech_capture_for_submit()
+        self.ask_button.setEnabled(False)
+        self.update_answer_actions(force_disabled=True)
+        self.input.clear()
+        self.question_count += 1
+        self.chat_messages.append(("user", question))
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self._begin_streaming()
+        self.status.setText("Анализирую скриншот...")
+        self._launch_image_analysis(image_b64, question)
 
     def _load_audio_devices(self, preferred_name: str = "") -> None:
         self.device_combo.clear()
@@ -4009,7 +4901,7 @@ class OverlayWindow(QMainWindow):
             (
                 device
                 for device in devices
-                if "stereo mix" in device.name.lower() or "стерео микшер" in device.name.lower()
+                if "stereo mix" in device.name.lower() or "СЃС‚РµСЂРµРѕ РјРёРєС€РµСЂ" in device.name.lower()
             ),
             None,
         )
@@ -4089,23 +4981,40 @@ class OverlayWindow(QMainWindow):
         if not device.loopback and "WASAPI" in api:
             return (0, name)
         if device.loopback:
-            if "realtek" in name or "динамики" in name or "speakers" in name:
+            if "realtek" in name or "РґРёРЅР°РјРёРєРё" in name or "speakers" in name:
                 return (1, name)
             return (2, name)
         if "DIRECTSOUND" in api:
             return (3, name)
-        if "стерео микшер" in name or "stereo mix" in name:
+        if "СЃС‚РµСЂРµРѕ РјРёРєС€РµСЂ" in name or "stereo mix" in name:
             return (4, name)
-        if not device.loopback and ("микрофон" in name or "microphone" in name or "mic " in name):
+        if not device.loopback and ("РјРёРєСЂРѕС„РѕРЅ" in name or "microphone" in name or "mic " in name):
             return (5, name)
-        if not device.loopback and ("линейный" in name or "лин. вход" in name or "line in" in name):
+        if not device.loopback and ("Р»РёРЅРµР№РЅС‹Р№" in name or "Р»РёРЅ. РІС…РѕРґ" in name or "line in" in name):
             return (7, name)
         if "MME" in api:
             return (9, name)
         return (6, name)
 
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        if self._modal_overlay is not None and self.centralWidget() is not None:
+            self._modal_overlay.setGeometry(self.centralWidget().rect())
+
+    def _drag_blocked_by_widget(self, widget: QWidget | None) -> bool:
+        blocked_types = (QAbstractButton, QTextEdit, QTextBrowser, QComboBox, QLineEdit, QScrollArea, QSizeGrip)
+        while widget is not None:
+            if isinstance(widget, blocked_types):
+                return True
+            widget = widget.parentWidget()
+        return False
+
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._drag_blocked_by_widget(self.childAt(event.position().toPoint())):
+                self.drag_position = None
+                super().mousePressEvent(event)
+                return
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
 
@@ -4113,8 +5022,20 @@ class OverlayWindow(QMainWindow):
         if event.buttons() & Qt.MouseButton.LeftButton and self.drag_position is not None:
             self.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
+            return
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self.drag_position = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        self.drag_position = None
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._generating:
+            self.stop_generation()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Alt:
             event.accept()
             return
@@ -4140,7 +5061,76 @@ class OverlayWindow(QMainWindow):
         style.unpolish(self.composer)
         style.polish(self.composer)
 
+    def _update_slash_popup(self) -> None:
+        popup = getattr(self, "slash_popup", None)
+        if popup is None:
+            return
+        if popup.update_for(self.input.toPlainText()):
+            self._position_slash_popup()
+
+    def _position_slash_popup(self) -> None:
+        popup = self.slash_popup
+        popup.adjustSize()
+        parent = popup.parentWidget()
+        if parent is None:
+            return
+        top_left = self.input.mapTo(parent, QPoint(0, 0))
+        x = max(_px(6), top_left.x())
+        y = max(_px(6), top_left.y() - popup.height() - _px(6))
+        popup.move(x, y)
+
+    def _insert_slash_command(self, cmd: str) -> None:
+        self.input.setPlainText(f"{cmd} ")
+        cursor = self.input.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.input.setTextCursor(cursor)
+        if getattr(self, "slash_popup", None) is not None:
+            self.slash_popup.hide()
+        self.input.setFocus()
+
+    def _apply_slash_command(self, text: str) -> tuple[bool, str]:
+        """Handle a /command typed in the composer.
+
+        Returns (handled, question):
+          handled=True  → command performed its own action; caller should stop.
+          handled=False → `question` is the (possibly rewritten) text to submit normally.
+        """
+        parts = text.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "/image":
+            if not arg:
+                self.status.setText("Использование: /image <описание картинки>")
+                return True, text
+            self.input.clear()
+            self.start_image_generation(arg)
+            return True, text
+
+        if cmd == "/clear":
+            self.clear_answer()
+            return True, text
+
+        # Text-prefix commands: rewrite into a normal prompt and let submit_question continue.
+        rewrites = {
+            "/explain": "Подробно и структурированно объясни простыми словами: ",
+            "/code": "Покажи рабочий пример кода с пояснениями по теме: ",
+            "/translate": "Определи язык и переведи (русский↔английский) этот текст: ",
+        }
+        if cmd in rewrites:
+            if not arg:
+                self.status.setText(f"Использование: {cmd} <текст>")
+                return True, text
+            return False, rewrites[cmd] + arg
+
+        # Unknown slash token → treat as ordinary text.
+        return False, text
+
     def submit_question(self) -> None:
+        # If currently generating, the ask button acts as stop.
+        if self._generating:
+            self.stop_generation()
+            return
         if not self.ask_button.isEnabled():
             return
         if not self._require_login():
@@ -4155,22 +5145,46 @@ class OverlayWindow(QMainWindow):
         if not question:
             return
 
+        # Slash commands (/image, /clear, /explain, ...). Returns (handled, rewritten_question):
+        # handled → the command did its own action; otherwise question may be rewritten for normal flow.
+        if question.startswith("/"):
+            handled, question = self._apply_slash_command(question)
+            if handled:
+                return
+
         if self.pending_capture_b64:
             self.submit_capture_question(question)
             return
 
+        # A screenshot is pinned in context → answer this question about that image.
+        if self._vision_context_b64:
+            self.submit_vision_followup(question)
+            return
+
+        self._hide_suggestions()
         trusted_text = self.is_manual_input(question)
         self.stop_speech_capture_for_submit()
         speech_context = (self.raw_transcript_lines or self.transcript_lines)[-STT_CONTEXT_LINES:]
-        chat_context = [
-            content.split("\n\n", 1)[-1].strip()
+        # Build Q&A history context: last 4 exchanges (user + assistant pairs).
+        history_messages = [
+            (role, content)
             for role, content in self.chat_messages
-            if role == "user" and content.strip()
-        ][-8:]
+            if role in ("user", "assistant")
+            and content.strip()
+            and not self._is_thinking(content)
+            and "[[screenshot:" not in content
+            and "[[file:" not in content
+        ][-8:]  # last 4 Q&A pairs
+        chat_context: list[str] = []
+        for role, content in history_messages:
+            prefix = "User" if role == "user" else "Assistant"
+            text = content.split("\n\n", 1)[-1].strip()
+            text = text[:350] + "..." if len(text) > 350 else text
+            chat_context.append(f"{prefix}: {text}")
         context = [*speech_context, *chat_context][-(STT_CONTEXT_LINES + len(chat_context)) :]
         self.ask_button.setEnabled(False)
         self.update_answer_actions(force_disabled=True)
-        self.status.setText("Генерация…")
+        self.status.setText("Generating...")
         self.question_count += 1
         self.chat_messages.append(("user", question))
         self.chat_messages.append(("assistant", "[[thinking:0]]"))
@@ -4181,20 +5195,84 @@ class OverlayWindow(QMainWindow):
         self._begin_streaming()  # renders history once + inserts the streaming block
         self._launch_ask_stream(question, context, trusted_text)
 
-    def _launch_ask_stream(self, question: str, context: list[str], trusted_text: bool) -> None:
+    def _launch_ask_stream(self, question: str, context: list[str], trusted_text: bool, *, creative: bool = False) -> None:
         self.ask_thread = QThread()
-        self.ask_worker = AskStreamWorker(question, context, trusted_text=trusted_text, storage_session_id=self.storage_session_id)
+        stream_generation = self._active_stream_generation
+        self.ask_worker = AskStreamWorker(
+            question,
+            context,
+            trusted_text=trusted_text,
+            storage_session_id=self.storage_session_id,
+            stream_generation=stream_generation,
+            creative=creative,
+        )
         self.ask_worker.moveToThread(self.ask_thread)
         self.ask_thread.started.connect(self.ask_worker.run)
         self.ask_worker.delta.connect(self.on_answer_delta)
         self.ask_worker.finished.connect(self.on_stream_finished)
-        self.ask_worker.failed.connect(self.show_error)
-        self.ask_worker.finished.connect(self.ask_thread.quit)
-        self.ask_worker.failed.connect(self.ask_thread.quit)
-        self.ask_worker.finished.connect(self.ask_worker.deleteLater)
-        self.ask_worker.failed.connect(self.ask_worker.deleteLater)
+        self.ask_worker.failed.connect(self.on_stream_failed)
+        self.ask_worker.done.connect(self.ask_thread.quit)
+        self.ask_worker.done.connect(self.ask_worker.deleteLater)
+        self._ask_threads.append(self.ask_thread)
+        self.ask_thread.finished.connect(lambda thread=self.ask_thread: self._ask_threads.remove(thread) if thread in self._ask_threads else None)
         self.ask_thread.finished.connect(self.ask_thread.deleteLater)
         self.ask_thread.start()
+
+    def regenerate_message(self, index: int) -> None:
+        """Re-run the question that produced the answer at `index`, replacing it with a fresh
+        variant. Uses elevated temperature + a random seed so each click differs."""
+        if self._generating or self.image_thread is not None or getattr(self, "imagegen_thread", None) is not None:
+            self.status.setText("Подождите, идёт генерация…")
+            return
+        if not self._require_login():
+            return
+        if index >= len(self.chat_messages) or self.chat_messages[index][0] != "assistant":
+            return
+        # Find the user message that prompted this answer.
+        user_idx = -1
+        for i in range(index - 1, -1, -1):
+            if self.chat_messages[i][0] == "user":
+                user_idx = i
+                break
+        if user_idx < 0:
+            self.status.setText("Нет вопроса для перегенерации")
+            return
+
+        user_content = self.chat_messages[user_idx][1]
+        # ChatGPT-style: drop the old answer (and anything after the question).
+        prior_messages = self.chat_messages[:user_idx]
+        self.chat_messages = self.chat_messages[: user_idx + 1]
+        self._hide_suggestions()
+        self.ask_button.setEnabled(False)
+        self.update_answer_actions(force_disabled=True)
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self._begin_streaming()
+        self.status.setText("Перегенерация…")
+
+        # Screenshot question → regenerate via the vision model (with its caption, if any).
+        screenshot_match = re.search(r"\[\[screenshot:([A-Za-z0-9+/=]+)\]\]", user_content)
+        if screenshot_match:
+            caption = re.sub(r"\[\[(?:screenshot|file):[^\]]*\]\]", "", user_content).strip()
+            self._launch_image_analysis(screenshot_match.group(1), caption)
+            return
+
+        # Build the same kind of short Q&A history context submit_question uses.
+        history_messages = [
+            (role, content)
+            for role, content in prior_messages
+            if role in ("user", "assistant")
+            and content.strip()
+            and not self._is_thinking(content)
+            and "[[screenshot:" not in content
+            and "[[file:" not in content
+        ][-8:]
+        chat_context: list[str] = []
+        for role, content in history_messages:
+            prefix = "User" if role == "user" else "Assistant"
+            text = content.split("\n\n", 1)[-1].strip()
+            text = text[:350] + "..." if len(text) > 350 else text
+            chat_context.append(f"{prefix}: {text}")
+        self._launch_ask_stream(user_content.strip(), chat_context, trusted_text=True, creative=True)
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
     MAX_TEXT_FILE_BYTES = 80_000
@@ -4202,14 +5280,14 @@ class OverlayWindow(QMainWindow):
     def attach_file(self) -> None:
         if not self.ask_button.isEnabled():
             return
-        path_str, _ = QFileDialog.getOpenFileName(self, "Прикрепить файл", "", "Все файлы (*.*)")
+        path_str, _ = QFileDialog.getOpenFileName(self, "Attach file", "", "All files (*.*)")
         if not path_str:
             return
         path = Path(path_str)
         try:
             raw = path.read_bytes()
         except Exception as exc:  # noqa: BLE001
-            self.status.setText(f"Не удалось прочитать файл: {_short_error(exc)}")
+            self.status.setText(f"Could not read file: {_short_error(exc)}")
             return
         if path.suffix.lower() in self.IMAGE_EXTENSIONS:
             self.pending_attachment = {"kind": "image", "name": path.name, "data": base64.b64encode(raw).decode("ascii")}
@@ -4217,27 +5295,33 @@ class OverlayWindow(QMainWindow):
             try:
                 text = raw[: self.MAX_TEXT_FILE_BYTES + 1].decode("utf-8")
                 if len(raw) > self.MAX_TEXT_FILE_BYTES:
-                    text = text[: self.MAX_TEXT_FILE_BYTES] + "\n… (файл обрезан)"
+                    text = text[: self.MAX_TEXT_FILE_BYTES] + "\n... (file truncated)"
                 self.pending_attachment = {"kind": "text", "name": path.name, "content": text}
             except UnicodeDecodeError:
                 self.pending_attachment = {"kind": "binary", "name": path.name}
         self._refresh_attachment_bar()
         self.input.setFocus()
-        self.status.setText("Файл прикреплён. Добавьте текст (по желанию) и нажмите Enter.")
+        self.status.setText("File attached. Add text if needed, then press Enter.")
 
     def clear_attachment(self) -> None:
         self.pending_attachment = None
+        self._vision_context_b64 = ""  # also drop pinned screenshot follow-up context
         self._refresh_attachment_bar()
 
     def _refresh_attachment_bar(self) -> None:
         attachment = self.pending_attachment
-        if not attachment:
-            self.attach_bar.setVisible(False)
-            self.attach_chip.setText("")
+        if attachment:
+            kind_label = {"image": "image", "text": "text", "binary": "file"}.get(attachment["kind"], "file")
+            self.attach_chip.setText(f"{attachment['name']} - {kind_label}")
+            self.attach_bar.setVisible(True)
             return
-        kind_label = {"image": "изображение", "text": "текст", "binary": "файл"}.get(attachment["kind"], "файл")
-        self.attach_chip.setText(f"📎  {attachment['name']}  ·  {kind_label}")
-        self.attach_bar.setVisible(True)
+        if self._vision_context_b64:
+            # A screenshot is pinned in context — follow-up questions ask about it.
+            self.attach_chip.setText("🖼 Скриншот активен — спросите ещё")
+            self.attach_bar.setVisible(True)
+            return
+        self.attach_bar.setVisible(False)
+        self.attach_chip.setText("")
 
     def submit_with_attachment(self, text: str) -> None:
         attachment = self.pending_attachment
@@ -4254,33 +5338,21 @@ class OverlayWindow(QMainWindow):
             self.chat_messages.append(("user", user_md))
             self.chat_messages.append(("assistant", "[[thinking:0]]"))
             self._begin_streaming()
-            self.status.setText("Анализирую…")
-            self.image_thread = QThread()
-            self.image_worker = ImageAnalysisWorker(attachment["data"], text)
-            self.image_worker.moveToThread(self.image_thread)
-            self.image_thread.started.connect(self.image_worker.run)
-            self.image_worker.finished.connect(self.show_image_answer)
-            self.image_worker.failed.connect(self.show_error)
-            self.image_worker.finished.connect(self.image_thread.quit)
-            self.image_worker.failed.connect(self.image_thread.quit)
-            self.image_worker.finished.connect(self.image_worker.deleteLater)
-            self.image_worker.failed.connect(self.image_worker.deleteLater)
-            self.image_thread.finished.connect(self.on_image_thread_finished)
-            self.image_thread.finished.connect(self.image_thread.deleteLater)
-            self.image_thread.start()
+            self.status.setText("Analyzing...")
+            self._launch_image_analysis(attachment["data"], text)
             return
 
         if attachment["kind"] == "text":
-            instruction = text.strip() or "Проанализируй этот файл и объясни, что он делает."
-            question = f"{instruction}\n\nФайл «{attachment['name']}»:\n```\n{attachment['content']}\n```"
+            instruction = text.strip() or "Analyze this file and explain what it does."
+            question = f"{instruction}\n\nFile \"{attachment['name']}\":\n```\n{attachment['content']}\n```"
         else:
-            instruction = text.strip() or "Что это за файл и для чего он?"
-            question = f"{instruction}\n\n(Приложен файл «{attachment['name']}», его содержимое не текстовое и не прочитано.)"
+            instruction = text.strip() or "What is this file and what is it used for?"
+            question = f"{instruction}\n\n(File \"{attachment['name']}\" is attached, but its contents are not readable as text.)"
         file_md = f"[[file:{attachment['name']}]]" + (f"\n\n{text}" if text else "")
         self.chat_messages.append(("user", file_md))
         self.chat_messages.append(("assistant", "[[thinking:0]]"))
         self._begin_streaming()
-        self.status.setText("Генерация…")
+        self.status.setText("Generating...")
         self._launch_ask_stream(question, [], True)
 
     def _last_assistant_index(self) -> int:
@@ -4292,6 +5364,8 @@ class OverlayWindow(QMainWindow):
     def _begin_streaming(self) -> None:
         # Rebuild the message widgets; the trailing assistant message starts as
         # animated thinking dots, then we stream rich text into that one row only.
+        self._stream_generation += 1
+        self._active_stream_generation = self._stream_generation
         self._stream_active = True
         self._stream_buffer = ""
         self._stream_render_pending = False
@@ -4300,10 +5374,24 @@ class OverlayWindow(QMainWindow):
         self.render_chat(animate_from=max(0, len(self.chat_messages) - 2))
         self._stream_prefix_snippets = len(CODE_SNIPPETS)
         self._stream_row = self._assistant_rows.get(self._last_assistant_index())
-        QTimer.singleShot(0, self.chat_area.scroll_to_bottom)
+        # Show ask_button as stop button while generating
+        self._generating = True
+        self.ask_button.setEnabled(True)
+        self.apply_icons()
 
-    def _stop_streaming(self) -> None:
+    def _stop_streaming(self, *, discard_generation: bool = False) -> None:
         self._stream_active = False
+        if discard_generation:
+            self._active_stream_generation = 0
+            self._generating = False
+            if hasattr(self, "ask_button"):
+                self.ask_button.setEnabled(True)
+            if hasattr(self, "listen_button"):
+                self.listen_button.setEnabled(True)
+            if hasattr(self, "capture_button"):
+                self.capture_button.setEnabled(True)
+            if hasattr(self, "update_answer_actions"):
+                self.update_answer_actions()
         _DIAGRAM_RENDER["enabled"] = True
         self.typing_timer.stop()
 
@@ -4317,7 +5405,10 @@ class OverlayWindow(QMainWindow):
         # Thinking dots animate themselves now; nothing to drive here.
         return
 
-    def on_answer_delta(self, chunk: str) -> None:
+    @Slot(int, str)
+    def on_answer_delta(self, stream_generation: int, chunk: str) -> None:
+        if stream_generation != self._active_stream_generation:
+            return
         if not self._stream_active:
             return
         self._stream_buffer += chunk
@@ -4332,10 +5423,11 @@ class OverlayWindow(QMainWindow):
         self._stream_render_pending = False
         if not self._stream_active or self._stream_row is None:
             return
-        bar = self.chat_area.scroll.verticalScrollBar()
+        bar = self.chat_area.scroll_area.verticalScrollBar()
         follow = bar.value() >= bar.maximum() - 8
         # Keep snippet ids stable/bounded: drop anything from the previous frame.
         del CODE_SNIPPETS[self._stream_prefix_snippets:]
+        del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
         balanced = balance_streaming_markdown(self._stream_buffer)
         markup = markdown_to_html(balanced)
         # Mint caret at the end while generating (skip when inside a code fence).
@@ -4343,11 +5435,20 @@ class OverlayWindow(QMainWindow):
             markup = _with_stream_caret(markup)
         self._stream_row.show_html(markup, final=False)
         if follow:
-            QTimer.singleShot(0, self.chat_area.scroll_to_bottom)
+            QTimer.singleShot(0, lambda: self.chat_area.scroll_to_bottom(animated=False))
 
-    def on_stream_finished(self, result: object) -> None:
-        self._stop_streaming()
+    @Slot(int, object)
+    def on_stream_finished(self, stream_generation: int, result: object) -> None:
+        if stream_generation != self._active_stream_generation:
+            return
+        self._stop_streaming(discard_generation=True)
         self.show_answer(result)
+
+    @Slot(int, str)
+    def on_stream_failed(self, stream_generation: int, message: str) -> None:
+        if stream_generation != self._active_stream_generation:
+            return
+        self.show_error(message)
 
     def _action_icon_link(self, kind: str, href: str, size: int) -> str:
         png = pixmap_to_base64_png(icon_pixmap(kind, size, "#8290a0"))
@@ -4367,7 +5468,7 @@ class OverlayWindow(QMainWindow):
 
         mode = mode if mode in EXPAND_LABELS else "details"
         header = EXPAND_LABELS[mode]
-        self.chat_messages.append(("assistant", f"{header}\n\nГенерирую расширение..."))
+        self.chat_messages.append(("assistant", f"{header}\n\nGenerating expansion..."))
         self.render_chat(focus_latest_assistant=True)
         self.status.setText("Expanding answer...")
         self.update_answer_actions(force_disabled=True)
@@ -4400,7 +5501,7 @@ class OverlayWindow(QMainWindow):
             self.last_answer_text = cleaned
             self.last_answer_id = None
         if not cleaned:
-            cleaned = "Модель вернула пустое расширение."
+            cleaned = "The model returned an empty expansion."
         self.replace_last_assistant(f"{EXPAND_LABELS[mode]}\n\n{cleaned}")
         self.ask_button.setEnabled(True)
         self.listen_button.setEnabled(True)
@@ -4551,7 +5652,7 @@ class OverlayWindow(QMainWindow):
                 answer_latency_ms=result.answer_latency * 1000,
                 total_latency_ms=result.total_latency * 1000,
             )
-            cleaned = result.answer.strip() or "Модель вернула пустой ответ. Попробуй нажать Enter еще раз."
+            cleaned = result.answer.strip() or "The model returned an empty answer. Try sending the question again."
             if not result.answered:
                 self.input.setPlainText(recovered_question or result.raw_text)
                 self.input.moveCursor(QTextCursor.MoveOperation.End)
@@ -4571,44 +5672,189 @@ class OverlayWindow(QMainWindow):
         else:
             cleaned = str(result).strip()
             if not cleaned:
-                cleaned = "Модель вернула пустой ответ. Попробуй нажать Enter еще раз."
+                cleaned = "The model returned an empty answer. Try sending the question again."
             elif len(cleaned) < 80:
-                cleaned = f"{cleaned}\n\nНюанс:\nОтвет выглядит неполным. Модель могла остановиться раньше времени; повтори запрос или уменьши контекст."
+                cleaned = f"{cleaned}\n\nNote:\nThe answer looks incomplete. Try the request again or reduce the context."
         if not isinstance(result, AskResult):
             self.last_answer_text = cleaned
             self.last_answer_id = None
         self.replace_last_assistant(cleaned)
+        self._generating = False
         self.ask_button.setEnabled(True)
         self.listen_button.setEnabled(True)
-        self.status.setText("Ready")
         self.update_answer_actions()
+        self.apply_icons()
 
+        if self.live_mode:
+            # Unlock STT so the next question can be captured
+            self.speech_input_locked = False
+            # Restart the worker if it somehow stopped (e.g. VAD timeout)
+            if not self._speech_is_running():
+                self.toggle_listening()
+            self.status.setText("Live — говорите следующий вопрос...")
+        else:
+            self.status.setText("Ready")
+            # Launch follow-up suggestions (only in regular mode, not live)
+            q = self.last_answer_question or ""
+            a = cleaned
+            if q and a and len(a) > 30:
+                self._launch_suggestions(q, a)
+
+    @Slot(int, str)
+    def on_image_answer(self, image_generation: int, text: str) -> None:
+        if image_generation != self._active_image_generation:
+            return
+        self._active_image_generation = 0
+        self.show_image_answer(text)
+
+    @Slot(int, str)
+    def on_image_error(self, image_generation: int, message: str) -> None:
+        if image_generation != self._active_image_generation:
+            return
+        self._active_image_generation = 0
+        self.show_error(message)
+
+    @Slot(str)
     def show_image_answer(self, text: str) -> None:
-        self._stop_streaming()
-        cleaned = text.strip() or "Не удалось распознать содержимое области."
+        self._stop_streaming(discard_generation=True)
+        cleaned = text.strip() or "Could not recognize the selected area."
         self.replace_last_assistant(cleaned)
         self.last_answer_question = ""
         self.last_answer_text = cleaned
         self.last_answer_id = None
         self.ask_button.setEnabled(True)
         self.capture_button.setEnabled(True)
+        # Pin the analyzed screenshot so the user can ask follow-up questions about the
+        # SAME image (re-sent silently, without a duplicate image bubble). ✕ clears it.
+        if self._last_vision_b64:
+            self._vision_context_b64 = self._last_vision_b64
+            self._refresh_attachment_bar()
         self.status.setText("Ready")
         self.update_answer_actions()
 
+    @Slot(str)
     def show_error(self, message: str) -> None:
-        self._stop_streaming()
-        self.replace_last_assistant(f"Ошибка: {message}")
+        self._stop_streaming(discard_generation=True)
+        self.replace_last_assistant(f"Error: {message}")
+        self._generating = False
         self.ask_button.setEnabled(True)
         self.listen_button.setEnabled(True)
         self.capture_button.setEnabled(True)
         if self.pending_capture_b64:
             self.input.setFocus()
-        self.status.setText("Error")
         self.update_answer_actions()
+        self.apply_icons()
+        if self.live_mode:
+            # On error in live mode: unlock so the next question can be captured
+            self.speech_input_locked = False
+            if not self._speech_is_running():
+                self.toggle_listening()
+            self.status.setText("Live — ошибка, слушаю дальше...")
+        else:
+            self.status.setText("Error")
+
+    # ------------------------------------------------------------------ stop generation
+    def stop_generation(self) -> None:
+        """Interrupt the current LLM generation immediately."""
+        if not self._generating:
+            return
+        self._generating = False
+        self._stop_streaming(discard_generation=True)
+        self.replace_last_assistant("Остановлено")
+        self.ask_button.setEnabled(True)
+        self.listen_button.setEnabled(True)
+        self.capture_button.setEnabled(True)
+        self.apply_icons()
+        if self.live_mode:
+            self.speech_input_locked = False
+        self.status.setText("Stopped.")
+
+    # ------------------------------------------------------------------ clipboard paste
+    def _on_clipboard_image(self, b64: str, name: str) -> None:
+        """Handle an image pasted from clipboard (Ctrl+V) into the input field."""
+        self.pending_attachment = {"kind": "image", "name": name, "data": b64}
+        self._refresh_attachment_bar()
+        self.status.setText("Image pasted. Add text if needed, then press Enter.")
+        self.input.setFocus()
+
+    # ------------------------------------------------------------------ follow-up suggestions
+    def _suggestions_thread_is_running(self) -> bool:
+        thread = self._suggestions_thread
+        if thread is None:
+            return False
+        try:
+            return bool(shiboken6.isValid(thread) and thread.isRunning())
+        except RuntimeError:
+            self._suggestions_thread = None
+            self._suggestions_worker = None
+            return False
+
+    def _on_suggestions_thread_finished(self, thread: QThread) -> None:
+        if self._suggestions_thread is thread:
+            self._suggestions_thread = None
+            self._suggestions_worker = None
+
+    def _launch_suggestions(self, question: str, answer: str) -> None:
+        """Asynchronously generate follow-up suggestion chips."""
+        self._suggestions_generation += 1
+        generation = self._suggestions_generation
+
+        if self._suggestions_thread_is_running():
+            assert self._suggestions_thread is not None
+            self._suggestions_thread.quit()
+            self._suggestions_thread.wait(100)
+
+        thread = QThread(self)
+        worker = SuggestionsWorker(question, answer)
+        self._suggestions_thread = thread
+        self._suggestions_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda items, gen=generation: self._show_suggestions_for_generation(gen, items))
+        worker.finished.connect(thread.quit)
+        worker.done.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(lambda t=thread: self._on_suggestions_thread_finished(t))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _show_suggestions_for_generation(self, generation: int, items: list) -> None:
+        if generation != self._suggestions_generation:
+            return
+        self._show_suggestions(items)
+
+    @Slot(list)
+    def _show_suggestions(self, items: list) -> None:
+        for i, btn in enumerate(self._suggestion_buttons):
+            if i < len(items) and items[i].strip():
+                btn.setText(items[i].strip())
+                btn.setVisible(True)
+            else:
+                btn.setVisible(False)
+        self.suggestions_bar.setVisible(any(b.isVisible() for b in self._suggestion_buttons))
+
+    def _hide_suggestions(self) -> None:
+        self._suggestions_generation += 1
+        self.suggestions_bar.setVisible(False)
+        for btn in self._suggestion_buttons:
+            btn.setVisible(False)
+
+    def _on_suggestion_clicked(self, text: str) -> None:
+        """Fill input with the suggestion text and submit immediately."""
+        self._hide_suggestions()
+        self.input.setPlainText(text)
+        self.input.moveCursor(QTextCursor.MoveOperation.End)
+        self.submit_question()
 
     def on_anchor_clicked(self, url: QUrl) -> None:
         target = url.toString()
-        for prefix, handler in (("edit:", self.start_edit_message), ("copy:", self.copy_message), ("copycode:", self.copy_code_snippet)):
+        for prefix, handler in (
+            ("edit:", self.start_edit_message),
+            ("copy:", self.copy_message),
+            ("copycode:", self.copy_code_snippet),
+            ("togglecode:", self.toggle_code_block),
+        ):
             if target.startswith(prefix):
                 try:
                     index = int(target[len(prefix) :])
@@ -4616,19 +5862,38 @@ class OverlayWindow(QMainWindow):
                     return
                 handler(index)
                 return
+        if target.startswith("viewimage:"):
+            try:
+                gen_id = int(target[len("viewimage:"):])
+                b64 = _GENERATED_IMAGES.get(gen_id)
+                if b64:
+                    self._show_image_viewer(b64)
+            except ValueError:
+                pass
+            return
         if url.scheme() in ("http", "https"):
             QDesktopServices.openUrl(url)
 
     def copy_code_snippet(self, index: int) -> None:
         if 0 <= index < len(CODE_SNIPPETS):
             QApplication.clipboard().setText(CODE_SNIPPETS[index])
-            self.status.setText("Код скопирован")
+            self.status.setText("Code copied")
+
+    def toggle_code_block(self, index: int) -> None:
+        if not (0 <= index < len(CODE_BLOCK_KEYS)):
+            return
+        block_key = CODE_BLOCK_KEYS[index]
+        if block_key in EXPANDED_CODE_BLOCKS:
+            EXPANDED_CODE_BLOCKS.remove(block_key)
+        else:
+            EXPANDED_CODE_BLOCKS.add(block_key)
+        self.render_chat()
 
     def _message_plain_text(self, index: int) -> str:
         if not (0 <= index < len(self.chat_messages)):
             return ""
         content = self.chat_messages[index][1]
-        match = re.match(r"^Вопрос\s+\d+\s*\n\n(.+)$", content.strip(), flags=re.DOTALL)
+        match = re.match(r"^Р’РѕРїСЂРѕСЃ\s+\d+\s*\n\n(.+)$", content.strip(), flags=re.DOTALL)
         return (match.group(1).strip() if match else content).strip()
 
     def copy_message(self, index: int) -> None:
@@ -4636,7 +5901,7 @@ class OverlayWindow(QMainWindow):
         if not text:
             return
         QApplication.clipboard().setText(text)
-        self.status.setText("Скопировано")
+        self.status.setText("Copied")
 
     def start_edit_message(self, index: int) -> None:
         if not self.ask_button.isEnabled():
@@ -4659,12 +5924,20 @@ class OverlayWindow(QMainWindow):
         self.input.setFocus()
         self.render_chat()
         self.update_answer_actions()
-        self.status.setText("Правка — измените текст и нажмите Enter")
+        self.status.setText("Editing - update the text and press Enter")
 
-    def toggle_debug_panel(self) -> None:
-        self.debug_expanded = self.debug_button.isChecked()
-        self.debug_panel.setVisible(self.debug_expanded)
-        self.debug_button.setToolTip("Hide debug" if self.debug_expanded else "Debug")
+    def set_runtime_debug_panel(self, visible: bool) -> None:
+        self.debug_expanded = visible
+        if hasattr(self, "debug_panel"):
+            self.debug_panel.setVisible(visible)
+
+    def show_notes_dialog(self) -> None:
+        dialog = NotesDialog(notes_path(), self)
+
+        def finish_notes(_dialog: NotesDialog) -> None:
+            self.status.setText("Notes saved")
+
+        self._show_embedded_dialog(dialog, on_accept=finish_notes, on_reject=finish_notes)
 
     def audio_device_names(self) -> list[str]:
         return [self.device_combo.itemText(index) for index in range(self.device_combo.count()) if self.device_combo.itemText(index).strip()]
@@ -4685,36 +5958,32 @@ class OverlayWindow(QMainWindow):
         if self.device_combo.count() == 0:
             self._load_audio_devices(os.getenv("STACKWIRE_AUDIO_DEVICE", "").strip())
         dialog = SettingsDialog(self, _model_choices(), self.audio_device_names(), self.current_audio_device_name())
-        dialog.setStyleSheet(build_window_styles(self.ui_zoom))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
 
-        values = dialog.values()
-        # Only model fields are mandatory; toggles/urls may be empty by design.
-        required_keys = ("ANSWER_MODEL", "RECOVERY_MODEL", "VISION_MODEL")
-        missing = [key for key in required_keys if not values.get(key, "").strip()]
-        if missing:
-            self.status.setText(f"Не сохранено: пустое поле {missing[0]}")
-            return
+        def apply_settings(settings_dialog: SettingsDialog) -> None:
+            values = settings_dialog.values()
+            required_keys = ("ANSWER_MODEL", "RECOVERY_MODEL", "VISION_MODEL")
+            missing = [key for key in required_keys if not values.get(key, "").strip()]
+            if missing:
+                self.status.setText(f"Settings not saved: empty {missing[0]}")
+                return
 
-        try:
-            _save_local_env_values(values)
-            for key, value in values.items():
-                os.environ[key] = value
-            self.set_audio_device_name(values.get("STACKWIRE_AUDIO_DEVICE", ""))
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("settings save failed: %s", exc)
-            self.status.setText(f"Не удалось сохранить настройки: {_short_error(exc)}")
-            return
+            try:
+                _save_local_env_values(values)
+                for key, value in values.items():
+                    os.environ[key] = value
+                self.set_audio_device_name(values.get("STACKWIRE_AUDIO_DEVICE", ""))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("settings save failed: %s", exc)
+                self.status.setText(f"Settings save failed: {_short_error(exc)}")
+                return
 
-        self.model_chip.setText(current_answer_model())
-        self.update_account_chip()
-        self.update_debug_panel()
-        self.render_chat()
-        if STACKWIRE_API_URL:
-            self.status.setText("Настройки сохранены. Удалённый API использует свою конфигурацию.")
-        else:
-            self.status.setText("Настройки сохранены.")
+            self.model_chip.setText(current_answer_model())
+            self.update_account_chip()
+            self.update_debug_panel()
+            self.render_chat()
+            self.status.setText("Settings saved")
+
+        self._show_embedded_dialog(dialog, on_accept=apply_settings)
 
     def update_debug_panel(
         self,
@@ -4752,7 +6021,8 @@ class OverlayWindow(QMainWindow):
         )
 
     def clear_answer(self) -> None:
-        self._stop_streaming()
+        self._stop_streaming(discard_generation=True)
+        self._hide_suggestions()
         self.input.clear()
         self.chat_messages.clear()
         self.raw_transcript_lines.clear()
@@ -4787,21 +6057,30 @@ class OverlayWindow(QMainWindow):
         if not context:
             return question
         return (
-            "Контекст распознанный из записи:\n"
+            "РљРѕРЅС‚РµРєСЃС‚ СЂР°СЃРїРѕР·РЅР°РЅРЅС‹Р№ РёР· Р·Р°РїРёСЃРё:\n"
             f"{context}\n\n"
-            "Задача: найди последний технический вопрос в этом контексте, отбрось лишние фразы, исправь ошибки речевого распознавания и ответь.\n\n"
-            "Если поле ниже уже похоже на вопрос, отвечай на него:\n"
+            "Р—Р°РґР°С‡Р°: РЅР°Р№РґРё РїРѕСЃР»РµРґРЅРёР№ С‚РµС…РЅРёС‡РµСЃРєРёР№ РІРѕРїСЂРѕСЃ РІ СЌС‚РѕРј РєРѕРЅС‚РµРєСЃС‚Рµ, РѕС‚Р±СЂРѕСЃСЊ Р»РёС€РЅРёРµ С„СЂР°Р·С‹, РёСЃРїСЂР°РІСЊ РѕС€РёР±РєРё СЂРµС‡РµРІРѕРіРѕ СЂР°СЃРїРѕР·РЅР°РІР°РЅРёСЏ Рё РѕС‚РІРµС‚СЊ.\n\n"
+            "Р•СЃР»Рё РїРѕР»Рµ РЅРёР¶Рµ СѓР¶Рµ РїРѕС…РѕР¶Рµ РЅР° РІРѕРїСЂРѕСЃ, РѕС‚РІРµС‡Р°Р№ РЅР° РЅРµРіРѕ:\n"
             f"{question}"
         )
 
-    def replace_last_assistant(self, text: str) -> None:
+    def replace_last_assistant(self, text: str, *, focus_latest: bool = False) -> None:
         for index in range(len(self.chat_messages) - 1, -1, -1):
             if self.chat_messages[index][0] == "assistant":
                 self.chat_messages[index] = ("assistant", text)
-                self.render_chat(focus_latest_assistant=True)
+                row = self._assistant_rows.get(index)
+                if row is not None and shiboken6.isValid(row):
+                    del CODE_SNIPPETS[self._stream_prefix_snippets:]
+                    del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
+                    row.show_html(markdown_to_html(text), final=True)
+                    self._persist_current_chat()
+                    if focus_latest:
+                        QTimer.singleShot(0, lambda: self.chat_area.scroll_to_bottom(animated=True))
+                    return
+                self.render_chat(focus_latest_assistant=focus_latest)
                 return
         self.chat_messages.append(("assistant", text))
-        self.render_chat(focus_latest_assistant=True)
+        self.render_chat(focus_latest_assistant=focus_latest)
 
     @staticmethod
     def _is_thinking(content: str) -> bool:
@@ -4838,17 +6117,20 @@ class OverlayWindow(QMainWindow):
         if is_screenshot:
             pixmap = self._screenshot_pixmap(content)
             if pixmap is not None:
-                shot = QLabel()
-                shot.setObjectName("shotLabel")
+                full_pixmap = pixmap
                 scaled = pixmap.scaledToWidth(_px(240), Qt.TransformationMode.SmoothTransformation)
+                shot = ClickableImageLabel(lambda px=full_pixmap: self._show_image_viewer(px))
+                shot.setObjectName("shotLabel")
                 shot.setPixmap(_rounded_pixmap(scaled, _px(12)))
+                shot.setCursor(Qt.CursorShape.PointingHandCursor)
+                shot.setToolTip("Нажмите для просмотра")
                 group_layout.addWidget(shot, 0, Qt.AlignmentFlag.AlignRight)
             if caption:
                 group_layout.addWidget(self._user_bubble_label(caption), 0, Qt.AlignmentFlag.AlignRight)
         elif is_file:
             file_match = re.search(r"\[\[file:([^\]]+)\]\]", content)
-            name = file_match.group(1) if file_match else "файл"
-            group_layout.addWidget(self._user_bubble_label(f"📎  {name}" + (f"\n{caption}" if caption else "")), 0, Qt.AlignmentFlag.AlignRight)
+            name = file_match.group(1) if file_match else "file"
+            group_layout.addWidget(self._user_bubble_label(f"{name}" + (f"\n{caption}" if caption else "")), 0, Qt.AlignmentFlag.AlignRight)
         else:
             group_layout.addWidget(self._user_bubble_label(self._message_plain_text(index)), 0, Qt.AlignmentFlag.AlignRight)
 
@@ -4857,9 +6139,9 @@ class OverlayWindow(QMainWindow):
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.setSpacing(_px(2))
         actions_layout.addStretch(1)
-        actions_layout.addWidget(_flat_icon_button("copy", "Скопировать", lambda i=index: self.copy_message(i)))
+        actions_layout.addWidget(_flat_icon_button("copy", "Copy", lambda i=index: self.copy_message(i)))
         if not is_screenshot:
-            actions_layout.addWidget(_flat_icon_button("edit", "Изменить", lambda i=index: self.start_edit_message(i)))
+            actions_layout.addWidget(_flat_icon_button("edit", "Edit", lambda i=index: self.start_edit_message(i)))
         group_layout.addWidget(actions)
 
         outer.addWidget(group)
@@ -4872,7 +6154,7 @@ class OverlayWindow(QMainWindow):
         bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         # Set the font explicitly (not only via QSS) so fontMetrics is correct and the
         # bubble hugs the text: one line when it fits, wrapping only past the cap.
-        font = QFont("Space Grotesk")
+        font = QFont("Manrope")
         font.setPixelSize(_px(15))
         bubble.setFont(font)
         available = max(_px(320), self.chat_area.width() - _px(96))
@@ -4891,7 +6173,12 @@ class OverlayWindow(QMainWindow):
             row: QWidget = self._make_user_row(index, content)
             self.chat_area.add_row(row)
         else:
-            row = AssistantRow(index, self.on_anchor_clicked, self.copy_message)
+            previous_content = self.chat_messages[index - 1][1] if index > 0 and self.chat_messages[index - 1][0] == "user" else ""
+            model_name = current_vision_model() if "[[screenshot:" in previous_content else current_answer_model()
+            row = AssistantRow(
+                index, self.on_anchor_clicked, self.copy_message, model_name,
+                on_regenerate=self.regenerate_message,
+            )
             self.chat_area.add_row(row)
             self._assistant_rows[index] = row
             if self._is_thinking(content):
@@ -4900,24 +6187,80 @@ class OverlayWindow(QMainWindow):
                 row.show_html(markdown_to_html(content), final=True)
         if animate:
             _animate_in(row)
+        self._message_rows[index] = row
 
     def render_chat(self, focus_latest_assistant: bool = False, animate_from: int = -1) -> None:
         CODE_SNIPPETS.clear()
+        CODE_BLOCK_KEYS.clear()
+        _GENERATED_IMAGES.clear()
+        previous_bar = self.chat_area.scroll_area.verticalScrollBar()
+        previous_value = previous_bar.value()
         self._stream_row = None
         self._assistant_rows = {}
+        self._message_rows = {}
         self.chat_area.clear_rows()
         if not self.chat_messages:
             self.chat_area.show_welcome()
+            self._persist_current_chat()
             return
         self.chat_area.show_list()
         for index, (role, content) in enumerate(self.chat_messages):
             self._add_message_row(index, role, content, animate=(animate_from >= 0 and index >= animate_from))
-        if focus_latest_assistant:
-            QTimer.singleShot(0, self.chat_area.scroll_to_bottom)
+        if animate_from >= 0:
+            target_row = self._message_rows.get(animate_from)
+            if target_row is not None:
+                QTimer.singleShot(0, lambda row=target_row, start=previous_value: self.chat_area.scroll_to_message_start(row, animated=True, start_value=start))
+        elif focus_latest_assistant:
+            QTimer.singleShot(0, lambda: self.chat_area.scroll_to_bottom(animated=True))
+        else:
+            QTimer.singleShot(0, lambda value=previous_value: self.chat_area.restore_scroll_position(value))
+        self._persist_current_chat()
+
+    # ------------------------------------------------------------------ live mode
+    def _live_auto_submit(self) -> None:
+        """Called by live_submit_timer when speech has settled for ~1.2 s."""
+        if not self.live_mode:
+            return
+        if self.speech_input_locked:
+            # LLM is still generating; the lock will be cleared in show_answer
+            return
+        if not self.ask_button.isEnabled():
+            return
+
+        candidate = self.last_final_speech or self.last_question_candidate
+        if not candidate or len(candidate.split()) < 2:
+            # Too short / noise — wait for more speech
+            return
+
+        # ---- lock STT input (but do NOT stop the worker) ----
+        self.speech_input_locked = True
+        self.auto_ask_timer.stop()
+        self.live_submit_timer.stop()
+        self.current_partial_speech = ""
+
+        question = condense_spoken_question(candidate) or candidate
+        context = list((self.raw_transcript_lines or self.transcript_lines)[-STT_CONTEXT_LINES:])
+
+        self.ask_button.setEnabled(False)
+        self.update_answer_actions(force_disabled=True)
+        self.status.setText("Live — генерирую ответ...")
+        self.question_count += 1
+        self.chat_messages.append(("user", question))
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self.input.clear()
+        self.last_final_speech = ""
+        self.current_partial_speech = ""
+        self.last_question_candidate = ""
+        self._begin_streaming()
+        self._launch_ask_stream(question, context, trusted_text=False)
 
     def toggle_listening(self) -> None:
         if self._speech_is_running():
             self.submit_after_speech_stop = False
+            # If the user manually stops listening while live mode is on, turn live off too
+            if self.live_mode:
+                self.live_mode = False
+                self.live_submit_timer.stop()
             if self.speech_worker:
                 self.speech_worker.stop()
             self.listen_button.setEnabled(False)
@@ -4929,9 +6272,11 @@ class OverlayWindow(QMainWindow):
         self._load_audio_devices(preferred_device)
         device = self.device_combo.currentData()
         if device is None:
-            self.show_error("Не выбрано аудио-устройство.")
+            self.show_error("No audio device selected.")
             return
 
+        # Every listening session is live interview mode
+        self.live_mode = True
         self.speech_input_locked = False
         self.speech_thread = QThread()
         self.speech_worker = SpeechWorker(device)
@@ -4949,7 +6294,7 @@ class OverlayWindow(QMainWindow):
         self.speech_thread.start()
 
         self.apply_icons()
-        self.status.setText("Listening...")
+        self.status.setText("Live — говорите вопрос...")
 
     def on_partial_speech(self, text: str) -> None:
         if self.speech_input_locked:
@@ -5004,8 +6349,15 @@ class OverlayWindow(QMainWindow):
         if self.last_final_speech and self.ask_button.isEnabled():
             self.input.setPlainText(self.last_final_speech)
             self.input.moveCursor(QTextCursor.MoveOperation.End)
-        self.status.setText("Speech captured. Press Enter when question is ready.")
-        self.auto_ask_timer.start()
+
+        if self.live_mode and self.ask_button.isEnabled():
+            # Live mode: restart silence-timer on every new fragment.
+            # When it fires without new speech arriving, we auto-submit.
+            self.status.setText(f"Live — слышу: {self.last_final_speech[:80]}")
+            self.live_submit_timer.start()
+        else:
+            self.status.setText("Speech captured. Press Enter when question is ready.")
+            self.auto_ask_timer.start()
 
     def refresh_question_candidate(self) -> None:
         if self.speech_input_locked:
@@ -5035,6 +6387,7 @@ class OverlayWindow(QMainWindow):
     def on_image_thread_finished(self) -> None:
         self.image_worker = None
         self.image_thread = None
+        self._active_image_generation = 0
         self.capture_button.setEnabled(True)
 
     def _speech_is_running(self) -> bool:
@@ -5049,484 +6402,20 @@ class OverlayWindow(QMainWindow):
 
 
 def build_window_styles(scale: float | None = None) -> str:
-    return f"""
-QWidget#root {{
-    background: transparent;
-}}
-
-QFrame#shell {{
-    background: transparent;
-    border: none;
-    border-radius: {_px(22, scale)}px;
-}}
-
-QFrame#rail {{
-    background: {RAIL};
-    border-top-left-radius: {_px(22, scale)}px;
-    border-bottom-left-radius: {_px(22, scale)}px;
-    border-right: none;
-}}
-
-QFrame#content {{
-    background: {SURFACE};
-    border-top-right-radius: {_px(22, scale)}px;
-    border-bottom-right-radius: {_px(22, scale)}px;
-}}
-
-QLabel#title {{
-    color: #d8d5db;
-    font-size: {_px(14, scale)}px;
-    font-weight: 850;
-}}
-
-QLabel#titleMark {{
-    min-width: {_px(20, scale)}px;
-    min-height: {_px(20, scale)}px;
-}}
-
-QLabel#subtitle,
-QLabel#status {{
-    color: {MUTED};
-    font-size: {_px(11, scale)}px;
-}}
-
-QLabel#modelChip,
-QLabel#apiChip,
-QLabel#accountChip,
-QLabel#status {{
-    min-height: {_px(28, scale)}px;
-    padding: 0 {_px(10, scale)}px;
-    border-radius: {_px(9, scale)}px;
-    font-family: {FONT_STACK};
-    font-size: {_px(11, scale)}px;
-}}
-
-QLabel#accountChip {{
-    color: #c7d1db;
-    background: rgba(4, 8, 11, 0.52);
-    border: 1px solid rgba(154, 214, 189, 0.13);
-}}
-
-QLabel#modelChip {{
-    color: #b5d7c8;
-    background: rgba(4, 8, 11, 0.52);
-    border: 1px solid rgba(154, 214, 189, 0.13);
-}}
-
-QLabel#apiChip {{
-    color: #9ad6bd;
-    background: rgba(154, 214, 189, 0.08);
-    border: 1px solid rgba(154, 214, 189, 0.16);
-}}
-
-QLabel#status {{
-    color: #6f8793;
-    background: rgba(4, 8, 11, 0.35);
-    border: 1px solid rgba(154, 214, 189, 0.08);
-}}
-
-QLabel#debugPanel {{
-    color: #a9cdbd;
-    background: rgba(5, 7, 10, 170);
-    border: 1px solid rgba(154, 214, 189, 0.11);
-    border-radius: {_px(14, scale)}px;
-    padding: {_px(6, scale)}px {_px(8, scale)}px;
-    font-family: Consolas, Courier New, monospace;
-    font-size: {_px(10, scale)}px;
-}}
-
-QWidget#chatArea {{
-    background: transparent;
-    border: none;
-}}
-
-QScrollArea#chatScroll {{
-    background: transparent;
-    border: none;
-}}
-
-QWidget#chatContainer {{
-    background: transparent;
-}}
-
-QScrollBar:vertical {{
-    background: transparent;
-    width: {_px(10, scale)}px;
-    margin: {_px(4, scale)}px {_px(2, scale)}px;
-}}
-
-QScrollBar::handle:vertical {{
-    background: rgba(154, 214, 189, 0.26);
-    border-radius: {_px(5, scale)}px;
-    min-height: {_px(32, scale)}px;
-}}
-
-QScrollBar::handle:vertical:hover {{
-    background: rgba(154, 214, 189, 0.46);
-}}
-
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0;
-}}
-
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-    background: transparent;
-}}
-
-QLabel#userBubble {{
-    background: {ELEVATED};
-    border: none;
-    border-radius: {_px(18, scale)}px;
-    padding: {_px(10, scale)}px {_px(15, scale)}px;
-    color: #eef3f9;
-    font-family: {FONT_STACK};
-    font-size: {_px(15, scale)}px;
-}}
-
-QLabel#shotLabel {{
-    background: transparent;
-    border-radius: {_px(12, scale)}px;
-}}
-
-QLabel#roleLabel {{
-    color: #7d8a99;
-    font-size: {_px(11, scale)}px;
-    font-weight: 700;
-}}
-
-QTextBrowser#msgBrowser {{
-    background: transparent;
-    border: none;
-    selection-background-color: #263139;
-}}
-
-QPushButton#msgActionButton {{
-    background: transparent;
-    border: none;
-    border-radius: {_px(7, scale)}px;
-    padding: 0;
-    min-height: 0;
-}}
-
-QPushButton#msgActionButton:hover {{
-    background: rgba(154, 214, 189, 0.14);
-}}
-
-QLabel#welcomeTitle {{
-    font-family: {FONT_DISPLAY};
-    color: #e6f4ee;
-    font-size: {_px(40, scale)}px;
-    font-weight: 700;
-}}
-
-QLabel#welcomeSub {{
-    color: #88a096;
-    font-size: {_px(14, scale)}px;
-}}
-
-QFrame#composer {{
-    background: {ELEVATED};
-    border: none;
-    border-radius: {_px(24, scale)}px;
-}}
-
-QFrame#composer[focused="true"] {{
-    border: 1px solid rgba(154, 214, 189, 0.16);
-}}
-
-QPushButton#composerIcon {{
-    min-width: {_px(38, scale)}px;
-    max-width: {_px(38, scale)}px;
-    min-height: {_px(38, scale)}px;
-    max-height: {_px(38, scale)}px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    border-radius: {_px(19, scale)}px;
-}}
-
-QPushButton#composerIcon:hover {{
-    background: rgba(154, 214, 189, 0.14);
-}}
-
-QPushButton#composerIcon:pressed {{
-    background: rgba(154, 214, 189, 0.22);
-}}
-
-QPushButton#composerSend {{
-    min-width: {_px(40, scale)}px;
-    max-width: {_px(40, scale)}px;
-    min-height: {_px(40, scale)}px;
-    max-height: {_px(40, scale)}px;
-    padding: 0;
-    color: #0d1411;
-    background: {ACCENT};
-    border: none;
-    border-radius: {_px(20, scale)}px;
-}}
-
-QPushButton#composerSend:hover {{
-    background: #abe2cb;
-}}
-
-QPushButton#composerSend:pressed {{
-    background: #84c4ad;
-}}
-
-QPushButton#composerSend:disabled {{
-    color: rgba(13, 20, 17, 0.45);
-    background: rgba(154, 214, 189, 0.22);
-}}
-
-QFrame#attachBar {{
-    background: rgba(154, 214, 189, 0.07);
-    border: 1px solid rgba(154, 214, 189, 0.16);
-    border-radius: {_px(10, scale)}px;
-}}
-
-QLabel#attachChip {{
-    color: #b9c6d2;
-    font-size: {_px(12, scale)}px;
-}}
-
-QPushButton#attachRemove {{
-    color: #8fa0ad;
-    background: transparent;
-    border: none;
-    border-radius: {_px(6, scale)}px;
-    font-size: {_px(13, scale)}px;
-    font-weight: 800;
-}}
-
-QPushButton#attachRemove:hover {{
-    color: #f06b6b;
-    background: rgba(246, 102, 102, 0.12);
-}}
-
-QTextEdit#prompt {{
-    background: transparent;
-    border: none;
-    color: {TEXT};
-    padding: {_px(8, scale)}px {_px(6, scale)}px;
-    font-family: {FONT_STACK};
-    font-size: {_px(15, scale)}px;
-    selection-background-color: #263139;
-}}
-
-QPushButton {{
-    min-height: {_px(30, scale)}px;
-    border-radius: {_px(9, scale)}px;
-    padding: 0 {_px(11, scale)}px;
-    font-size: {_px(12, scale)}px;
-    font-weight: 760;
-}}
-
-QPushButton#askButton {{
-    min-width: {_px(44, scale)}px;
-    max-width: {_px(44, scale)}px;
-    min-height: {_px(44, scale)}px;
-    max-height: {_px(44, scale)}px;
-    padding: 0;
-    color: #10131a;
-    background: {ACCENT};
-    border: 1px solid rgba(154, 214, 189, 0.30);
-    border-radius: {_px(13, scale)}px;
-}}
-
-QPushButton#askButton:disabled {{
-    color: rgba(201, 237, 244, 0.4);
-    background: rgba(154, 214, 189, 0.18);
-}}
-
-QPushButton#ghostButton {{
-    color: {TEXT};
-    background: rgba(31, 38, 54, 126);
-    border: 1px solid rgba(154, 214, 189, 0.11);
-}}
-
-QPushButton#ghostButton:hover {{
-    border: 1px solid rgba(154, 214, 189, 0.22);
-}}
-
-QDialog#settingsDialog {{
-    background: #101722;
-    color: {TEXT};
-}}
-
-QLabel#dialogTitle {{
-    color: #ffffff;
-    font-size: {_px(18, scale)}px;
-    font-weight: 800;
-}}
-
-QLabel#dialogNote {{
-    color: {MUTED};
-    font-size: {_px(12, scale)}px;
-}}
-
-QPushButton#dialogPrimaryButton {{
-    min-width: {_px(92, scale)}px;
-    min-height: {_px(32, scale)}px;
-    color: #07130d;
-    background: {ACCENT};
-    border: 0;
-    border-radius: {_px(8, scale)}px;
-    font-weight: 760;
-}}
-
-QPushButton#iconButton {{
-    min-width: {_px(34, scale)}px;
-    max-width: {_px(34, scale)}px;
-    min-height: {_px(34, scale)}px;
-    max-height: {_px(34, scale)}px;
-    padding: 0;
-    color: {TEXT};
-    background: rgba(20, 28, 34, 0.55);
-    border: 1px solid rgba(154, 214, 189, 0.10);
-    border-radius: {_px(11, scale)}px;
-}}
-
-QPushButton#iconButton:hover {{
-    background: rgba(37, 53, 60, 0.72);
-    border: 1px solid rgba(154, 214, 189, 0.28);
-}}
-
-QPushButton#iconButton:checked {{
-    background: rgba(154, 214, 189, 0.16);
-    border: 1px solid rgba(154, 214, 189, 0.34);
-}}
-
-QFrame#actionPopup {{
-    background: rgba(18, 24, 38, 245);
-    border: 1px solid rgba(154, 214, 189, 0.18);
-    border-radius: {_px(10, scale)}px;
-}}
-
-QPushButton#popupButton {{
-    min-width: {_px(190, scale)}px;
-    min-height: {_px(30, scale)}px;
-    padding: 0 {_px(10, scale)}px;
-    color: {TEXT};
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: {_px(7, scale)}px;
-    text-align: left;
-}}
-
-QPushButton#popupButton:hover {{
-    background: rgba(154, 214, 189, 0.14);
-    border: 1px solid rgba(154, 214, 189, 0.22);
-}}
-
-QPushButton#closeButton {{
-    min-width: {_px(34, scale)}px;
-    max-width: {_px(34, scale)}px;
-    min-height: {_px(34, scale)}px;
-    max-height: {_px(34, scale)}px;
-    padding: 0;
-    color: #6f8793;
-    background: rgba(20, 22, 27, 0.68);
-    border: 1px solid rgba(154, 214, 189, 0.08);
-    border-radius: {_px(11, scale)}px;
-}}
-
-QPushButton#closeButton:hover {{
-    background: rgba(246, 102, 102, 0.16);
-    border: 1px solid rgba(246, 102, 102, 0.30);
-}}
-
-QComboBox#deviceCombo {{
-    min-width: {_px(220, scale)}px;
-    max-width: {_px(280, scale)}px;
-    min-height: {_px(28, scale)}px;
-    border-radius: {_px(9, scale)}px;
-    padding: 0 {_px(10, scale)}px;
-    color: #a9cdbd;
-    background: rgba(5, 7, 10, 0.44);
-    border: 1px solid rgba(154, 214, 189, 0.11);
-}}
-
-QComboBox#settingsCombo {{
-    min-width: {_px(280, scale)}px;
-    min-height: {_px(32, scale)}px;
-    border-radius: {_px(8, scale)}px;
-    padding: 0 {_px(10, scale)}px;
-    color: {TEXT};
-    background: rgba(31, 38, 54, 176);
-    border: 1px solid rgba(154, 214, 189, 0.16);
-}}
-
-QComboBox QAbstractItemView {{
-    color: {TEXT};
-    background: #111820;
-    selection-background-color: #263139;
-}}
-
-QLineEdit#settingsCombo {{
-    min-width: {_px(280, scale)}px;
-    min-height: {_px(32, scale)}px;
-    border-radius: {_px(8, scale)}px;
-    padding: 0 {_px(10, scale)}px;
-    color: {TEXT};
-    background: rgba(31, 38, 54, 176);
-    border: 1px solid rgba(154, 214, 189, 0.16);
-}}
-
-QLineEdit#settingsCombo:focus {{
-    border: 1px solid rgba(154, 214, 189, 0.42);
-}}
-
-QLabel#dialogError {{
-    color: #f08a8a;
-    font-size: {_px(12, scale)}px;
-}}
-
-QCheckBox {{
-    color: {TEXT};
-    font-size: {_px(13, scale)}px;
-    spacing: {_px(8, scale)}px;
-}}
-
-QCheckBox::indicator {{
-    width: {_px(16, scale)}px;
-    height: {_px(16, scale)}px;
-    border-radius: {_px(4, scale)}px;
-    border: 1px solid rgba(154, 214, 189, 0.34);
-    background: rgba(5, 7, 10, 0.44);
-}}
-
-QCheckBox::indicator:checked {{
-    background: {ACCENT};
-    border: 1px solid {ACCENT};
-}}
-
-QTabWidget#settingsTabs::pane {{
-    border: 1px solid rgba(154, 214, 189, 0.12);
-    border-radius: {_px(10, scale)}px;
-    top: -1px;
-}}
-
-QTabBar::tab {{
-    color: {MUTED};
-    background: transparent;
-    padding: {_px(7, scale)}px {_px(14, scale)}px;
-    margin-right: {_px(2, scale)}px;
-    border-top-left-radius: {_px(8, scale)}px;
-    border-top-right-radius: {_px(8, scale)}px;
-}}
-
-QTabBar::tab:selected {{
-    color: #07130d;
-    background: {ACCENT};
-    font-weight: 700;
-}}
-
-QTabBar::tab:hover:!selected {{
-    color: {TEXT};
-    background: rgba(154, 214, 189, 0.12);
-}}
-"""
-
+    return _build_window_styles(
+        scale=scale,
+        px=_px,
+        accent=ACCENT,
+        coral=CORAL,
+        elevated=ELEVATED,
+        font_display=FONT_DISPLAY,
+        font_stack=FONT_STACK,
+        muted=MUTED,
+        rail=RAIL,
+        surface=SURFACE,
+        text=TEXT,
+        ui_zoom=UI_ZOOM,
+    )
 
 STYLES = build_window_styles()
 
@@ -5546,7 +6435,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
     _load_app_fonts()
-    app.setFont(QFont("Space Grotesk", 10))
+    app.setFont(QFont("Manrope", 10))
     app.setWindowIcon(make_icon("mark", 32, ACCENT))
     window = OverlayWindow()
     window.show()
