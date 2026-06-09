@@ -108,7 +108,7 @@ def _rgba(red: int, green: int, blue: int, opacity: float) -> str:
     return f"rgba({red}, {green}, {blue}, {alpha})"
 
 
-STACKWIRE_PANEL_OPACITY = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 0.70), 0.45, 0.92)
+STACKWIRE_PANEL_OPACITY = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 0.92), 0.45, 0.92)
 STACKWIRE_RAIL_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.10, 0.55, 0.95)
 STACKWIRE_BUBBLE_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.08, 0.55, 0.94)
 
@@ -180,8 +180,8 @@ STACKWIRE_API_CONNECT_TIMEOUT = float(os.getenv("STACKWIRE_API_CONNECT_TIMEOUT",
 STACKWIRE_API_TIMEOUT = float(os.getenv("STACKWIRE_API_TIMEOUT", "300"))
 STACKWIRE_REMOTE_STT = os.getenv("STACKWIRE_REMOTE_STT", "1" if STACKWIRE_API_URL else "0").strip() == "1"
 STACKWIRE_STT_TIMEOUT = float(os.getenv("STACKWIRE_STT_TIMEOUT", "120"))
-STACKWIRE_HIDE_FROM_CAPTURE = os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "1").strip() == "1"
-STACKWIRE_HIDE_TASKBAR = os.getenv("STACKWIRE_HIDE_TASKBAR", "1").strip() == "1"
+STACKWIRE_HIDE_FROM_CAPTURE = os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "0").strip() == "1"
+STACKWIRE_HIDE_TASKBAR = os.getenv("STACKWIRE_HIDE_TASKBAR", "0").strip() == "1"
 STACKWIRE_ACRYLIC = os.getenv("STACKWIRE_ACRYLIC", "0").strip().lower() in {"1", "true", "yes", "on"}
 MIN_UI_ZOOM = 0.75
 MAX_UI_ZOOM = 1.55
