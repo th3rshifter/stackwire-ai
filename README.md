@@ -3,7 +3,7 @@
 Local AI workspace.
 
 <p align="center">
-  <img src="docs/images/1.png" width="720" alt="StackWire main screen">
+  <img src="docs/images/1.jpg" width="720" alt="StackWire main screen">
 </p>
 
 ## Features
