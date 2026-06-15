@@ -128,6 +128,62 @@ QWidget#railNav {{
     background: transparent;
 }}
 
+QFrame#agentConfirmBar {{
+    background: rgba(232, 137, 107, 0.07);
+    border: 1px solid rgba(232, 137, 107, 0.28);
+    border-radius: {_px(12, scale)}px;
+}}
+QLabel#agentConfirmTitle {{ color: #e7d2c8; font-weight: 700; font-size: {_px(12, scale)}px; }}
+QLabel#agentWarnLabel {{ color: #e8896b; font-weight: 700; font-size: {_px(11, scale)}px; }}
+QLabel#agentCommandLabel {{
+    color: #dfe6ef; background: #14171d; border-radius: {_px(8, scale)}px;
+    padding: {_px(8, scale)}px {_px(10, scale)}px;
+    font-family: Consolas, "Courier New", monospace; font-size: {_px(13, scale)}px;
+}}
+QPushButton#agentRunButton {{
+    color: #0c1f18; background: {ACCENT}; border: none; border-radius: {_px(10, scale)}px;
+    padding: {_px(6, scale)}px {_px(16, scale)}px; font-weight: 700;
+}}
+QPushButton#agentRunButton:hover {{ background: #abe2cb; }}
+QPushButton#agentDenyButton {{
+    color: #c7d1db; background: transparent; border: 1px solid rgba(154, 214, 189, 0.18);
+    border-radius: {_px(10, scale)}px; padding: {_px(6, scale)}px {_px(14, scale)}px;
+}}
+QPushButton#agentDenyButton:hover {{ background: rgba(255, 255, 255, 0.04); }}
+
+QFrame#canvasPanel {{
+    background: {RAIL};
+    border-left: 1px solid rgba(154, 214, 189, 0.10);
+}}
+
+QLabel#canvasTitle {{
+    color: #dcebe6;
+    font-family: {FONT_DISPLAY};
+    font-size: {_px(13, scale)}px;
+    font-weight: 700;
+}}
+
+QPushButton#canvasIconButton {{
+    background: transparent;
+    border: none;
+    border-radius: {_px(7, scale)}px;
+}}
+
+QPushButton#canvasIconButton:hover {{
+    background: rgba(154, 214, 189, 0.12);
+}}
+
+QPlainTextEdit#canvasEdit {{
+    background: #14171d;
+    border: 1px solid rgba(154, 214, 189, 0.10);
+    border-radius: {_px(10, scale)}px;
+    padding: {_px(10, scale)}px;
+    color: #dfe6ef;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: {_px(13, scale)}px;
+    selection-background-color: #263139;
+}}
+
 QFrame#chatPanel {{
     background: {RAIL};
     border-left: none;

@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTextBrowser,
     QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -514,6 +515,18 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(int(s * 0.30), int(s * 0.70), int(s * 0.48), int(s * 0.28))
         painter.drawLine(int(s * 0.48), int(s * 0.28), int(s * 0.72), int(s * 0.70))
+    elif kind == "deepthink":
+        painter.drawEllipse(int(s * 0.27), int(s * 0.13), int(s * 0.46), int(s * 0.46))
+        painter.drawLine(int(s * 0.41), int(s * 0.64), int(s * 0.59), int(s * 0.64))
+        painter.drawLine(int(s * 0.43), int(s * 0.76), int(s * 0.57), int(s * 0.76))
+    elif kind == "canvas":
+        painter.drawRoundedRect(int(s * 0.16), int(s * 0.18), int(s * 0.68), int(s * 0.64), int(s * 0.10), int(s * 0.10))
+        painter.drawLine(int(s * 0.56), int(s * 0.18), int(s * 0.56), int(s * 0.82))
+    elif kind == "agent":
+        painter.drawRoundedRect(int(s * 0.16), int(s * 0.20), int(s * 0.68), int(s * 0.60), int(s * 0.10), int(s * 0.10))
+        painter.drawLine(int(s * 0.30), int(s * 0.42), int(s * 0.42), int(s * 0.50))
+        painter.drawLine(int(s * 0.42), int(s * 0.50), int(s * 0.30), int(s * 0.58))
+        painter.drawLine(int(s * 0.50), int(s * 0.59), int(s * 0.64), int(s * 0.59))
     elif kind == "listen":
         painter.drawRoundedRect(int(s * 0.36), int(s * 0.16), int(s * 0.28), int(s * 0.46), int(s * 0.14), int(s * 0.14))
         painter.drawLine(int(s * 0.50), int(s * 0.68), int(s * 0.50), int(s * 0.84))
@@ -912,6 +925,20 @@ blockquote {{
   padding: {_px(1)}px 0 {_px(1)}px {_px(12)}px;
   border-left: {_px(3)}px solid rgba(154, 214, 189, 0.5);
   color: #aab6c0;
+}}
+.think-block {{
+  margin: 0 0 {_px(10)}px;
+  padding: {_px(7)}px {_px(12)}px;
+  border-left: {_px(3)}px solid rgba(154, 214, 189, 0.35);
+  background: rgba(154, 214, 189, 0.04);
+  color: #8fa0ad;
+  font-size: {_px(13)}px;
+}}
+.think-label {{
+  color: #6f8793;
+  font-size: {_px(10)}px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }}
 </style>
 """
@@ -2496,7 +2523,7 @@ class SettingsDialog(QDialog):
         self.view_opacity = NoWheelComboBox()
         self.view_opacity.setObjectName("settingsCombo")
         for label, _v in self._opacity_options:
-            self.view_opacity.addItem(label)
+            self.view_opacity.addItem(label) 
         _cur = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 1.0), 0.30, 1.0)
         self.view_opacity.setCurrentIndex(min(range(len(self._opacity_options)), key=lambda i: abs(self._opacity_options[i][1] - _cur)))
         form.addRow(t("view_opacity"), self.view_opacity)
@@ -2509,7 +2536,7 @@ class SettingsDialog(QDialog):
         self.view_language.setCurrentText("English" if _lang == "en" else "Русский")
         form.addRow(t("view_language"), self.view_language)
 
-        # Hidden mode: screen-capture exclusion + taskbar hidden.
+        # Hidden mode: screen-capture excluццццццццццццццццццццццццццццццццццццццццццsion + taskbar hidden.
         self.view_hidden = QCheckBox(t("view_hidden"))
         self.view_hidden.setChecked(os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "0").strip().lower() in {"1", "true", "yes", "on"})
         form.addRow("", self.view_hidden)
@@ -3415,6 +3442,196 @@ class OverlayWindow(QMainWindow):
         button.clicked.connect(handler)
         return button
 
+    def toggle_deepthink(self) -> None:
+        on = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in {"0", "false", "no", "off"}
+        on = not on
+        os.environ["STACKWIRE_DEEPTHINK"] = "1" if on else "0"
+        try:
+            _save_local_env_values({"STACKWIRE_DEEPTHINK": os.environ["STACKWIRE_DEEPTHINK"]})
+        except Exception:
+            LOGGER.debug("deepthink save failed", exc_info=True)
+        self.status.setText("DeepThink: рассуждения включены" if on else "DeepThink выключен")
+        self.apply_icons()
+
+    def _last_answer_code(self) -> tuple[str, str]:
+        for role, content in reversed(self.chat_messages):
+            if role != "assistant":
+                continue
+            blocks = re.findall("```([\\w+.-]*)\\n(.*?)```", content, re.DOTALL)
+            if blocks:
+                lang, code = max(blocks, key=lambda b: len(b[1]))
+                return code.strip(), (lang or "").strip()
+            return "", ""
+        return "", ""
+
+    def _populate_canvas(self) -> None:
+        code, lang = self._last_answer_code()
+        if code:
+            self.canvas_edit.setPlainText(code)
+            self.canvas_title.setText(f"Canvas — {lang}" if lang else "Canvas")
+        else:
+            self.canvas_edit.setPlainText("")
+            self.canvas_title.setText("Canvas — в ответе нет кода")
+
+    def _copy_canvas(self) -> None:
+        text = self.canvas_edit.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status.setText("Скопировано из Canvas")
+
+    def toggle_canvas(self) -> None:
+        if not hasattr(self, "canvas_panel"):
+            return
+        show = not self.canvas_panel.isVisible()
+        self.canvas_panel.setVisible(show)
+        if show:
+            self._populate_canvas()
+        if hasattr(self, "canvas_button"):
+            self.canvas_button.setChecked(show)
+        self.apply_icons()
+
+    def _agent_enabled(self) -> bool:
+        return os.getenv("STACKWIRE_AGENT", "0").strip().lower() not in {"0", "false", "no", "off"}
+
+    def toggle_agent(self) -> None:
+        on = not self._agent_enabled()
+        os.environ["STACKWIRE_AGENT"] = "1" if on else "0"
+        try:
+            _save_local_env_values({"STACKWIRE_AGENT": os.environ["STACKWIRE_AGENT"]})
+        except Exception:
+            LOGGER.debug("agent save failed", exc_info=True)
+        self.status.setText("Agent-режим включён — команды с подтверждением" if on else "Agent-режим выключен")
+        self.apply_icons()
+
+    def _start_agent(self, question: str) -> None:
+        self._agent_stopped = False
+        from app.agent import AGENT_SYSTEM_PROMPT
+        self._agent_messages = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
+        self.chat_messages.append(("user", question))
+        self.input.clear()
+        self.render_chat(focus_latest_assistant=True)
+        self._run_agent_turn()
+
+    def _run_agent_turn(self) -> None:
+        if getattr(self, "_agent_thread", None) is not None:
+            return
+        from app.workers.chat import AgentWorker
+        self._agent_stream_buffer = ""
+        self._generating = True
+        self.ask_button.setEnabled(True)
+        self.apply_icons()
+        self.status.setText("Agent: думаю…")
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self.render_chat()
+        self._agent_thread = QThread()
+        self._agent_worker = AgentWorker(list(self._agent_messages))
+        self._agent_worker.moveToThread(self._agent_thread)
+        self._agent_thread.started.connect(self._agent_worker.run)
+        self._agent_worker.result.connect(self._on_agent_result)
+        self._agent_worker.delta.connect(self._on_agent_delta)
+        self._agent_worker.failed.connect(self._on_agent_failed)
+        self._agent_worker.done.connect(self._agent_thread.quit)
+        self._agent_worker.done.connect(self._agent_worker.deleteLater)
+        self._agent_thread.finished.connect(self._on_agent_thread_finished)
+        self._agent_thread.finished.connect(self._agent_thread.deleteLater)
+        self._agent_thread.start()
+
+    def _on_agent_thread_finished(self) -> None:
+        self._agent_thread = None
+        self._agent_worker = None
+
+    def _on_agent_failed(self, message: str) -> None:
+        self.replace_last_assistant(f"Agent error: {message}")
+        self._hide_agent_confirm()
+        self.ask_button.setEnabled(True)
+        self.status.setText("Agent: ошибка")
+
+    def _on_agent_delta(self, chunk: str) -> None:
+        self._agent_stream_buffer = getattr(self, "_agent_stream_buffer", "") + chunk
+        if not getattr(self, "_agent_render_pending", False):
+            self._agent_render_pending = True
+            QTimer.singleShot(80, self._flush_agent_render)
+
+    def _flush_agent_render(self) -> None:
+        self._agent_render_pending = False
+        from app.agent import strip_command_tag
+        text = strip_command_tag(getattr(self, "_agent_stream_buffer", ""))
+        if text:
+            self.replace_last_assistant(text)
+
+    def _on_agent_result(self, text: str) -> None:
+        self._generating = False
+        self.apply_icons()
+        if getattr(self, "_agent_stopped", False):
+            self.replace_last_assistant("Остановлено")
+            self.ask_button.setEnabled(True)
+            return
+        from app.agent import extract_command, strip_command_tag, is_dangerous
+        command = extract_command(text)
+        prose = strip_command_tag(text) or (text if not command else "Предлагаю выполнить команду:")
+        self._agent_messages.append({"role": "assistant", "content": text})
+        self.replace_last_assistant(prose)
+        if command:
+            self._agent_pending_command = command
+            self._show_agent_confirm(command, is_dangerous(command))
+        else:
+            self._agent_pending_command = ""
+            self._hide_agent_confirm()
+            self.ask_button.setEnabled(True)
+            self.status.setText("Agent: готово")
+
+    def _agent_approve(self) -> None:
+        command = getattr(self, "_agent_pending_command", "")
+        if not command or getattr(self, "_cmd_thread", None) is not None:
+            return
+        self._agent_pending_command = ""
+        self._hide_agent_confirm()
+        from app.workers.chat import CommandWorker
+        self.chat_messages.append(("assistant", "Выполняю команду:" + chr(10) + "```bash" + chr(10) + command + chr(10) + "```"))
+        self.render_chat()
+        self.status.setText("Agent: выполняю команду…")
+        self._cmd_thread = QThread()
+        self._cmd_worker = CommandWorker(command)
+        self._cmd_worker.moveToThread(self._cmd_thread)
+        self._cmd_thread.started.connect(self._cmd_worker.run)
+        self._cmd_worker.result.connect(lambda out, c=command: self._on_command_done(c, out))
+        self._cmd_worker.done.connect(self._cmd_thread.quit)
+        self._cmd_worker.done.connect(self._cmd_worker.deleteLater)
+        self._cmd_thread.finished.connect(lambda: setattr(self, "_cmd_thread", None))
+        self._cmd_thread.finished.connect(self._cmd_thread.deleteLater)
+        self._cmd_thread.start()
+
+    def _on_command_done(self, command: str, output: str) -> None:
+        self.chat_messages.append(("assistant", "```" + chr(10) + output + chr(10) + "```"))
+        self.render_chat()
+        self._agent_messages.append({"role": "user", "content": f"Output of `{command}`:" + chr(10) + output})
+        if getattr(self, "_agent_stopped", False):
+            return
+        self._run_agent_turn()
+
+    def _agent_deny(self) -> None:
+        self._agent_pending_command = ""
+        self._hide_agent_confirm()
+        self.chat_messages.append(("assistant", "Команда отклонена пользователем."))
+        self.render_chat()
+        self._agent_messages.append({"role": "user", "content": "I declined that command. Suggest an alternative or answer without running it."})
+        self._run_agent_turn()
+
+    def _show_agent_confirm(self, command: str, dangerous: bool) -> None:
+        self.ask_button.setEnabled(True)
+        if hasattr(self, "agent_confirm_bar"):
+            self.agent_command_label.setText(command)
+            self.agent_warn_label.setVisible(dangerous)
+            self.agent_confirm_bar.setVisible(True)
+        self.status.setText("Agent: подтвердите команду" + (" (ОПАСНО!)" if dangerous else ""))
+
+    def _hide_agent_confirm(self) -> None:
+        if hasattr(self, "agent_confirm_bar"):
+            self.agent_confirm_bar.setVisible(False)
+
     def _rail_action_handler(self, spec: RailActionSpec):  # noqa: ANN001
         handler = getattr(self, spec.handler)
         if spec.expand_mode:
@@ -4015,12 +4232,81 @@ class OverlayWindow(QMainWindow):
         content_layout.addWidget(self.live_panel)
         content_layout.addWidget(self.voice_wave)
         content_layout.addWidget(self.quick_bar)
+        self.agent_confirm_bar = QFrame()
+        self.agent_confirm_bar.setObjectName("agentConfirmBar")
+        self.agent_confirm_bar.setVisible(False)
+        _acl = QVBoxLayout(self.agent_confirm_bar)
+        _acl.setContentsMargins(_px(12), _px(10), _px(12), _px(10))
+        _acl.setSpacing(_px(7))
+        _atop = QHBoxLayout()
+        _atitle = QLabel("Запустить команду?")
+        _atitle.setObjectName("agentConfirmTitle")
+        self.agent_warn_label = QLabel("ОПАСНАЯ КОМАНДА")
+        self.agent_warn_label.setObjectName("agentWarnLabel")
+        self.agent_warn_label.setVisible(False)
+        _atop.addWidget(_atitle)
+        _atop.addStretch(1)
+        _atop.addWidget(self.agent_warn_label)
+        self.agent_command_label = QLabel("")
+        self.agent_command_label.setObjectName("agentCommandLabel")
+        self.agent_command_label.setWordWrap(True)
+        self.agent_command_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        _abtns = QHBoxLayout()
+        self.agent_deny_btn = QPushButton("Отклонить")
+        self.agent_deny_btn.setObjectName("agentDenyButton")
+        self.agent_deny_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.agent_deny_btn.clicked.connect(self._agent_deny)
+        self.agent_run_btn = QPushButton("Запустить")
+        self.agent_run_btn.setObjectName("agentRunButton")
+        self.agent_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.agent_run_btn.clicked.connect(self._agent_approve)
+        _abtns.addStretch(1)
+        _abtns.addWidget(self.agent_deny_btn)
+        _abtns.addWidget(self.agent_run_btn)
+        _acl.addLayout(_atop)
+        _acl.addWidget(self.agent_command_label)
+        _acl.addLayout(_abtns)
+        content_layout.addWidget(self.agent_confirm_bar)
         content_layout.addWidget(composer)
         content_layout.addWidget(self.debug_panel)
         content_layout.addLayout(bottom)
         shell_layout.addWidget(rail)
         shell_layout.addWidget(self.chat_panel)
+        # Canvas / artifacts: a right-side panel that shows the latest answer's code
+        # block on its own (monospace, editable, copyable). Toggled from the rail.
+        self.canvas_panel = QFrame()
+        self.canvas_panel.setObjectName("canvasPanel")
+        self.canvas_panel.setVisible(False)
+        self.canvas_panel.setFixedWidth(_px(380))
+        _cv = QVBoxLayout(self.canvas_panel)
+        _cv.setContentsMargins(_px(12), _px(12), _px(12), _px(12))
+        _cv.setSpacing(_px(8))
+        _ch = QHBoxLayout()
+        self.canvas_title = QLabel("Canvas")
+        self.canvas_title.setObjectName("canvasTitle")
+        self.canvas_copy = QPushButton()
+        self.canvas_copy.setObjectName("canvasIconButton")
+        self.canvas_copy.setToolTip("Скопировать")
+        self.canvas_copy.setFixedSize(_px(28), _px(28))
+        self.canvas_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.canvas_copy.clicked.connect(self._copy_canvas)
+        self.canvas_close = QPushButton()
+        self.canvas_close.setObjectName("canvasIconButton")
+        self.canvas_close.setToolTip("Закрыть")
+        self.canvas_close.setFixedSize(_px(28), _px(28))
+        self.canvas_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.canvas_close.clicked.connect(self.toggle_canvas)
+        _ch.addWidget(self.canvas_title)
+        _ch.addStretch(1)
+        _ch.addWidget(self.canvas_copy)
+        _ch.addWidget(self.canvas_close)
+        self.canvas_edit = QPlainTextEdit()
+        self.canvas_edit.setObjectName("canvasEdit")
+        self.canvas_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        _cv.addLayout(_ch)
+        _cv.addWidget(self.canvas_edit, 1)
         shell_layout.addWidget(content, 1)
+        shell_layout.addWidget(self.canvas_panel)
         layout.addWidget(shell)
         self.setCentralWidget(root)
 
@@ -4389,6 +4675,21 @@ class OverlayWindow(QMainWindow):
         self.listen_button.setIcon(make_icon("stop" if listening else "listen", icon_size, CORAL if listening else ACCENT))
         self.listen_button.setToolTip("Stop listening" if listening else "Listen")
         self.capture_button.setIcon(make_icon("capture", rail_icon_size, "#83aeb8"))
+        if hasattr(self, "deepthink_button"):
+            _dt = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in {"0", "false", "no", "off"}
+            self.deepthink_button.setChecked(_dt)
+            self.deepthink_button.setIcon(make_icon("deepthink", rail_icon_size, ACCENT if _dt else "#83aeb8"))
+        if hasattr(self, "canvas_button"):
+            _cv_open = self.canvas_panel.isVisible() if hasattr(self, "canvas_panel") else False
+            self.canvas_button.setChecked(_cv_open)
+            self.canvas_button.setIcon(make_icon("canvas", rail_icon_size, ACCENT if _cv_open else "#83aeb8"))
+        if hasattr(self, "agent_button"):
+            _ag = os.getenv("STACKWIRE_AGENT", "0").strip().lower() not in {"0", "false", "no", "off"}
+            self.agent_button.setChecked(_ag)
+            self.agent_button.setIcon(make_icon("agent", rail_icon_size, ACCENT if _ag else "#83aeb8"))
+        if hasattr(self, "canvas_copy"):
+            self.canvas_copy.setIcon(make_icon("copy", icon_size, "#83aeb8"))
+            self.canvas_close.setIcon(make_icon("close", icon_size, "#83aeb8"))
         self.diff_button.setIcon(make_icon("diff", rail_icon_size, "#83aeb8"))
         self.search_button.setIcon(make_icon("search", rail_icon_size, "#83aeb8"))
         self.debug_button.setIcon(make_icon("debug", rail_icon_size, "#83aeb8"))
@@ -4409,6 +4710,9 @@ class OverlayWindow(QMainWindow):
             self.chats_button,
             self.notes_button,
             self.capture_button,
+            self.deepthink_button,
+            self.canvas_button,
+            self.agent_button,
             self.diff_button,
             self.search_button,
             self.debug_button,
@@ -5049,6 +5353,9 @@ class OverlayWindow(QMainWindow):
             handled, question = self._apply_slash_command(question)
             if handled:
                 return
+        if self._agent_enabled():
+            self._start_agent(question)
+            return
 
         # A screenshot is pinned in context → answer this question about that image.
         if self._vision_context_b64:
@@ -5088,6 +5395,7 @@ class OverlayWindow(QMainWindow):
         self.ask_worker.moveToThread(self.ask_thread)
         self.ask_thread.started.connect(self.ask_worker.run)
         self.ask_worker.delta.connect(self.on_answer_delta)
+        self.ask_worker.thinking.connect(self.on_answer_thinking)
         self.ask_worker.finished.connect(self.on_stream_finished)
         self.ask_worker.failed.connect(self.on_stream_failed)
         self.ask_worker.done.connect(self.ask_thread.quit)
@@ -5259,6 +5567,7 @@ class OverlayWindow(QMainWindow):
         self._active_stream_generation = self._stream_generation
         self._stream_active = True
         self._stream_buffer = ""
+        self._thinking_buffer = ""
         self._stream_render_pending = False
         _DIAGRAM_RENDER["enabled"] = False  # skip diagram rendering on partial source
         if self._can_append_incrementally():
@@ -5303,6 +5612,14 @@ class OverlayWindow(QMainWindow):
         return
 
     @Slot(int, str)
+    def on_answer_thinking(self, stream_generation: int, chunk: str) -> None:
+        if stream_generation != self._active_stream_generation or not self._stream_active:
+            return
+        self._thinking_buffer = getattr(self, "_thinking_buffer", "") + chunk
+        if not self._stream_render_pending:
+            self._stream_render_pending = True
+            QTimer.singleShot(70, self._flush_stream_render)
+
     def on_answer_delta(self, stream_generation: int, chunk: str) -> None:
         if stream_generation != self._active_stream_generation:
             return
@@ -5327,6 +5644,11 @@ class OverlayWindow(QMainWindow):
         del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
         balanced = balance_streaming_markdown(self._stream_buffer)
         markup = markdown_to_html(balanced)
+        _think = getattr(self, "_thinking_buffer", "").strip()
+        if _think:
+            _safe = html.escape(_think).replace(chr(10), "<br>")
+            _block = f'<div class="think-block"><span class="think-label">Размышления</span><br>{_safe}</div>'
+            markup = markup.replace("<body>", "<body>" + _block, 1)
         # Mint caret at the end while generating (skip when inside a code fence).
         if not balanced.rstrip().endswith("```"):
             markup = _with_stream_caret(markup)
@@ -5576,6 +5898,8 @@ class OverlayWindow(QMainWindow):
             self.last_answer_text = cleaned
             self.last_answer_id = None
         self.replace_last_assistant(cleaned)
+        if hasattr(self, "canvas_panel") and self.canvas_panel.isVisible():
+            self._populate_canvas()
         self._generating = False
         self.ask_button.setEnabled(True)
         self.listen_button.setEnabled(True)
@@ -5649,11 +5973,33 @@ class OverlayWindow(QMainWindow):
             self.status.setText("Error")
 
     # ------------------------------------------------------------------ stop generation
+    def _interrupt_ask_threads(self) -> None:
+        for thread in list(getattr(self, "_ask_threads", []) or []):
+            try:
+                if thread.isRunning():
+                    thread.requestInterruption()
+            except RuntimeError:
+                pass
+
+    def _interrupt_agent(self) -> None:
+        self._agent_stopped = True
+        self._agent_pending_command = ""
+        self._hide_agent_confirm()
+        thread = getattr(self, "_agent_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.requestInterruption()
+            except RuntimeError:
+                pass
+
     def stop_generation(self) -> None:
         """Interrupt the current LLM generation immediately."""
         if not self._generating:
             return
         self._generating = False
+        self._interrupt_ask_threads()
+        self._interrupt_agent()
         self._stop_streaming(discard_generation=True)
         self.replace_last_assistant("Остановлено")
         self.ask_button.setEnabled(True)

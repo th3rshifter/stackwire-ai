@@ -52,7 +52,16 @@ class STTSettings:
 
 
 def get_stt_settings() -> STTSettings:
-    language_mode = _language_mode(os.getenv("STT_LANGUAGE_MODE") or os.getenv("WHISPER_LANGUAGE") or "auto")
+    # Recognition language: an explicit STT override wins; otherwise follow the UI
+    # Language setting (View tab) so picking Russian/English there also pins Whisper's
+    # decoding language — this kills the auto-detect flips that used to mis-hear short
+    # Russian phrases as English. Falls back to "auto" when nothing is set.
+    language_mode = _language_mode(
+        os.getenv("STT_LANGUAGE_MODE")
+        or os.getenv("WHISPER_LANGUAGE")
+        or os.getenv("STACKWIRE_UI_LANGUAGE")
+        or "auto"
+    )
     return STTSettings(
         backend=os.getenv("STT_BACKEND", "whisper").strip().lower(),
         allow_vosk_fallback=_env_bool("STT_ALLOW_VOSK_FALLBACK", False),

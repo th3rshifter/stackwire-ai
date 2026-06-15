@@ -9,7 +9,7 @@ import re
 from typing import Any, cast
 
 import requests
-from PySide6.QtCore import QBuffer, QIODevice, QObject, Signal, Slot
+from PySide6.QtCore import QBuffer, QIODevice, QObject, QThread, Signal, Slot
 from requests import RequestException
 
 from app.llm import AskResult, ExpandResult, OllamaClient
@@ -163,6 +163,7 @@ class AskStreamWorker(QObject):
 
     recovered = Signal(str)
     delta = Signal(int, str)
+    thinking = Signal(int, str)  # DeepThink: model reasoning chunks
     finished = Signal(int, object)
     failed = Signal(int, str)
     done = Signal()
@@ -210,6 +211,8 @@ class AskStreamWorker(QObject):
                 trusted_text=self.trusted_text,
                 on_recovery=self.recovered.emit,
                 on_delta=self._emit_delta,
+                on_thinking=lambda c: self.thinking.emit(self.stream_generation, c),
+                should_stop=lambda: QThread.currentThread().isInterruptionRequested(),
                 creative=self.creative,
             )
             self.finished.emit(self.stream_generation, result)
@@ -554,3 +557,56 @@ class SuggestionsWorker(QObject):
             pass
         self.done.emit()
 
+
+class AgentWorker(QObject):
+    """Agent mode LLM step: ask the model what to do next given the agent transcript."""
+
+    result = Signal(str)
+    delta = Signal(str)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.messages = messages
+        self.client = OllamaClient()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            text = self.client._chat_stream(
+                self.messages,
+                {"num_ctx": 8192, "num_predict": 1200, "temperature": 0.15, "top_p": 0.85},
+                self.delta.emit,
+                timeout=300,
+                should_stop=lambda: QThread.currentThread().isInterruptionRequested(),
+            )
+            self.result.emit(text or "")
+        except RequestException as exc:
+            self.failed.emit(_remote_request_error_func("Agent request failed", STACKWIRE_API_URL, exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        finally:
+            self.done.emit()
+
+
+class CommandWorker(QObject):
+    """Runs an APPROVED shell command off the GUI thread and returns its output."""
+
+    result = Signal(str)
+    done = Signal()
+
+    def __init__(self, command: str) -> None:
+        super().__init__()
+        self.command = command
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from app.agent import run_command
+
+            out = run_command(self.command)
+        except Exception as exc:  # noqa: BLE001
+            out = f"[failed: {exc}]"
+        self.result.emit(out)
+        self.done.emit()

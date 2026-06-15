@@ -127,51 +127,21 @@ def _recovery_is_unusable(recovery: "RecoveryResult", raw_text: str) -> bool:
 
 
 ANSWER_SYSTEM_PROMPT = """
-You are a knowledgeable assistant. You answer ANY question the user has: everyday life, science, history, culture, cooking, travel, health, relationships, software, programming, infrastructure, networking, security, and anything else.
-Answer in Russian, practical, clear and useful.
+You are StackWire, a sharp and genuinely helpful assistant. Use your own judgment to understand what each question is really about and answer it well — everyday life, science, history, cooking, health, money, software, or anything else.
 
-CRITICAL: You are NOT a DevOps assistant. You are NOT an SRE assistant. You are a general-purpose assistant. Do NOT assume the user is asking about infrastructure, Kubernetes, Docker, Linux, or any technical topic unless the question clearly contains those terms. When in doubt, treat the question as general/everyday.
+Be practical and concrete. Infer what the person most likely wants and answer THAT fully — don't ask for clarification on short or vague requests; add a brief note on a real alternative only when it genuinely matters.
 
-## Principle of Maximum Usefulness (apply to every answer)
+Shape each answer to the question:
+- Lead with the direct answer, or the usable artifact itself (code, recipe, steps, calculation), then a tight breakdown of the key parts. No filler introductions.
+- Match the depth to the request — a small question gets a short answer; a hard or technical one gets real depth and the non-obvious specifics.
+- Answer the whole question: if it has several parts, conditions or comparisons, cover all of them.
+- Use natural section headings only where they truly help; never template-style labels.
 
-When a request is short, vague, or underspecified — do NOT ask for clarification. Instead, apply statistical anticipation:
-1. Identify what the vast majority of people asking this exact question actually want (the most common, practical scenario).
-2. Build your answer around that scenario — fully and concretely.
-3. At the end, briefly note 1–2 alternative interpretations and offer to go deeper.
+Formatting:
+- Put any code, config, command or query in fenced Markdown with a language tag.
+- If the user asks for a table, give a Markdown table. If they ask for a diagram/scheme, give a clear ASCII diagram in a fenced block (or a ```mermaid / ```dot block); otherwise don't add diagrams.
 
-Example of correct behaviour: "покажи ансибл код" → do not say "what do you mean?". Instead, infer "most people want a working playbook example" → provide a complete nginx/package install playbook, explain each section in a table or list, show key modules, then note "if you need a different scenario (DB, file deploy, CI/CD), say which one".
-
-This principle applies to ALL domains: code, cooking, history, finance, medicine, etc. Always give the most useful complete answer first, ask nothing second.
-
-## Structuring rich answers
-
-For requests that ask to "show", "explain", "give an example", or "how to do X":
-- Lead with a complete, runnable/usable artifact (code block, recipe steps, calculation, etc.)
-- Follow with a breakdown: explain the key parts/ingredients/concepts in a short table or bullet list
-- Add a "Common variations" or "What else can you do" section when relevant
-- Close with 1–2 brief clarifying questions IF the topic has genuinely important branches the user should know about
-
-Keep the structure clean. Use Russian section headers (## Название) to separate logical parts. Do not pad with introductions.
-
-## Live conversation / interview awareness
-
-The question often arrives from speech recognition during a LIVE conversation — frequently a job interview the user is answering in real time. This means:
-1. The text may be a fragment ("кубер 64 оперативы", "control plane как настроить два узла") — reconstruct the most likely full question a real interviewer would ask and answer THAT.
-2. Answer like a confident senior specialist speaking out loud: lead with the direct answer in the first sentence, then the key specifics. The user may be reading your answer aloud — make the first 2-3 sentences self-sufficient.
-3. NEVER answer a conversational fragment with a textbook lecture or a rigid template. Match the register of the question.
-4. If conversation history shows you already answered something similar — do not repeat it. Say briefly that the base was covered and add depth: edge cases, production specifics, what an interviewer expects to hear next.
-
-## Style rules
-
-Keep canonical English names for tools, protocols, API objects, commands, config keys and metrics when they appear.
-Do not invent mechanisms.
-Assume the question may come from noisy speech recognition: ignore filler words and answer only the core.
-Answer the entire user question. If it contains multiple entities, conditions or comparisons, address all of them.
-Start with a clear first sentence or the artifact itself, then explain. Avoid long textbook introductions.
-Do not invent section headings that mirror an internal template (no "Что это (1 предложение)" style labels). Use natural headings only where they genuinely help.
-Use fenced Markdown with a language tag for any code, config, command or query. Do not write the language name as a separate line before code.
-If the user explicitly asks for a table, answer with a Markdown table for the requested content and do not replace it with an ASCII diagram or code block.
-When the user explicitly asks for a diagram, scheme, architecture or drawing, include a clear ASCII diagram (boxes drawn with +, -, | and arrows ->) inside a fenced code block. For graphs/flows you may emit a Mermaid diagram in a ```mermaid block or Graphviz in a ```dot block. Do not produce diagrams unless the user asks for one.
+Live speech: questions may arrive as noisy speech fragments — reconstruct the intended question and answer it directly, like a knowledgeable person speaking out loud (the user may read it aloud, so make the first 1-2 sentences self-sufficient). Don't lecture. If you already covered something, add the new angle instead of repeating.
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
@@ -218,19 +188,10 @@ def _answer_language_directive() -> str:
 
 
 def _answer_system_prompt() -> str:
+    # The base prompt is language-neutral; one clean line up front sets the language.
     lang = os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru").strip().lower()
-    if lang != "en":
-        return ANSWER_SYSTEM_PROMPT
-    # English: the base prompt hard-codes "Answer in Russian" near the top, which the
-    # model follows over a trailing note. Replace that line AND lead with a hard rule.
-    base = ANSWER_SYSTEM_PROMPT.replace(
-        "Answer in Russian, practical, clear and useful.",
-        "Answer in English, practical, clear and useful.",
-    ).replace(
-        "Use Russian section headers (## Название) to separate logical parts.",
-        "Use English section headers (## Title) to separate logical parts.",
-    )
-    return "ABSOLUTE RULE: Reply ONLY in English, regardless of the language of the question.\n\n" + base
+    language = "Reply ONLY in English." if lang == "en" else "Reply in Russian."
+    return f"{language}\n\n{ANSWER_SYSTEM_PROMPT}"
 
 
 @dataclass(frozen=True)
@@ -676,6 +637,13 @@ def _question_requests_artifact(question: str) -> bool:
 
 
 def _build_prompt(question: str, plan: AnswerPlan, context: list[str] | None = None) -> str:
+    # General question: don't wrap it in a rigid technical "contract" (domain / required
+    # concepts / component model) — that scaffolding made every answer feel narrow and
+    # un-ChatGPT-like. The system prompt already says how to answer well, so just hand the
+    # model the question and the conversation history. Technical domains keep the contract.
+    if plan.domain == "generic_software" and not plan.required_concepts:
+        return f"{question}{_history_section(question, context)}".strip()
+
     artifact_rule = (
         "If artifact_required=true, start with the fenced artifact/code/config block and then add 'Практические замечания'."
         if plan.artifact_required
@@ -944,6 +912,13 @@ def _web_search_enabled() -> bool:
     return os.getenv("STACKWIRE_WEB_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _deepthink_enabled() -> bool:
+    """DeepThink: ask the model to reason first and surface that reasoning. Read live so
+    the rail toggle applies immediately. Only reasoning models (e.g. qwen3) actually
+    produce a separate thinking stream; others just answer normally."""
+    return os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _answer_is_uncertain(answer: str) -> bool:
     text = answer.strip().casefold()
     if not text:
@@ -999,7 +974,7 @@ class OllamaClient:
             "model": model or current_answer_model(),
             "messages": messages,
             "stream": False,
-            "think": False,
+            "think": _deepthink_enabled(),
             "options": options,
         }
         if OLLAMA_KEEP_ALIVE:
@@ -1018,6 +993,8 @@ class OllamaClient:
         *,
         timeout: int = 300,
         model: str | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         if current_llm_provider() == "openai_compatible":
             payload: dict[str, Any] = {
@@ -1030,6 +1007,8 @@ class OllamaClient:
             with self.session.post(current_openai_chat_url(), json=cast(Any, payload), headers=_openai_headers(), timeout=timeout, stream=True) as response:
                 response.raise_for_status()
                 for line in response.iter_lines(decode_unicode=True):
+                    if should_stop is not None and should_stop():
+                        break
                     if not line:
                         continue
                     if line.startswith("data:"):
@@ -1044,6 +1023,9 @@ class OllamaClient:
                     if not choices or not isinstance(choices[0], dict):
                         continue
                     delta = choices[0].get("delta") or {}
+                    reasoning = str(delta.get("reasoning_content", "") or delta.get("reasoning", ""))
+                    if reasoning and on_thinking is not None:
+                        on_thinking(reasoning)
                     chunk = str(delta.get("content", ""))
                     if chunk:
                         parts.append(chunk)
@@ -1055,7 +1037,7 @@ class OllamaClient:
             "model": model or current_answer_model(),
             "messages": messages,
             "stream": True,
-            "think": False,
+            "think": _deepthink_enabled(),
             "options": options,
         }
         if OLLAMA_KEEP_ALIVE:
@@ -1064,13 +1046,19 @@ class OllamaClient:
         with self.session.post(current_ollama_chat_url(), json=cast(Any, payload), timeout=timeout, stream=True) as response:
             response.raise_for_status()
             for line in response.iter_lines(decode_unicode=True):
+                if should_stop is not None and should_stop():
+                    break
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
                 except ValueError:
                     continue
-                chunk = str((data.get("message") or {}).get("content", ""))
+                message = data.get("message") or {}
+                thinking = str(message.get("thinking", ""))
+                if thinking and on_thinking is not None:
+                    on_thinking(thinking)
+                chunk = str(message.get("content", ""))
                 if chunk:
                     parts.append(chunk)
                     if on_delta is not None:
@@ -1121,6 +1109,8 @@ class OllamaClient:
         on_delta: Callable[[str], None] | None,
         *,
         options: dict[str, Any] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         answer = self._chat_stream(
             [
@@ -1130,6 +1120,8 @@ class OllamaClient:
             options or self._answer_options(plan),
             on_delta,
             timeout=300,
+            on_thinking=on_thinking,
+            should_stop=should_stop,
         )
         return _repair_answer(answer, question, plan)
 
@@ -1452,6 +1444,8 @@ class OllamaClient:
         trusted_text: bool = False,
         on_recovery: Callable[[str], None] | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
         creative: bool = False,
     ) -> AskResult:
         context = context or []
@@ -1525,8 +1519,8 @@ class OllamaClient:
             regen_options["temperature"] = float(os.getenv("OLLAMA_REGEN_TEMPERATURE", "0.7"))
             regen_options["top_p"] = 0.95
             regen_options["seed"] = random.randint(1, 2_000_000_000)
-        answer = self._generate_answer_stream(normalized, plan, prompt, on_delta, options=regen_options) or "Вопрос нужно уточнить."
-        if _web_search_enabled() and _answer_is_uncertain(answer):
+        answer = self._generate_answer_stream(normalized, plan, prompt, on_delta, options=regen_options, on_thinking=on_thinking, should_stop=should_stop) or "Вопрос нужно уточнить."
+        if _web_search_enabled() and _answer_is_uncertain(answer) and not (should_stop is not None and should_stop()):
             answer = self._web_fallback(normalized, plan, answer, on_delta)
         answer_latency = time.perf_counter() - started
         total_latency = time.perf_counter() - pipeline_started
