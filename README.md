@@ -22,10 +22,10 @@ Local AI workspace.
 
 <br>
 
-![Main screen](docs/images/1.png)
-
-![Answer view](docs/images/2.png)
+![1](docs/images/1.jpg)
+![2](docs/images/2.jpg)
+![3](docs/images/3.jpg)
+![4](docs/images/4.jpg)
 
 </details>
-
 <details>
