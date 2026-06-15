@@ -8,6 +8,8 @@ Local AI workspace.
 
 ## Features
 
+RU/ENG language switch
+
 - Whisper-based speech-to-text
 - Question recovery from noisy transcripts
 - Local RAG over Markdown knowledge notes
@@ -21,6 +23,7 @@ Local AI workspace.
 <summary><b>Screenshots</b></summary>
 
 <br>
+
 
 ![1](docs/images/1.jpg)
 ![2](docs/images/2.jpg)
