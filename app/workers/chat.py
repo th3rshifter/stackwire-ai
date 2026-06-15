@@ -316,12 +316,13 @@ class ImageAnalysisWorker(QObject):
     failed = Signal(int, str)
     done = Signal()
 
-    def __init__(self, image_b64: str, prompt: str, *, image_generation: int = 0, stream_generation: int = 0) -> None:
+    def __init__(self, image_b64: str, prompt: str, *, image_generation: int = 0, stream_generation: int = 0, creative: bool = False) -> None:
         super().__init__()
         self.image_b64 = image_b64
         self.prompt = prompt
         self.image_generation = image_generation
         self.stream_generation = stream_generation
+        self.creative = creative
         self.api_url = STACKWIRE_API_URL
         self.client = None if self.api_url else OllamaClient()
         self.session = requests.Session()
@@ -342,7 +343,7 @@ class ImageAnalysisWorker(QObject):
                 return
             if self.client is None:
                 raise RuntimeError("Local Ollama client is not initialized")
-            answer = self.client.analyze_image_stream(self.image_b64, self.prompt, self._emit_delta)
+            answer = self.client.analyze_image_stream(self.image_b64, self.prompt, self._emit_delta, creative=self.creative)
             self.finished.emit(self.image_generation, answer)
         except RequestException as exc:
             self.failed.emit(self.image_generation, _remote_request_error("Image analysis request failed", self.api_url, exc))

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from collections.abc import Callable
 
 import shiboken6
 from PySide6.QtCore import QEasingCurve, QLineF, QPointF, QPropertyAnimation, QTimer, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget
 
 
@@ -194,6 +195,68 @@ class ThinkingDots(QWidget):
         painter.end()
 
 
+class VoiceWave(QWidget):
+    """Animated audio-level equalizer shown while speech is being recognized.
+
+    Feed it with push_level(0..1) from the STT worker; bars travel and decay
+    smoothly (voice-assistant style). Ticks only while running, so it costs
+    nothing when idle/hidden.
+    """
+
+    BARS = 26
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedHeight(_px(26))
+        self._energy = 0.0
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)  # ~25fps
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def start(self) -> None:
+        self.show()
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self._energy = 0.0
+        self.hide()
+
+    def push_level(self, level: float) -> None:
+        # Rise fast to the loudest recent block; _tick decays it between updates.
+        self._energy = max(self._energy, max(0.0, min(1.0, float(level))))
+
+    def _tick(self) -> None:
+        self._energy *= 0.88
+        self._phase += 0.38
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        width, height = self.width(), self.height()
+        n = self.BARS
+        gap = _px(3)
+        bar_w = max(2, (width - gap * (n - 1)) // n)
+        center_y = height / 2
+        base = max(0.05, self._energy)
+        alpha = int(110 + 130 * min(1.0, self._energy * 1.3))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(154, 214, 189, alpha))
+        for i in range(n):
+            envelope = math.sin(math.pi * (i + 0.5) / n)             # taller in the middle
+            osc = 0.5 + 0.5 * math.sin(self._phase + i * 0.55)        # travelling wave
+            amp = base * envelope * osc
+            bar_h = max(_px(2), int(amp * (height - _px(4))))
+            x = int(i * (bar_w + gap))
+            painter.drawRoundedRect(x, int(center_y - bar_h / 2), int(bar_w), bar_h, _px(2), _px(2))
+        painter.end()
+
+
 class ChatMessageBrowser(QTextBrowser):
     """A per-message rich-text view that auto-sizes to its content height so the
     outer scroll area (not the browser) does the scrolling."""
@@ -246,8 +309,11 @@ class AssistantRow(QWidget):
         role_row.setSpacing(_px(7))
         avatar = QLabel()
         avatar.setPixmap(icon_pixmap("mark", _px(16), ACCENT))
-        role = QLabel("Assistant")
+        role = QLabel("ОТВЕТ")
         role.setObjectName("roleLabel")
+        _role_font = role.font()
+        _role_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, _px(1.4))
+        role.setFont(_role_font)
         model_badge = QLabel(model_name)
         model_badge.setObjectName("assistantModelBadge")
         model_badge.setVisible(bool(model_name.strip()))
@@ -320,10 +386,11 @@ class ChatArea(QWidget):
         logo = QLabel()
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setPixmap(icon_pixmap("mark", _px(56), ACCENT))
-        title = QLabel("Stackwire")
+        title = QLabel("StackWire")
         title.setObjectName("welcomeTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("Think faster. Work locally.")
+        from app.i18n import t as _t
+        sub = QLabel(_t("welcome_sub"))
         sub.setObjectName("welcomeSub")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         wl.addWidget(logo)

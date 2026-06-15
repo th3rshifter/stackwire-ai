@@ -36,15 +36,29 @@ MODELHUB_RECOMMENDED: tuple[ModelRecommendation, ...] = (
     ModelRecommendation("qwen2.5:14b", "Qwen 2.5 14B", "14B", "quality", "Better quality if you have enough RAM/VRAM.", 32, 12),
 )
 
+
+def normalized_model_name(model: str) -> str:
+    value = str(model).strip().lower()
+    if not value:
+        return ""
+    if ":" not in value:
+        return f"{value}:latest"
+    return value
+
+
+def model_name_matches(left: str, right: str) -> bool:
+    return normalized_model_name(left) == normalized_model_name(right)
+
+
 VISION_MODEL_NAMES = frozenset(
-    recommendation.name
+    normalized_model_name(recommendation.name)
     for recommendation in MODELHUB_RECOMMENDED
     if recommendation.kind == "vision"
 )
 
 
 def is_vision_model(model: str) -> bool:
-    return model.strip().lower() in {item.lower() for item in VISION_MODEL_NAMES}
+    return normalized_model_name(model) in VISION_MODEL_NAMES
 
 
 def short_error(exc: BaseException, limit: int = 180) -> str:
@@ -57,9 +71,10 @@ def dedupe_models(models: list[str] | tuple[str, ...] | set[str]) -> list[str]:
     result: list[str] = []
     for model in models:
         value = str(model).strip()
-        if not value or value.lower() in seen:
+        key = normalized_model_name(value)
+        if not value or key in seen:
             continue
-        seen.add(value.lower())
+        seen.add(key)
         result.append(value)
     return result
 
@@ -121,7 +136,9 @@ def installed_ollama_models(endpoint: str | None = None) -> list[str]:
     session = requests.Session()
     session.trust_env = False
     try:
-        response = session.get(ollama_tags_url(endpoint), timeout=1.5)
+        # 4s: /api/tags can lag while Ollama is busy generating; 1.5s used to
+        # time out and leave the Settings model dropdowns empty.
+        response = session.get(ollama_tags_url(endpoint), timeout=4.0)
         response.raise_for_status()
         payload = response.json()
     except Exception:

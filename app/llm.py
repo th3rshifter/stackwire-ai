@@ -89,7 +89,13 @@ ANSWER_MODE = os.getenv("ANSWER_MODE", os.getenv("STACKWIRE_ANSWER_MODE", "norma
 if ANSWER_MODE not in {"normal", "deep"}:
     ANSWER_MODE = "normal"
 ANSWER_PROMPT_PROFILE = os.getenv("ANSWER_PROMPT_PROFILE", "balanced").strip().lower()
-DEFAULT_NUM_CTX = max(int(os.getenv("OLLAMA_NUM_CTX", "4096")), 4096)
+# 8192 by default: the system prompt (~1.5k tokens) + RAG (up to 3.2k chars) +
+# chat history + a full ~950-token answer must all fit in one window. At 4096 a
+# populated RAG/history made the total overflow, so Ollama either cut answers off
+# mid-sentence or silently truncated the OLDEST tokens — the system prompt — losing
+# the instructions. All bundled models (qwen3.6, qwen2.5*, gemma3, llama3.2) handle
+# 8k easily; weak hardware can still set OLLAMA_NUM_CTX=4096.
+DEFAULT_NUM_CTX = max(int(os.getenv("OLLAMA_NUM_CTX", "8192")), 4096)
 DEFAULT_ANSWER_NUM_PREDICT = max(
     int(os.getenv("OLLAMA_ANSWER_NUM_PREDICT", "1100" if ANSWER_MODE == "deep" else "950")),
     1100 if ANSWER_MODE == "deep" else 900,
@@ -104,6 +110,21 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
 
 LOGGER = logging.getLogger(__name__)
 NEED_MANUAL_FIX_MESSAGE = "Вопрос распознан ненадежно. Поправь текст вручную."
+
+
+def _recovery_is_unusable(recovery: "RecoveryResult", raw_text: str) -> bool:
+    """True only when there is genuinely nothing to answer (noise/empty).
+
+    Low recovery confidence is NOT a reason to refuse: in a live conversation the
+    user cannot 'fix the text manually'. The answer model is instructed to
+    reconstruct the most likely intended question from fragments, so we answer
+    best-effort instead of bouncing the question back."""
+    best = (recovery.recovered_question or raw_text or "").strip()
+    if not best:
+        return True
+    # Fewer than 2 meaningful tokens → noise (e.g. "ну", "ага").
+    return len(re.findall(r"[\w-]{2,}", best)) < 2
+
 
 ANSWER_SYSTEM_PROMPT = """
 You are a knowledgeable assistant. You answer ANY question the user has: everyday life, science, history, culture, cooking, travel, health, relationships, software, programming, infrastructure, networking, security, and anything else.
@@ -132,6 +153,14 @@ For requests that ask to "show", "explain", "give an example", or "how to do X":
 
 Keep the structure clean. Use Russian section headers (## Название) to separate logical parts. Do not pad with introductions.
 
+## Live conversation / interview awareness
+
+The question often arrives from speech recognition during a LIVE conversation — frequently a job interview the user is answering in real time. This means:
+1. The text may be a fragment ("кубер 64 оперативы", "control plane как настроить два узла") — reconstruct the most likely full question a real interviewer would ask and answer THAT.
+2. Answer like a confident senior specialist speaking out loud: lead with the direct answer in the first sentence, then the key specifics. The user may be reading your answer aloud — make the first 2-3 sentences self-sufficient.
+3. NEVER answer a conversational fragment with a textbook lecture or a rigid template. Match the register of the question.
+4. If conversation history shows you already answered something similar — do not repeat it. Say briefly that the base was covered and add depth: edge cases, production specifics, what an interviewer expects to hear next.
+
 ## Style rules
 
 Keep canonical English names for tools, protocols, API objects, commands, config keys and metrics when they appear.
@@ -139,6 +168,7 @@ Do not invent mechanisms.
 Assume the question may come from noisy speech recognition: ignore filler words and answer only the core.
 Answer the entire user question. If it contains multiple entities, conditions or comparisons, address all of them.
 Start with a clear first sentence or the artifact itself, then explain. Avoid long textbook introductions.
+Do not invent section headings that mirror an internal template (no "Что это (1 предложение)" style labels). Use natural headings only where they genuinely help.
 Use fenced Markdown with a language tag for any code, config, command or query. Do not write the language name as a separate line before code.
 If the user explicitly asks for a table, answer with a Markdown table for the requested content and do not replace it with an ASCII diagram or code block.
 When the user explicitly asks for a diagram, scheme, architecture or drawing, include a clear ASCII diagram (boxes drawn with +, -, | and arrows ->) inside a fenced code block. For graphs/flows you may emit a Mermaid diagram in a ```mermaid block or Graphviz in a ```dot block. Do not produce diagrams unless the user asks for one.
@@ -176,6 +206,31 @@ DEFAULT_VISION_USER_PROMPT = (
     "что на экране, ключевые детали (точно процитируй важный текст, код, числа), "
     "и что это значит или что с этим делать."
 )
+
+
+def _answer_language_directive() -> str:
+    """Force the answer language to the View → Language setting. Appended after the
+    base prompt so it overrides the default 'Answer in Russian'. Read live from env."""
+    lang = os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru").strip().lower()
+    if lang == "en":
+        return "\n\nLANGUAGE OVERRIDE (highest priority): Reply ONLY in English, regardless of the question's language."
+    return "\n\nLANGUAGE (highest priority): Reply in Russian."
+
+
+def _answer_system_prompt() -> str:
+    lang = os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru").strip().lower()
+    if lang != "en":
+        return ANSWER_SYSTEM_PROMPT
+    # English: the base prompt hard-codes "Answer in Russian" near the top, which the
+    # model follows over a trailing note. Replace that line AND lead with a hard rule.
+    base = ANSWER_SYSTEM_PROMPT.replace(
+        "Answer in Russian, practical, clear and useful.",
+        "Answer in English, practical, clear and useful.",
+    ).replace(
+        "Use Russian section headers (## Название) to separate logical parts.",
+        "Use English section headers (## Title) to separate logical parts.",
+    )
+    return "ABSOLUTE RULE: Reply ONLY in English, regardless of the language of the question.\n\n" + base
 
 
 @dataclass(frozen=True)
@@ -366,10 +421,16 @@ def _question_allows_history(question: str) -> bool:  # noqa: ARG001
 def _history_section(question: str, context: list[str] | None) -> str:
     if not context or not _question_allows_history(question):
         return ""
-    lines = [line.strip() for line in context[-8:] if line.strip()]
+    lines = [line.strip() for line in context[-14:] if line.strip()]
     if not lines:
         return ""
-    return "\n\nRecent conversation history (for context — use it to understand follow-up questions):\n" + "\n".join(f"  {line}" for line in lines)
+    return (
+        "\n\nRecent conversation history (use it to understand follow-up questions AND to avoid repeating yourself):\n"
+        + "\n".join(f"  {line}" for line in lines)
+        + "\n\nIMPORTANT about history: if a similar question was already answered above, do NOT repeat the same material. "
+        "Briefly acknowledge what was already covered in one short sentence, then add ONLY the new angle, the missing details, "
+        "or the next logical step. The user is often in a live conversation (e.g. a job interview) — repeated identical answers are useless to them."
+    )
 
 
 def _format_tuple(values: tuple[str, ...]) -> str:
@@ -667,7 +728,8 @@ Question:
 {good_examples_section}
 
 Contract:
-- Follow answer_shape exactly — it defines the sections and their order.
+- answer_shape is a CHECKLIST of what a complete answer usually covers — NOT a template. Adapt the structure freely to this specific question. NEVER copy shape labels (like "Что это (1 предложение)") as literal headings. Write natural headings or none at all.
+- If the question is fragmentary or conversational (e.g. captured from speech), answer it the way a strong senior specialist would answer in a live conversation: directly, starting from the most likely intended meaning. Do not deliver a textbook lecture.
 - Answer the full Question field, not only the first detected technical term.
 - Include required_concepts naturally.
 - Avoid forbidden_concepts and dangerous_confusions.
@@ -1043,7 +1105,7 @@ class OllamaClient:
     def _generate_answer(self, question: str, plan: AnswerPlan, prompt: str, *, options: dict[str, Any] | None = None) -> str:
         answer = self._chat(
             [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "system", "content": _answer_system_prompt()},
                 {"role": "user", "content": prompt},
             ],
             options or self._answer_options(plan),
@@ -1062,7 +1124,7 @@ class OllamaClient:
     ) -> str:
         answer = self._chat_stream(
             [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "system", "content": _answer_system_prompt()},
                 {"role": "user", "content": prompt},
             ],
             options or self._answer_options(plan),
@@ -1087,7 +1149,7 @@ class OllamaClient:
             on_delta("\n\nДополняю из веба:\n\n")
         grounded = self._chat_stream(
             [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "system", "content": _answer_system_prompt()},
                 {"role": "user", "content": _build_web_prompt(question, format_results_for_prompt(results))},
             ],
             self._answer_options(plan),
@@ -1322,11 +1384,7 @@ class OllamaClient:
         recovery = self.question_recovery.recover(recovery_input or raw_text, context)
         recovery_latency = time.perf_counter() - recovery_started
 
-        if (
-            recovery.needs_manual_fix
-            or recovery.confidence < CONFIDENCE_THRESHOLD
-            or recovery.detected_topic == "NEED_CLARIFICATION"
-        ):
+        if _recovery_is_unusable(recovery, raw_text):
             LOGGER.info("skip answer generation confidence=%.2f recovered_question=%r", recovery.confidence, recovery.recovered_question)
             return AskResult(
                 raw_text=raw_text,
@@ -1337,9 +1395,15 @@ class OllamaClient:
                 answer_latency=0.0,
                 total_latency=time.perf_counter() - pipeline_started,
             )
+        if recovery.confidence < CONFIDENCE_THRESHOLD:
+            LOGGER.info(
+                "low recovery confidence=%.2f — answering best-effort with %r",
+                recovery.confidence,
+                recovery.recovered_question or raw_text,
+            )
 
         started = time.perf_counter()
-        answer = self.answer_question(recovery.recovered_question, context)
+        answer = self.answer_question(recovery.recovered_question or raw_text, context)
         answer_latency = time.perf_counter() - started
         total_latency = time.perf_counter() - pipeline_started
         LOGGER.info(
@@ -1407,18 +1471,16 @@ class OllamaClient:
                 candidate_quality="manual",
             )
             recovery_latency = 0.0
-            answer_context: list[str] | None = None
+            # Trusted (typed) input still needs the chat history — dropping it here
+            # was why follow-up questions "forgot" previous messages.
+            answer_context: list[str] | None = context
             question = raw_text
         else:
             recovery_started = time.perf_counter()
             recovery_input = condense_spoken_question(raw_text)
             recovery = self.question_recovery.recover(recovery_input or raw_text, context)
             recovery_latency = time.perf_counter() - recovery_started
-            if (
-                recovery.needs_manual_fix
-                or recovery.confidence < CONFIDENCE_THRESHOLD
-                or recovery.detected_topic == "NEED_CLARIFICATION"
-            ):
+            if _recovery_is_unusable(recovery, raw_text):
                 return AskResult(
                     raw_text=raw_text,
                     recovery=recovery,
@@ -1428,8 +1490,14 @@ class OllamaClient:
                     answer_latency=0.0,
                     total_latency=time.perf_counter() - pipeline_started,
                 )
+            if recovery.confidence < CONFIDENCE_THRESHOLD:
+                LOGGER.info(
+                    "low recovery confidence=%.2f — streaming best-effort answer for %r",
+                    recovery.confidence,
+                    recovery.recovered_question or raw_text,
+                )
             answer_context = context
-            question = recovery.recovered_question
+            question = recovery.recovered_question or raw_text
 
         normalized = normalize_question(question)
         if not normalized:
@@ -1496,7 +1564,7 @@ class OllamaClient:
             plan_intent=effective_plan.intent,
         )
 
-    def _vision_request(self, image_b64: str, prompt: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    def _vision_request(self, image_b64: str, prompt: str | None, *, creative: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
         """Build the (messages, options) for a vision call, or None if the image is empty."""
         image_b64 = image_b64.strip()
         if image_b64.startswith("data:image"):
@@ -1505,7 +1573,7 @@ class OllamaClient:
             return None
         user_prompt = (prompt or "").strip() or DEFAULT_VISION_USER_PROMPT
         messages = [
-            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {"role": "system", "content": VISION_SYSTEM_PROMPT + _answer_language_directive()},
             {"role": "user", "content": user_prompt, "images": [image_b64]},
         ]
         options = {
@@ -1514,6 +1582,12 @@ class OllamaClient:
             "temperature": 0.05,
             "top_p": 0.75,
         }
+        if creative:
+            # Regenerate: bump temperature + random seed so each click yields a fresh
+            # variant instead of repeating the near-deterministic default answer.
+            options["temperature"] = float(os.getenv("OLLAMA_REGEN_TEMPERATURE", "0.7"))
+            options["top_p"] = 0.95
+            options["seed"] = random.randint(1, 2_000_000_000)
         return messages, options
 
     def analyze_image(self, image_b64: str, prompt: str | None = None) -> str:
@@ -1531,9 +1605,10 @@ class OllamaClient:
         on_delta: Callable[[str], None] | None = None,
         *,
         timeout: int = 300,
+        creative: bool = False,
     ) -> str:
         """Stream a vision answer token-by-token (Ollama). Returns the cleaned full text."""
-        request = self._vision_request(image_b64, prompt)
+        request = self._vision_request(image_b64, prompt, creative=creative)
         if request is None:
             return "Could not read the image."
         messages, options = request

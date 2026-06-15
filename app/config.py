@@ -65,8 +65,10 @@ def get_stt_settings() -> STTSettings:
         model=os.getenv("WHISPER_MODEL", "large-v3-turbo").strip() or "large-v3-turbo",
         device=os.getenv("WHISPER_DEVICE", "auto").strip() or "auto",
         compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "auto").strip() or "auto",
-        chunk_seconds=_env_float("WHISPER_CHUNK_SECONDS", 3.5),
-        chunk_overlap_seconds=_env_float("WHISPER_CHUNK_OVERLAP_SECONDS", 1.0),
+        # 2.5s chunks: GhostGPT-class reactivity. large-v3-turbo on GPU transcribes
+        # this far faster than real time; raise via env if running CPU-only.
+        chunk_seconds=_env_float("WHISPER_CHUNK_SECONDS", 2.5),
+        chunk_overlap_seconds=_env_float("WHISPER_CHUNK_OVERLAP_SECONDS", 0.8),
         sample_rate=_env_int("WHISPER_SAMPLE_RATE", 16000),
         language_mode=language_mode,
         beam_size=_env_int("WHISPER_BEAM_SIZE", 5),

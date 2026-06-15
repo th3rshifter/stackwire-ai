@@ -19,15 +19,17 @@ class AnswerPlan:
     depth: str
 
 
+# NOTE: shapes are coverage checklists for the model, NOT literal headings.
+# The prompt explicitly forbids copying these labels into the answer verbatim.
 ANSWER_SHAPES: dict[str, str] = {
-    "definition": "Что это (1 предложение) -> Как работает -> Ключевые компоненты (таблица/список) -> Практический пример -> Нюанс или частые вопросы",
-    "compare": "Главное отличие (1 предложение) -> Сравнение по критериям -> Когда что использовать -> Практический совет",
-    "troubleshoot": "Что означает симптом -> Частые причины -> Как проверить (команды/шаги) -> Fix",
-    "configure": "Что настраиваем -> Минимальный рабочий пример (код/конфиг) -> Разбор ключевых параметров -> Проверка -> Подводные камни",
-    "architecture": "Контекст -> Компоненты -> Control plane/Data plane -> Компромиссы -> Failure modes",
-    "example": "Рабочий пример (код/конфиг/рецепт) -> Разбор ключевых частей (таблица или список) -> Частые вариации -> Уточняющий вопрос если нужен",
-    "analogy": "Коротко -> Аналогия -> Где аналогия ломается -> Практический смысл",
-    "command_explain": "Что делает команда -> Пример -> Ключевые флаги/поля -> Нюанс",
+    "definition": "суть простыми словами; как это работает; ключевые компоненты; живой практический пример; важный нюанс",
+    "compare": "главное отличие сразу; сравнение по важным критериям; когда что использовать; практический совет",
+    "troubleshoot": "что означает симптом; частые причины; как проверить (команды/шаги); как исправить",
+    "configure": "что настраиваем; минимальный рабочий пример (код/конфиг); ключевые параметры; как проверить; подводные камни",
+    "architecture": "контекст; компоненты; control plane/data plane; компромиссы; failure modes",
+    "example": "рабочий пример (код/конфиг/рецепт); разбор ключевых частей; частые вариации",
+    "analogy": "суть коротко; аналогия; где аналогия ломается; практический смысл",
+    "command_explain": "что делает команда; пример; ключевые флаги/поля; нюанс",
 }
 
 EXPLICIT_ARTIFACT_RE = re.compile(
@@ -89,9 +91,14 @@ def build_answer_plan(question: str) -> AnswerPlan:
     code_allowed = artifact_required or intent == "command_explain"
 
     profile = DOMAIN_PROFILES[domain]
-    required = list(profile.required_concepts)
-    forbidden = list(profile.forbidden_concepts)
-    dangerous = list(profile.dangerous_confusions)
+    # General by default: the no-match fallback (generic_software) must NOT impose a
+    # software/DevOps concept template on everyday questions — that made the whole app
+    # feel narrowly DevOps. Explicit technical domains below keep their depth, and the
+    # model answers technical questions well on its own without a rigid template.
+    _general = domain == "generic_software"
+    required = [] if _general else list(profile.required_concepts)
+    forbidden = [] if _general else list(profile.forbidden_concepts)
+    dangerous = [] if _general else list(profile.dangerous_confusions)
 
     if domain in INFRASTRUCTURE_DOMAINS and profile.component_model:
         required.append("components")

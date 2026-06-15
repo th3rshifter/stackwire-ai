@@ -40,20 +40,53 @@ QFrame#shell {{
 
 QFrame#rail {{
     background: {RAIL};
+    border: 1px solid rgba(154, 214, 189, 0.09);
+    border-right: none;
     border-top-left-radius: {_px(22, scale)}px;
     border-bottom-left-radius: {_px(22, scale)}px;
-    border-right: none;
+}}
+
+QPushButton#railBrandButton {{
+    color: #eef8f4;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_px(12, scale)}px;
+    padding: 0 {_px(8, scale)}px;
+    font-family: {FONT_DISPLAY};
+    font-size: {_px(15, scale)}px;
+    font-weight: 780;
+    text-align: left;
+}}
+
+QPushButton#railBrandButton:hover {{
+    background: rgba(154, 214, 189, 0.07);
+    border: 1px solid rgba(154, 214, 189, 0.12);
+}}
+
+QPushButton#railBrandButton[brandInteractive="false"]:hover {{
+    background: transparent;
+    border: 1px solid transparent;
+}}
+
+QPushButton#railBrandButton[railCollapsed="true"] {{
+    padding: 0;
+    border-radius: {_px(18, scale)}px;
+    text-align: center;
+}}
+
+QWidget#railHeader {{
+    background: transparent;
 }}
 
 QPushButton#railButton {{
     color: #9fb7bd;
-    background: rgba(20, 28, 34, 0.50);
-    border: 1px solid rgba(154, 214, 189, 0.09);
-    border-radius: {_px(11, scale)}px;
-    padding: 0 {_px(10, scale)}px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_px(13, scale)}px;
+    padding: 0 {_px(14, scale)}px;
     font-family: {FONT_STACK};
-    font-size: {_px(12, scale)}px;
-    font-weight: 760;
+    font-size: {_px(14, scale)}px;
+    font-weight: 720;
     text-align: left;
 }}
 
@@ -69,21 +102,79 @@ QPushButton#railButton:checked {{
     border: 1px solid rgba(154, 214, 189, 0.25);
 }}
 
+QPushButton#railButton[railCollapsed="true"] {{
+    padding: 0;
+    color: #93bdc9;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_px(12, scale)}px;
+    text-align: center;
+}}
+
+QPushButton#railButton[railCollapsed="true"]:hover {{
+    color: #d7f1e7;
+    background: rgba(42, 58, 62, 0.58);
+    border: 1px solid rgba(154, 214, 189, 0.18);
+}}
+
+QPushButton#railButton[railCollapsed="true"]:checked {{
+    color: #e8fff5;
+    background: rgba(154, 214, 189, 0.16);
+    border: 1px solid rgba(154, 214, 189, 0.24);
+    border-left: {_px(3, scale)}px solid {ACCENT};
+}}
+
 QWidget#railNav {{
     background: transparent;
 }}
 
 QFrame#chatPanel {{
-    background: rgba(14, 19, 25, 0.82);
-    border-left: 1px solid rgba(154, 214, 189, 0.05);
-    border-right: 1px solid rgba(154, 214, 189, 0.08);
+    background: {RAIL};
+    border-left: none;
+    border-right: 1px solid rgba(154, 214, 189, 0.07);
 }}
 
 QLabel#chatPanelTitle {{
     color: #dcebe6;
-    font-family: {FONT_STACK};
+    font-family: {FONT_DISPLAY};
     font-size: {_px(13, scale)}px;
-    font-weight: 820;
+    font-weight: 700;
+}}
+
+QPushButton#newChatButton {{
+    color: #9ad6bd;
+    background: rgba(154, 214, 189, 0.06);
+    border: 1px solid rgba(154, 214, 189, 0.28);
+    border-radius: {_px(13, scale)}px;
+    padding: 0 {_px(14, scale)}px;
+    font-family: {FONT_STACK};
+    font-size: {_px(14, scale)}px;
+    font-weight: 780;
+    text-align: left;
+}}
+
+QPushButton#newChatButton:hover {{
+    background: rgba(154, 214, 189, 0.13);
+    border: 1px solid rgba(154, 214, 189, 0.42);
+}}
+
+QLabel#railSectionLabel {{
+    color: #5f7079;
+    font-family: {FONT_STACK};
+    font-size: {_px(10, scale)}px;
+    font-weight: 700;
+    padding: {_px(4, scale)}px {_px(4, scale)}px {_px(1, scale)}px;
+}}
+
+QFrame#railDivider {{
+    background: rgba(154, 214, 189, 0.16);
+    border: none;
+    margin: {_px(5, scale)}px {_px(2, scale)};
+}}
+
+QFrame#railGroupDivider {{
+    background: rgba(154, 214, 189, 0.22);
+    border: none;
 }}
 
 QScrollArea#chatSessionsScroll,
@@ -93,9 +184,9 @@ QWidget#chatSessionsContainer {{
 }}
 
 QFrame#chatSessionItem {{
-    background: rgba(28, 36, 46, 0.42);
-    border: 1px solid rgba(154, 214, 189, 0.07);
-    border-radius: {_px(10, scale)}px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_px(13, scale)}px;
 }}
 
 QFrame#chatSessionItem:hover {{
@@ -104,18 +195,18 @@ QFrame#chatSessionItem:hover {{
 }}
 
 QFrame#chatSessionItem[active="true"] {{
-    background: rgba(154, 214, 189, 0.11);
-    border: 1px solid rgba(154, 214, 189, 0.22);
+    background: rgba(154, 214, 189, 0.13);
+    border: 1px solid rgba(154, 214, 189, 0.10);
 }}
 
 QPushButton#chatSessionButton {{
-    color: #b9c8cf;
+    color: #d6e5e2;
     background: transparent;
     border: none;
     padding: 0 {_px(4, scale)}px;
     font-family: {FONT_STACK};
-    font-size: {_px(12, scale)}px;
-    font-weight: 650;
+    font-size: {_px(14, scale)}px;
+    font-weight: 720;
     text-align: left;
 }}
 
@@ -141,8 +232,31 @@ QPushButton#chatDeleteButton:hover {{
     background: rgba(246, 102, 102, 0.12);
 }}
 
+QPushButton#railUserButton {{
+    color: #d8e7e3;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_px(14, scale)}px;
+    padding: 0 {_px(10, scale)}px;
+    font-family: {FONT_STACK};
+    font-size: {_px(14, scale)}px;
+    font-weight: 760;
+    text-align: left;
+}}
+
+QPushButton#railUserButton:hover {{
+    background: rgba(42, 58, 62, 0.56);
+    border: 1px solid rgba(154, 214, 189, 0.14);
+}}
+
+QPushButton#railUserButton[railCollapsed="true"] {{
+    padding: 0;
+    border-radius: {_px(20, scale)}px;
+    text-align: center;
+}}
+
 QFrame#content {{
-    background: {SURFACE};
+    background: rgba(22, 27, 34, 0.97);
     border-top-right-radius: {_px(22, scale)}px;
     border-bottom-right-radius: {_px(22, scale)}px;
 }}
@@ -205,6 +319,47 @@ QLabel#status {{
     border: 1px solid rgba(154, 214, 189, 0.08);
 }}
 
+QLabel#status[listening="true"] {{
+    color: #e8896b;
+    background: rgba(232, 137, 107, 0.10);
+    border: 1px solid rgba(232, 137, 107, 0.24);
+}}
+
+QLabel#brandDot {{
+    background: transparent;
+}}
+
+QLabel#headerWordmark {{
+    color: #eafaf3;
+    font-family: {FONT_DISPLAY};
+    font-size: {_px(15, scale)}px;
+    font-weight: 700;
+}}
+
+QLabel#ghostPill {{
+    color: #8ab4f0;
+    background: rgba(138, 180, 240, 0.10);
+    border: 1px solid rgba(138, 180, 240, 0.22);
+    border-radius: {_px(9, scale)}px;
+    min-height: {_px(28, scale)}px;
+    padding: 0 {_px(10, scale)}px;
+    font-family: {FONT_STACK};
+    font-size: {_px(11, scale)}px;
+    font-weight: 600;
+}}
+
+QLabel#listenPill {{
+    color: #e8896b;
+    background: rgba(232, 137, 107, 0.10);
+    border: 1px solid rgba(232, 137, 107, 0.24);
+    border-radius: {_px(9, scale)}px;
+    min-height: {_px(28, scale)}px;
+    padding: 0 {_px(10, scale)}px;
+    font-family: {FONT_STACK};
+    font-size: {_px(11, scale)}px;
+    font-weight: 600;
+}}
+
 QLabel#debugPanel {{
     color: #a9cdbd;
     background: rgba(5, 7, 10, 170);
@@ -254,11 +409,12 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
 }}
 
 QLabel#userBubble {{
-    background: {ELEVATED};
-    border: none;
-    border-radius: {_px(18, scale)}px;
-    padding: {_px(10, scale)}px {_px(15, scale)}px;
-    color: #eef3f9;
+    background: rgba(154, 214, 189, 0.13);
+    border: 1px solid rgba(154, 214, 189, 0.18);
+    border-radius: {_px(15, scale)}px;
+    border-bottom-right-radius: {_px(5, scale)}px;
+    padding: {_px(10, scale)}px {_px(14, scale)}px;
+    color: #e7f6ef;
     font-family: {FONT_STACK};
     font-size: {_px(15, scale)}px;
 }}
@@ -269,7 +425,8 @@ QLabel#shotLabel {{
 }}
 
 QLabel#roleLabel {{
-    color: #7d8a99;
+    color: #9ad6bd;
+    font-family: {FONT_DISPLAY};
     font-size: {_px(11, scale)}px;
     font-weight: 700;
 }}
@@ -316,13 +473,13 @@ QLabel#welcomeSub {{
 }}
 
 QFrame#composer {{
-    background: {ELEVATED};
-    border: none;
-    border-radius: {_px(24, scale)}px;
+    background: rgba(16, 21, 26, 0.92);
+    border: 1px solid rgba(154, 214, 189, 0.16);
+    border-radius: {_px(16, scale)}px;
 }}
 
 QFrame#composer[focused="true"] {{
-    border: 1px solid rgba(154, 214, 189, 0.16);
+    border: 1px solid rgba(154, 214, 189, 0.38);
 }}
 
 QPushButton#composerIcon {{
@@ -345,15 +502,15 @@ QPushButton#composerIcon:pressed {{
 }}
 
 QPushButton#composerSend {{
-    min-width: {_px(40, scale)}px;
-    max-width: {_px(40, scale)}px;
-    min-height: {_px(40, scale)}px;
-    max-height: {_px(40, scale)}px;
+    min-width: {_px(38, scale)}px;
+    max-width: {_px(38, scale)}px;
+    min-height: {_px(38, scale)}px;
+    max-height: {_px(38, scale)}px;
     padding: 0;
-    color: #0d1411;
+    color: #0c1f18;
     background: {ACCENT};
     border: none;
-    border-radius: {_px(20, scale)}px;
+    border-radius: {_px(12, scale)}px;
 }}
 
 QPushButton#composerSend:hover {{
@@ -392,6 +549,40 @@ QPushButton#attachRemove {{
 QPushButton#attachRemove:hover {{
     color: #f06b6b;
     background: rgba(246, 102, 102, 0.12);
+}}
+
+QWidget#quickBar {{
+    background: transparent;
+}}
+
+QPushButton#quickChip {{
+    color: #aacdbf;
+    background: rgba(20, 28, 34, 0.55);
+    border: 1px solid rgba(154, 214, 189, 0.12);
+    border-radius: {_px(11, scale)}px;
+    padding: {_px(7, scale)}px {_px(12, scale)}px;
+    font-size: {_px(12, scale)}px;
+    font-family: {FONT_STACK};
+    font-weight: 600;
+}}
+
+QPushButton#quickChip:hover {{
+    background: rgba(154, 214, 189, 0.15);
+    color: {TEXT};
+}}
+
+QPushButton#quickChip:pressed {{
+    background: rgba(154, 214, 189, 0.22);
+}}
+
+QLabel#livePanel {{
+    color: #9fb3c2;
+    background: rgba(154, 214, 189, 0.05);
+    border: 1px solid rgba(154, 214, 189, 0.12);
+    border-radius: {_px(10, scale)}px;
+    padding: {_px(7, scale)}px {_px(11, scale)}px;
+    font-size: {_px(12, scale)}px;
+    font-family: {FONT_STACK};
 }}
 
 QFrame#slashPopup {{
@@ -685,6 +876,26 @@ QComboBox QAbstractItemView {{
     color: {TEXT};
     background: #111820;
     selection-background-color: #263139;
+}}
+
+QSlider#settingsSlider {{
+    min-height: {_px(22, scale)}px;
+}}
+QSlider#settingsSlider::groove:horizontal {{
+    height: {_px(4, scale)}px;
+    background: rgba(154, 214, 189, 0.14);
+    border-radius: {_px(2, scale)}px;
+}}
+QSlider#settingsSlider::sub-page:horizontal {{
+    background: {ACCENT};
+    border-radius: {_px(2, scale)}px;
+}}
+QSlider#settingsSlider::handle:horizontal {{
+    width: {_px(14, scale)}px;
+    height: {_px(14, scale)}px;
+    margin: {_px(-6, scale)}px 0;
+    border-radius: {_px(7, scale)}px;
+    background: {ACCENT};
 }}
 
 QLineEdit#settingsCombo {{

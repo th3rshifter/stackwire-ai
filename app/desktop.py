@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import threading
 import re
 import sys
 import time
@@ -17,7 +18,7 @@ from zipfile import ZipFile
 
 import requests
 import shiboken6
-from PySide6.QtCore import QBuffer, QEasingCurve, QEvent, QIODevice, QMimeData, QObject, QPoint, QRect, QSize, QPropertyAnimation, QThread, QTimer, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import QBuffer, QEasingCurve, QEvent, QIODevice, QMimeData, QObject, QPoint, QRect, QSize, QParallelAnimationGroup, QPropertyAnimation, QThread, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QTextCursor, QTextOption, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -73,6 +74,8 @@ from app.modelhub import (  # noqa: E402
     installed_ollama_models as _installed_ollama_models,
     is_vision_model as _is_vision_model,
     llm_provider as _llm_provider,
+    model_name_matches as _model_name_matches,
+    normalized_model_name as _normalized_model_name,
     ollama_base_url as _ollama_base_url,
     ollama_chat_url as _ollama_chat_url,
     openai_base_url as _openai_base_url,
@@ -84,9 +87,11 @@ from app.tech_terms import WHISPER_TECHNICAL_PROMPT, normalize_spoken_technical_
 from app.transcript_repair import clean_stt_output, collapse_repeated_phrases, condense_spoken_question, is_probable_stt_hallucination, repair_live_transcript  # noqa: E402
 from app.ui.actions import MAIN_RAIL_ACTIONS, RailActionSpec  # noqa: E402
 from app.ui.styles import build_window_styles as _build_window_styles  # noqa: E402
-from app.widgets.chat import AssistantRow, ChatArea, NeuralBackground, configure_chat_widgets  # noqa: E402
+from app import i18n as _i18n  # noqa: E402
+from app.widgets.chat import AssistantRow, ChatArea, NeuralBackground, VoiceWave, configure_chat_widgets  # noqa: E402
 from app.widgets.dialogs import ClickableImageLabel, FullImageDialog, NotesDialog, configure_dialog_widgets  # noqa: E402
 from app.workers.chat import AskStreamWorker, ExpandWorker, ImageAnalysisWorker, ImageGenWorker, SuggestionsWorker, configure_chat_workers  # noqa: E402
+from app.workers.speech import AudioDevice, SpeechWorker, configure_speech_worker  # noqa: E402
 
 
 def _env_float_raw(name: str, default: float) -> float:
@@ -108,24 +113,39 @@ def _rgba(red: int, green: int, blue: int, opacity: float) -> str:
     return f"rgba({red}, {green}, {blue}, {alpha})"
 
 
-STACKWIRE_PANEL_OPACITY = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 0.92), 0.45, 0.92)
-STACKWIRE_RAIL_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.10, 0.55, 0.95)
-STACKWIRE_BUBBLE_OPACITY = _clamp(STACKWIRE_PANEL_OPACITY + 0.08, 0.55, 0.94)
+# Overlay translucency is WINDOW-level (setWindowOpacity); per-widget surfaces are
+# opaque so STACKWIRE_PANEL_OPACITY cleanly controls the whole window (View → Прозрачность).
+# 1.0 = fully opaque ("100%"); presets go down to 0.30.
+STACKWIRE_PANEL_OPACITY = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 1.0), 0.30, 1.0)
+# UI language for the app interface ("ru"/"en"); also drives the answer language.
+STACKWIRE_UI_LANGUAGE = (os.getenv("STACKWIRE_UI_LANGUAGE", os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru")).strip().lower() or "ru")
+if STACKWIRE_UI_LANGUAGE not in {"ru", "en"}:
+    STACKWIRE_UI_LANGUAGE = "ru"
+
+
+_i18n.set_language(STACKWIRE_UI_LANGUAGE)
+
+
+def tr(ru: str, en: str) -> str:
+    return _i18n.tr(ru, en)
+
+
+def t(key: str) -> str:
+    return _i18n.t(key)
 
 ACCENT = "#9ad6bd"          # primary mint
 ACCENT2 = "#8ab4f0"         # secondary cool вЂ" role, links, selection
 CORAL = "#e8896b"           # warm вЂ" active recording indicator
 GOLD = "#a98cff"            # (unused, kept for back-compat)
 BLUE = "#8ab4f0"            # links / selection
-# Layered surfaces: translucent per-widget, so text stays opaque while the app
-# still works as an overlay. Tune with STACKWIRE_PANEL_OPACITY=0.45..0.92.
-BG = _rgba(17, 21, 27, STACKWIRE_PANEL_OPACITY)
-SURFACE = _rgba(25, 30, 38, STACKWIRE_PANEL_OPACITY)
-ELEVATED = _rgba(43, 50, 61, STACKWIRE_BUBBLE_OPACITY)
+# Opaque layered surfaces (window-level opacity does the overlay see-through).
+BG = _rgba(17, 21, 27, 0.99)
+SURFACE = _rgba(25, 30, 38, 0.99)
+ELEVATED = _rgba(43, 50, 61, 0.99)
 HAIRLINE = "rgba(154, 214, 189, 0.08)"
 PANEL = BG                          # back-compat alias
 PANEL_LIGHT = "rgba(10, 13, 18, 230)"
-RAIL = _rgba(9, 12, 16, STACKWIRE_RAIL_OPACITY)
+RAIL = _rgba(9, 12, 16, 0.99)
 TEXT = "#dbeee7"
 MUTED = "#8295a0"
 
@@ -134,6 +154,22 @@ FONT_DISPLAY = '"Space Grotesk", "Manrope", "Segoe UI", sans-serif'
 FONTS_DIR = ROOT_DIR / "assets" / "fonts"
 MODELS_DIR = ROOT_DIR / "models"
 DEFAULT_VOSK_MODEL_NAME = os.getenv("VOSK_MODEL_NAME", "vosk-model-ru-0.54")
+
+RAIL_EXPANDED_WIDTH = 300
+RAIL_COLLAPSED_WIDTH = 92
+RAIL_PADDING_X = 14
+RAIL_ITEM_WIDTH = RAIL_EXPANDED_WIDTH - (RAIL_PADDING_X * 2)
+RAIL_TOGGLE_SIZE = 38
+RAIL_HEADER_GAP = 8
+RAIL_BRAND_WIDTH = RAIL_ITEM_WIDTH - RAIL_TOGGLE_SIZE - RAIL_HEADER_GAP
+RAIL_ICON_SIZE = 22
+RAIL_COLLAPSED_ACTIVE_SIZE = 64
+RAIL_COLLAPSED_BUTTON_SIZE = 52
+RAIL_EXPANDED_ROW_HEIGHT = 46
+RAIL_NEW_CHAT_HEIGHT = 54
+RAIL_USER_HEIGHT = 48
+RAIL_DIVIDER_WIDTH = 44
+RAIL_ANIMATION_MS = 180
 DEFAULT_VOSK_MODEL_DIR = MODELS_DIR / DEFAULT_VOSK_MODEL_NAME
 DEFAULT_VOSK_MODEL_ZIP = MODELS_DIR / f"{DEFAULT_VOSK_MODEL_NAME}.zip"
 DEFAULT_VOSK_MODEL_URL = os.getenv(
@@ -180,7 +216,9 @@ STACKWIRE_API_CONNECT_TIMEOUT = float(os.getenv("STACKWIRE_API_CONNECT_TIMEOUT",
 STACKWIRE_API_TIMEOUT = float(os.getenv("STACKWIRE_API_TIMEOUT", "300"))
 STACKWIRE_REMOTE_STT = os.getenv("STACKWIRE_REMOTE_STT", "1" if STACKWIRE_API_URL else "0").strip() == "1"
 STACKWIRE_STT_TIMEOUT = float(os.getenv("STACKWIRE_STT_TIMEOUT", "120"))
-STACKWIRE_HIDE_FROM_CAPTURE = os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "0").strip() == "1"
+# Ghost mode by default: the overlay is excluded from screen capture/sharing
+# (Zoom/Meet/Teams see everything EXCEPT this window). Set to 0 to make it visible.
+STACKWIRE_HIDE_FROM_CAPTURE = os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "1").strip() == "1"
 STACKWIRE_HIDE_TASKBAR = os.getenv("STACKWIRE_HIDE_TASKBAR", "0").strip() == "1"
 STACKWIRE_ACRYLIC = os.getenv("STACKWIRE_ACRYLIC", "0").strip().lower() in {"1", "true", "yes", "on"}
 MIN_UI_ZOOM = 0.75
@@ -196,18 +234,18 @@ DEFAULT_MODEL_CHOICES: tuple[str, ...] = (
 )
 
 EXPAND_LABELS: dict[str, str] = {
-    "details": "Р Р°СЃС€РёСЂРµРЅРёРµ: РџРѕРґСЂРѕР±РЅРµРµ",
-    "components": "Р Р°СЃС€РёСЂРµРЅРёРµ: РЎ РєРѕРјРїРѕРЅРµРЅС‚Р°РјРё",
-    "example": "Р Р°СЃС€РёСЂРµРЅРёРµ: РџСЂРёРјРµСЂ",
-    "compare": "Р Р°СЃС€РёСЂРµРЅРёРµ: РЎСЂР°РІРЅРµРЅРёРµ",
-    "troubleshoot": "Р Р°СЃС€РёСЂРµРЅРёРµ: Troubleshooting",
+    "details": "Расширение: Подробнее",
+    "components": "Расширение: С компонентами",
+    "example": "Расширение: Пример",
+    "compare": "Расширение: Сравнение",
+    "troubleshoot": "Расширение: Troubleshooting",
 }
 
 EXPAND_MENU_ITEMS: tuple[tuple[str, str], ...] = (
-    ("details", "РџРѕРґСЂРѕР±РЅРµРµ"),
-    ("components", "РЎ РєРѕРјРїРѕРЅРµРЅС‚Р°РјРё"),
-    ("example", "РЎ РїСЂРёРјРµСЂРѕРј РєРѕРґР°/РєРѕРЅС„РёРіР°"),
-    ("compare", "РЎСЂР°РІРЅРёС‚СЊ СЃ Р°РЅР°Р»РѕРіР°РјРё"),
+    ("details", "Подробнее"),
+    ("components", "С компонентами"),
+    ("example", "С примером кода/конфига"),
+    ("compare", "Сравнить с аналогами"),
     ("troubleshoot", "Troubleshooting"),
 )
 
@@ -221,36 +259,36 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 LIGHTWEIGHT_STT_CORRECTIONS: tuple[tuple[str, str], ...] = (
-    (r"\bРґРµРІ\s+Рё\s+РїСЂРѕРє\b", "/dev Рё /proc"),
-    (r"\bРґРµРІ\b", "/dev"),
-    (r"\bРїСЂРѕРє\b", "/proc"),
-    (r"\bРµС‚СЃ\b", "/etc"),
-    (r"\bРІР°СЂ\s+Р»РѕРі\b", "/var/log"),
+    (r"\bдев\s+и\s+прок\b", "/dev и /proc"),
+    (r"\bдев\b", "/dev"),
+    (r"\bпрок\b", "/proc"),
+    (r"\bетс\b", "/etc"),
+    (r"\bвар\s+лог\b", "/var/log"),
 )
 
 LIVE_FILLER_WORDS = (
-    "РѕРєРµР№",
-    "С…Рј",
-    "С…РјРј",
-    "РјРј",
-    "РјРјРј",
-    "Рј",
-    "Р°Р°",
-    "Р°Р°Р°",
-    "СЌСЌ",
-    "СЌСЌСЌ",
-    "Р»Р°РґРЅРѕ",
-    "СЃР»СѓС€Р°Р№",
-    "СЃРјРѕС‚СЂРё",
-    "Р·РЅР°С‡РёС‚",
-    "РєРѕСЂРѕС‡Рµ",
-    "С‚РёРїР°",
-    "РЅСѓ",
-    "РІРѕС‚",
-    "РІРѕРѕР±С‰Рµ",
-    "РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
-    "РґР°РІР°Р№",
-    "РґР°РІР°Р№С‚Рµ",
+    "окей",
+    "хм",
+    "хмм",
+    "мм",
+    "ммм",
+    "м",
+    "аа",
+    "ааа",
+    "ээ",
+    "эээ",
+    "ладно",
+    "слушай",
+    "смотри",
+    "значит",
+    "короче",
+    "типа",
+    "ну",
+    "вот",
+    "вообще",
+    "пожалуйста",
+    "давай",
+    "давайте",
 )
 
 
@@ -280,20 +318,20 @@ def _save_local_env_values(values: dict[str, str]) -> None:
     LOCAL_ENV_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 LIVE_FILLER_PHRASES = (
-    "РІ РѕР±С‰РµРј",
-    "РЅР° СЃР°РјРѕРј РґРµР»Рµ",
-    "РјРѕР¶РµС€СЊ СЂР°СЃСЃРєР°Р·Р°С‚СЊ",
-    "РјРѕР¶РµС€СЊ РѕР±СЉСЏСЃРЅРёС‚СЊ",
-    "СЂР°СЃСЃРєР°Р¶Рё РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
-    "РѕР±СЉСЏСЃРЅРё РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
+    "в общем",
+    "на самом деле",
+    "можешь рассказать",
+    "можешь объяснить",
+    "расскажи пожалуйста",
+    "объясни пожалуйста",
 )
 
 LIVE_TRAILING_NOISE = (
-    "Р·РЅР°РµС€СЊ",
-    "Р·РЅР°РµС€СЊ РЅРµС‚",
-    "РїРѕРЅРёРјР°РµС€СЊ",
-    "РґР°",
-    "РЅРµС‚",
+    "знаешь",
+    "знаешь нет",
+    "понимаешь",
+    "да",
+    "нет",
 )
 
 
@@ -325,8 +363,8 @@ def clean_live_transcript(text: str) -> str:
         cleaned = re.sub(rf"\b{re.escape(phrase)}\b[,\s]*", " ", cleaned, flags=re.IGNORECASE)
     filler_pattern = r"\b(?:" + "|".join(re.escape(word) for word in LIVE_FILLER_WORDS) + r")\b[,\s]*"
     cleaned = re.sub(filler_pattern, " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:Р°|Рё)\s+(?=(С‡С‚Рѕ|РєР°Рє|С‡РµРј|РєРѕРіРґР°|РїРѕС‡РµРјСѓ|Р·Р°С‡РµРј|СЂР°СЃСЃРєР°Р¶Рё|РѕР±СЉСЏСЃРЅРё)\b)", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:СЂР°СЃСЃРєР°Р¶Рё|СЂР°СЃСЃРєР°Р·Р°С‚СЊ|РѕР±СЉСЏСЃРЅРё|РѕР±СЉСЏСЃРЅРёС‚СЊ)\s+(?=С‡С‚Рѕ С‚Р°РєРѕРµ\b)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:а|и)\s+(?=(что|как|чем|когда|почему|зачем|расскажи|объясни)\b)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:расскажи|рассказать|объясни|объяснить)\s+(?=что такое\b)", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;")
 
     for phrase in LIVE_TRAILING_NOISE:
@@ -344,13 +382,13 @@ def clean_live_transcript(text: str) -> str:
 
 
 def _merge_definition_fragments(text: str) -> str:
-    parts = [part.strip(" ,.?") for part in re.split(r"\bС‡С‚Рѕ С‚Р°РєРѕРµ\b", text, flags=re.IGNORECASE)]
+    parts = [part.strip(" ,.?") for part in re.split(r"\bчто такое\b", text, flags=re.IGNORECASE)]
     if len(parts) <= 2:
         return text
 
     terms: list[str] = []
     for part in parts[1:]:
-        part = re.sub(r"\b(?:Р·РЅР°РµС€СЊ|РЅРµС‚|РґР°|РїРѕР¶Р°Р»СѓР№СЃС‚Р°)\b", "", part, flags=re.IGNORECASE)
+        part = re.sub(r"\b(?:знаешь|нет|да|пожалуйста)\b", "", part, flags=re.IGNORECASE)
         part = re.sub(r"\s+", " ", part).strip(" ,.?")
         if part:
             terms.append(part)
@@ -358,39 +396,57 @@ def _merge_definition_fragments(text: str) -> str:
     if not terms:
         return text
     if len(terms) == 1:
-        return f"С‡С‚Рѕ С‚Р°РєРѕРµ {terms[0]}"
-    return "С‡С‚Рѕ С‚Р°РєРѕРµ " + ", ".join(terms[:-1]) + " Рё " + terms[-1]
+        return f"что такое {terms[0]}"
+    return "что такое " + ", ".join(terms[:-1]) + " и " + terms[-1]
 
 
-QUESTION_MARKERS = (
-    "С‡С‚Рѕ",
-    "РєР°Рє",
-    "РїРѕС‡РµРјСѓ",
-    "Р·Р°С‡РµРј",
-    "РєРѕРіРґР°",
-    "РіРґРµ",
-    "С‡РµРј",
-    "РєР°РєРѕР№",
-    "РєР°РєР°СЏ",
-    "РєР°РєРёРµ",
-    "РѕР±СЉСЏСЃРЅРё",
-    "РѕР±СЉСЏСЃРЅРёС‚СЊ",
-    "СЂР°СЃСЃРєР°Р¶Рё",
-    "СЂР°СЃСЃРєР°Р·Р°С‚СЊ",
-    "РѕРїРёС€Рё",
-    "СЃСЂР°РІРЅРё",
-    "СЂР°Р·РЅРёС†Р°",
-    "РѕС‚Р»РёС‡Р°РµС‚СЃСЏ",
-    "РґРёР°РіРЅРѕСЃС‚РёСЂРѕРІР°С‚СЊ",
-    "РїРѕС‡РёРЅРёС‚СЊ",
-    "debug",
-    "troubleshoot",
+# Interrogative pronouns/adverbs: a strong question signal ONLY when they lead the
+# clause ("Как работает X?"). Mid-sentence they are usually conjunctions ("я знаю
+# ЧТО это", "там ГДЕ мы были", "КАК обычно") — counting those as questions made the
+# live gate answer ordinary statements.
+QUESTION_LEAD_WORDS = (
+    "что", "чё", "чо", "чего", "чему", "чем", "чём",
+    "как", "почему", "зачем", "когда", "где", "куда", "откуда",
+    "какой", "какая", "какое", "какие", "какого", "какому", "каким",
+    "каком", "какую", "каких", "какими",
+    "кто", "кого", "кому", "кем", "ком",
+    "сколько", "скольких", "чей", "чья", "чьё", "чьи",
 )
+# Imperative requests + comparison words: reliable anywhere in the utterance.
+REQUEST_MARKERS = (
+    "объясни", "объяснить", "расскажи", "рассказать", "опиши", "описать",
+    "сравни", "сравнить", "перечисли", "покажи", "показать",
+    "диагностировать", "починить", "debug", "troubleshoot",
+)
+# Particles + prepositions that may precede a leading question word and should be
+# skipped when locating it ("ну как...", "а что...", "в чём...", "на каком...").
+_QUESTION_LEAD_SKIP = frozenset({
+    "а", "и", "ну", "вот", "так", "слушай", "скажи", "ок", "окей",
+    "в", "во", "о", "об", "обо", "на", "с", "со", "по", "к", "ко",
+    "при", "из", "от", "для", "у", "до", "за", "над", "под",
+})
+# Words that turn a leading "как" into a statement idiom ("как обычно", "как раз").
+_KAK_STATEMENT_NEXT = frozenset({"обычно", "всегда", "раз", "бы", "то", "будто", "если", "только"})
+# Kept for backwards compatibility / external callers.
+QUESTION_MARKERS = QUESTION_LEAD_WORDS + REQUEST_MARKERS
 
 
 def looks_like_question(text: str) -> bool:
     lowered = text.lower()
-    return "?" in lowered or any(marker in lowered for marker in QUESTION_MARKERS)
+    if "?" in lowered:
+        return True
+    if any(marker in lowered for marker in REQUEST_MARKERS):
+        return True
+    # An interrogative word counts only as the FIRST meaningful token (after
+    # skipping particles/prepositions) — mid-sentence it is usually a conjunction.
+    tokens = re.findall(r"[\wёЁ]+", lowered)
+    meaningful = [t for t in tokens if t not in _QUESTION_LEAD_SKIP]
+    if not meaningful or meaningful[0] not in QUESTION_LEAD_WORDS:
+        return False
+    # "как обычно / как раз / как бы ..." — leading "как" but a statement.
+    if meaningful[0] == "как" and len(meaningful) > 1 and meaningful[1] in _KAK_STATEMENT_NEXT:
+        return False
+    return True
 
 
 def append_transcript_segment(current: str, addition: str, max_words: int | None = None) -> str:
@@ -621,6 +677,40 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
         painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.54), int(s * 0.54))
         painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.70), int(s * 0.56))
         painter.drawLine(int(s * 0.70), int(s * 0.70), int(s * 0.56), int(s * 0.70))
+    elif kind == "spark":
+        # Filled lightning bolt — instant response
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        bolt = QPainterPath()
+        bolt.moveTo(s * 0.58, s * 0.12)
+        bolt.lineTo(s * 0.28, s * 0.55)
+        bolt.lineTo(s * 0.47, s * 0.55)
+        bolt.lineTo(s * 0.42, s * 0.88)
+        bolt.lineTo(s * 0.72, s * 0.45)
+        bolt.lineTo(s * 0.53, s * 0.45)
+        bolt.closeSubpath()
+        painter.drawPath(bolt)
+    elif kind == "short":
+        # Chevrons converging on a line — compress / short-circuit
+        painter.drawLine(int(s * 0.28), int(s * 0.50), int(s * 0.72), int(s * 0.50))
+        painter.drawLine(int(s * 0.38), int(s * 0.16), int(s * 0.50), int(s * 0.32))
+        painter.drawLine(int(s * 0.62), int(s * 0.16), int(s * 0.50), int(s * 0.32))
+        painter.drawLine(int(s * 0.38), int(s * 0.84), int(s * 0.50), int(s * 0.68))
+        painter.drawLine(int(s * 0.62), int(s * 0.84), int(s * 0.50), int(s * 0.68))
+    elif kind == "amp":
+        # Three rising bars — amplify / go deeper
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(int(s * 0.24), int(s * 0.58), int(s * 0.13), int(s * 0.24), int(s * 0.04), int(s * 0.04))
+        painter.drawRoundedRect(int(s * 0.44), int(s * 0.42), int(s * 0.13), int(s * 0.40), int(s * 0.04), int(s * 0.04))
+        painter.drawRoundedRect(int(s * 0.64), int(s * 0.22), int(s * 0.13), int(s * 0.60), int(s * 0.04), int(s * 0.04))
+    elif kind == "loop":
+        # Open loop with an arrowhead — close the loop / recap
+        rect = QRect(int(s * 0.22), int(s * 0.26), int(s * 0.56), int(s * 0.48))
+        painter.drawArc(rect, 40 * 16, 300 * 16)
+        ax, ay = int(s * 0.74), int(s * 0.38)
+        painter.drawLine(ax, ay, int(s * 0.74), int(s * 0.54))
+        painter.drawLine(ax, ay, int(s * 0.58), int(s * 0.42))
 
     painter.end()
     return pixmap
@@ -687,26 +777,27 @@ def build_html_style() -> str:
 <style>
 body {{
   margin: 0;
-  color: #c7d1db;
+  color: #cdd8e1;
   font-family: {FONT_STACK};
-  font-size: {_px(16)}px;
-  line-height: 1.6;
+  font-size: {_px(14)}px;
+  line-height: 1.5;
 }}
 h2 {{
-  margin: {_px(13)}px 0 {_px(7)}px;
-  color: #e4e9f0;
-  font-size: {_px(17)}px;
+  margin: {_px(12)}px 0 {_px(6)}px;
+  color: #9ad6bd;
+  font-family: {FONT_DISPLAY};
+  font-size: {_px(16)}px;
   font-weight: 700;
 }}
 p {{
-  margin: 0 0 {_px(9)}px;
+  margin: 0 0 {_px(7)}px;
 }}
 ul {{
-  margin: 0 0 {_px(11)}px {_px(20)}px;
+  margin: 0 0 {_px(9)}px {_px(19)}px;
   padding: 0;
 }}
 li {{
-  margin: {_px(5)}px 0;
+  margin: {_px(4)}px 0;
 }}
 code {{
   padding: {_px(2)}px {_px(6)}px;
@@ -800,6 +891,27 @@ pre {{
 }}
 .md-table tr:nth-child(even) td {{
   background: rgba(255, 255, 255, 0.025);
+}}
+h3 {{
+  margin: {_px(10)}px 0 {_px(5)}px;
+  color: #cfeae0;
+  font-family: {FONT_DISPLAY};
+  font-size: {_px(14)}px;
+  font-weight: 600;
+}}
+ol {{
+  margin: 0 0 {_px(9)}px {_px(20)}px;
+  padding: 0;
+}}
+a {{
+  color: #8ab4f0;
+  text-decoration: none;
+}}
+blockquote {{
+  margin: {_px(8)}px 0;
+  padding: {_px(1)}px 0 {_px(1)}px {_px(12)}px;
+  border-left: {_px(3)}px solid rgba(154, 214, 189, 0.5);
+  color: #aab6c0;
 }}
 </style>
 """
@@ -1056,14 +1168,14 @@ CODE_LABEL_LANGUAGES: dict[str, str] = {
 }
 
 SECTION_HEADINGS = {
-    "РєРѕСЂРѕС‚РєРѕ:",
-    "РєР°Рє СЂР°Р±РѕС‚Р°РµС‚:",
-    "РїСЂР°РєС‚РёРєР°:",
-    "РїСЂРёРјРµСЂ:",
-    "РЅСЋР°РЅСЃ:",
+    "коротко:",
+    "как работает:",
+    "практика:",
+    "пример:",
+    "нюанс:",
     "best practices:",
-    "РѕСЃРЅРѕРІРЅРѕР№ РѕС‚РІРµС‚:",
-    "РїРѕРґСЂРѕР±РЅС‹Р№ РѕС‚РІРµС‚:",
+    "основной ответ:",
+    "подробный ответ:",
 }
 
 
@@ -1150,7 +1262,7 @@ def _looks_like_code_line(text: str, language: str) -> bool:
 def _looks_like_plain_text(text: str) -> bool:
     if len(text) < 45:
         return False
-    return bool(re.search(r"[Р°-СЏРђ-РЇ]", text)) and not bool(re.search(r"[{}:=#;/\\[\\]$]", text))
+    return bool(re.search(r"[а-яА-Я]", text)) and not bool(re.search(r"[{}:=#;/\\[\\]$]", text))
 
 
 def highlight_code(language: str, code: str) -> str:
@@ -1265,8 +1377,8 @@ def render_message_fragment(markdown: str) -> str:
 
 
 def render_user_message_fragment(markdown: str) -> str:
-    # Older sessions stored a "Р’РѕРїСЂРѕСЃ N" prefix; strip it so no label/stripe is shown.
-    match = re.match(r"^Р’РѕРїСЂРѕСЃ\s+\d+\s*\n\n(.+)$", markdown.strip(), flags=re.DOTALL)
+    # Older sessions stored a "Вопрос N" prefix; strip it so no label/stripe is shown.
+    match = re.match(r"^Вопрос\s+\d+\s*\n\n(.+)$", markdown.strip(), flags=re.DOTALL)
     body = match.group(1).strip() if match else markdown
     return render_message_fragment(body)
 
@@ -1309,11 +1421,18 @@ def _table_lines_to_html(raw_lines: list[str]) -> str:
 
 
 def _inline_format(text: str) -> str:
-    """Apply inline markdown: backtick code, bold, links."""
+    """Apply inline markdown: backtick code, bold, markdown + bare links."""
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    # Markdown links [text](url) — handle BEFORE bare URLs so the url inside isn't double-wrapped.
     text = re.sub(
-        r"(https?://[^\s<]+)",
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        lambda m: f'<a href="{m.group(2)}" style="color:{BLUE};text-decoration:none">{m.group(1)}</a>',
+        text,
+    )
+    # Bare URLs — skip ones already inside an href="..." (negative lookbehind on " or =).
+    text = re.sub(
+        r'(?<!["=])(https?://[^\s<]+)',
         lambda m: f'<a href="{m.group(1)}" style="color:{BLUE};text-decoration:none">{m.group(1)}</a>',
         text,
     )
@@ -1327,15 +1446,23 @@ def text_to_html(text: str) -> str:
 
     lines = escaped.splitlines()
     out: list[str] = []
-    in_list = False
+    list_type: str | None = None  # "ul" or "ol"
     in_table = False
     table_lines: list[str] = []
+    quote_lines: list[str] = []
 
     def flush_list() -> None:
-        nonlocal in_list
-        if in_list:
-            out.append("</ul>")
-            in_list = False
+        nonlocal list_type
+        if list_type:
+            out.append(f"</{list_type}>")
+            list_type = None
+
+    def open_list(kind: str) -> None:
+        nonlocal list_type
+        if list_type != kind:
+            flush_list()
+            out.append(f"<{kind}>")
+            list_type = kind
 
     def flush_table() -> None:
         nonlocal in_table, table_lines
@@ -1344,6 +1471,12 @@ def text_to_html(text: str) -> str:
             table_lines = []
             in_table = False
 
+    def flush_quote() -> None:
+        nonlocal quote_lines
+        if quote_lines:
+            out.append(f"<blockquote>{'<br>'.join(quote_lines)}</blockquote>")
+            quote_lines = []
+
     for line in lines:
         stripped = line.strip()
 
@@ -1351,11 +1484,13 @@ def text_to_html(text: str) -> str:
         if not stripped:
             flush_list()
             flush_table()
+            flush_quote()
             continue
 
         # Table row detection: starts with | and has at least one more |
         if stripped.startswith("|") and stripped.count("|") >= 2:
             flush_list()
+            flush_quote()
             in_table = True
             table_lines.append(stripped)
             continue
@@ -1364,26 +1499,33 @@ def text_to_html(text: str) -> str:
         if in_table:
             flush_table()
 
+        # Blockquote ("> " — note html.escape turned ">" into "&gt;").
+        if stripped.startswith("&gt; ") or stripped == "&gt;":
+            flush_list()
+            content = stripped[5:] if stripped.startswith("&gt; ") else ""
+            quote_lines.append(_inline_format(content))
+            continue
+        if quote_lines:
+            flush_quote()
+
         formatted = _inline_format(stripped)
 
         if stripped.startswith(("- ", "* ")):
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
+            open_list("ul")
             out.append(f"<li>{_inline_format(stripped[2:])}</li>")
             continue
 
         numbered = re.match(r"^\d+\.\s+(.+)$", stripped)
         if numbered:
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
+            open_list("ol")
             out.append(f"<li>{_inline_format(numbered.group(1))}</li>")
             continue
 
         flush_list()
 
-        if stripped.startswith("## "):
+        if stripped.startswith("### "):
+            out.append(f"<h3>{_inline_format(stripped[4:])}</h3>")
+        elif stripped.startswith("## "):
             out.append(f"<h2>{_inline_format(stripped[3:])}</h2>")
         elif stripped.startswith("# "):
             out.append(f"<h2>{_inline_format(stripped[2:])}</h2>")
@@ -1394,6 +1536,7 @@ def text_to_html(text: str) -> str:
 
     flush_list()
     flush_table()
+    flush_quote()
 
     return "".join(out)
 
@@ -1586,7 +1729,7 @@ class LoginDialog(QDialog):
         self.username = ""
         self._mode = "login"  # or "register"
 
-        self.setWindowTitle("Stackwire - sign in")
+        self.setWindowTitle("StackWire - sign in")
         self.setModal(True)
         self.setObjectName("settingsDialog")
         self.setMinimumWidth(_px(420))
@@ -1595,7 +1738,7 @@ class LoginDialog(QDialog):
         layout.setContentsMargins(_px(22), _px(20), _px(22), _px(18))
         layout.setSpacing(_px(12))
 
-        title = QLabel("Sign in to Stackwire")
+        title = QLabel("Sign in to StackWire")
         title.setObjectName("dialogTitle")
         self._subtitle = QLabel("Sign in to use chat.")
         self._subtitle.setObjectName("dialogNote")
@@ -1697,7 +1840,7 @@ class SettingsDialog(QDialog):
         # (authenticated, logout, prompt_login, ...) not on QWidget. Access is guarded
         # with hasattr/getattr at runtime; type as Any so the checker allows it.
         self._window: Any = parent
-        self.setWindowTitle("Stackwire settings")
+        self.setWindowTitle("StackWire settings")
         self.setModal(True)
         self.setObjectName("settingsDialog")
         self.setMinimumWidth(_px(940))
@@ -1716,11 +1859,12 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.setObjectName("settingsTabs")
-        tabs.addTab(self._build_account_tab(), "Account")
-        tabs.addTab(self._build_models_tab(models), "ModelHub")
-        tabs.addTab(self._build_speech_tab(audio_devices, current_audio_device), "Speech")
-        tabs.addTab(self._build_knowledge_tab(), "Knowledge")
-        tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
+        tabs.addTab(self._build_account_tab(), t("tab_account"))
+        tabs.addTab(self._build_models_tab(models), t("tab_modelhub"))
+        tabs.addTab(self._build_speech_tab(audio_devices, current_audio_device), t("tab_speech"))
+        tabs.addTab(self._build_view_tab(), t("tab_view"))
+        tabs.addTab(self._build_knowledge_tab(), t("tab_knowledge"))
+        tabs.addTab(self._build_diagnostics_tab(), t("tab_diagnostics"))
 
         actions = QHBoxLayout()
         actions.addStretch(1)
@@ -2007,13 +2151,25 @@ class SettingsDialog(QDialog):
 
     def _sync_model_combos(self, models: set[str]) -> None:
         current_values = [self.answer_model.currentText(), self.recovery_model.currentText(), self.vision_model.currentText()]
-        choices = _dedupe_models(sorted(model.strip() for model in models if model.strip()))
+        # Never leave the dropdowns empty: even if Ollama didn't answer in time,
+        # the currently configured models must stay selectable.
+        fallback = {
+            current_answer_model(),
+            current_recovery_model(),
+            current_vision_model(),
+            *(value for value in current_values if value.strip()),
+        }
+        merged = set(models) | {name for name in fallback if name.strip()}
+        choices = _dedupe_models(sorted(model.strip() for model in merged if model.strip()))
         vision_choices = [model for model in choices if _is_vision_model(model)]
 
         def selected(current: str, available: list[str]) -> str:
             current = current.strip()
             if current in available:
                 return current
+            for model in available:
+                if _model_name_matches(current, model):
+                    return model
             return available[0] if available else ""
 
         for combo, current in ((self.answer_model, current_values[0]), (self.recovery_model, current_values[1]), (self.vision_model, current_values[2])):
@@ -2041,23 +2197,50 @@ class SettingsDialog(QDialog):
         self._model_cards = {}
         hardware, ram_gb, vram_gb = _hardware_summary()
         self.hardware_label.setText(hardware)
-        installed_only = [
-            model
-            for model in sorted(self._installed_models)
-            if model not in {recommendation.name for recommendation in MODELHUB_RECOMMENDED}
-        ]
+        shown_recommendations: set[str] = set()
+        shown_models: set[str] = set()
+
+        for model in sorted(self._installed_models, key=str.lower):
+            recommendation = self._recommendation_for_installed_model(model)
+            shown_models.add(_normalized_model_name(model))
+            if recommendation is None:
+                recommendation = ModelRecommendation(model, model, "installed", "custom", "Already installed in provider.", 0)
+            else:
+                shown_recommendations.add(_normalized_model_name(recommendation.name))
+            self.model_cards_layout.insertWidget(
+                self.model_cards_layout.count() - 1,
+                self._make_model_card(recommendation, ram_gb, vram_gb, installed_model=model),
+            )
+
         for recommendation in MODELHUB_RECOMMENDED:
-            self.model_cards_layout.insertWidget(self.model_cards_layout.count() - 1, self._make_model_card(recommendation, ram_gb, vram_gb))
-        for model in installed_only:
-            recommendation = ModelRecommendation(model, model, "installed", "custom", "Already installed in provider.", 0)
-            self.model_cards_layout.insertWidget(self.model_cards_layout.count() - 1, self._make_model_card(recommendation, ram_gb, vram_gb))
+            key = _normalized_model_name(recommendation.name)
+            if key in shown_recommendations or key in shown_models:
+                continue
+            self.model_cards_layout.insertWidget(
+                self.model_cards_layout.count() - 1,
+                self._make_model_card(recommendation, ram_gb, vram_gb),
+            )
         self.model_cards_layout.activate()
         self.model_cards_container.adjustSize()
         self.model_cards_container.updateGeometry()
         self.model_cards_container.update()
 
-    def _make_model_card(self, recommendation: ModelRecommendation, ram_gb: int, vram_gb: int) -> QFrame:
-        installed = recommendation.name in self._installed_models
+    def _recommendation_for_installed_model(self, model: str) -> ModelRecommendation | None:
+        for recommendation in MODELHUB_RECOMMENDED:
+            if _model_name_matches(model, recommendation.name):
+                return recommendation
+        return None
+
+    def _installed_model_name(self, model: str) -> str:
+        for installed in sorted(self._installed_models, key=str.lower):
+            if _model_name_matches(installed, model):
+                return installed
+        return ""
+
+    def _make_model_card(self, recommendation: ModelRecommendation, ram_gb: int, vram_gb: int, installed_model: str = "") -> QFrame:
+        active_model = installed_model or self._installed_model_name(recommendation.name)
+        installed = bool(active_model)
+        model_name = active_model or recommendation.name
         suitability = _hardware_recommendation_note(recommendation, ram_gb, vram_gb)
         card = QFrame()
         card.setObjectName("modelCard")
@@ -2072,7 +2255,7 @@ class SettingsDialog(QDialog):
         text_box = QVBoxLayout()
         title = QLabel(recommendation.title)
         title.setObjectName("modelCardTitle")
-        meta = QLabel(f"{recommendation.name} - {recommendation.kind} - {recommendation.size} - {suitability}")
+        meta = QLabel(f"{model_name} - {recommendation.kind} - {recommendation.size} - {suitability}")
         meta.setObjectName("dialogNote")
         meta.setWordWrap(True)
         note = QLabel(recommendation.note)
@@ -2089,7 +2272,7 @@ class SettingsDialog(QDialog):
         use = QPushButton("Use")
         use.setObjectName("ghostButton")
         use.setEnabled(installed)
-        use.clicked.connect(lambda _checked=False, model=recommendation.name: self.use_model(model))
+        use.clicked.connect(lambda _checked=False, model=model_name: self.use_model(model))
 
         pull = QPushButton("Pull")
         pull.setObjectName("ghostButton")
@@ -2099,7 +2282,7 @@ class SettingsDialog(QDialog):
         test = QPushButton("Test")
         test.setObjectName("ghostButton")
         test.setEnabled(installed)
-        test.clicked.connect(lambda _checked=False, model=recommendation.name: self.test_model(model))
+        test.clicked.connect(lambda _checked=False, model=model_name: self.test_model(model))
 
         buttons = QHBoxLayout()
         buttons.addWidget(status)
@@ -2110,7 +2293,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(icon)
         layout.addLayout(text_box, 1)
         layout.addLayout(buttons)
-        self._model_cards[recommendation.name] = card
+        self._model_cards[model_name] = card
         return card
 
     def use_model(self, model: str) -> None:
@@ -2289,7 +2472,11 @@ class SettingsDialog(QDialog):
         if current in choices:
             combo.setCurrentText(current)
         elif choices:
-            combo.setCurrentIndex(0)
+            matched = next((model for model in choices if _model_name_matches(current, model)), "")
+            if matched:
+                combo.setCurrentText(matched)
+            else:
+                combo.setCurrentIndex(0)
         return combo
 
     def _audio_combo(self, devices: list[str], current: str) -> NoWheelComboBox:
@@ -2300,6 +2487,40 @@ class SettingsDialog(QDialog):
         combo.addItems(choices)
         combo.setCurrentText(current)
         return combo
+
+    def _build_view_tab(self) -> QWidget:
+        page, form = self._form_page()
+
+        # Opacity as fixed presets (a free % slider felt fiddly to drag).
+        self._opacity_options = [("100%", 1.0), ("70%", 0.70), ("50%", 0.50), ("30%", 0.30)]
+        self.view_opacity = NoWheelComboBox()
+        self.view_opacity.setObjectName("settingsCombo")
+        for label, _v in self._opacity_options:
+            self.view_opacity.addItem(label)
+        _cur = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 1.0), 0.30, 1.0)
+        self.view_opacity.setCurrentIndex(min(range(len(self._opacity_options)), key=lambda i: abs(self._opacity_options[i][1] - _cur)))
+        form.addRow(t("view_opacity"), self.view_opacity)
+
+        # Language: app UI + model answers.
+        self.view_language = NoWheelComboBox()
+        self.view_language.setObjectName("settingsCombo")
+        self.view_language.addItems(["Русский", "English"])
+        _lang = os.getenv("STACKWIRE_UI_LANGUAGE", os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru")).strip().lower()
+        self.view_language.setCurrentText("English" if _lang == "en" else "Русский")
+        form.addRow(t("view_language"), self.view_language)
+
+        # Hidden mode: screen-capture exclusion + taskbar hidden.
+        self.view_hidden = QCheckBox(t("view_hidden"))
+        self.view_hidden.setChecked(os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "0").strip().lower() in {"1", "true", "yes", "on"})
+        form.addRow("", self.view_hidden)
+
+        hint = QLabel(
+            "Optionally hide the panel from screen capture (e.g. for screenshots or video recording) and from the taskbar. The panel will still be visible in the Alt-Tab switcher and can be focused with a global hotkey."
+        )
+        hint.setObjectName("dialogNote")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return page
 
     def values(self) -> dict[str, str]:
         recovery = self.recovery_model.currentText().strip()
@@ -2321,6 +2542,11 @@ class SettingsDialog(QDialog):
             "STACKWIRE_REMEMBER_ANSWERS": "1" if self.remember_answers.isChecked() else "0",
             "STACKWIRE_AUTH_URL": self.auth_url_edit.text().strip(),
             "STACKWIRE_SHOW_DEBUG_PANEL": "1" if self.runtime_debug_panel.isChecked() else "0",
+            "STACKWIRE_PANEL_OPACITY": f"{self._opacity_options[self.view_opacity.currentIndex()][1]:.2f}",
+            "STACKWIRE_ANSWER_LANGUAGE": "en" if self.view_language.currentText() == "English" else "ru",
+            "STACKWIRE_UI_LANGUAGE": "en" if self.view_language.currentText() == "English" else "ru",
+            "STACKWIRE_HIDE_FROM_CAPTURE": "1" if self.view_hidden.isChecked() else "0",
+            "STACKWIRE_HIDE_TASKBAR": "1" if self.view_hidden.isChecked() else "0",
         }
 
 
@@ -2347,23 +2573,59 @@ configure_chat_widgets(px=_px, icon_pixmap=icon_pixmap, flat_icon_button=_flat_i
 configure_dialog_widgets(px=_px)
 
 
-def _soft_shadow(widget: QWidget, *, blur: int = 28, dy: int = 8, alpha: int = 130) -> None:
-    """Attach a soft drop shadow. NOTE: a widget can hold only one QGraphicsEffect,
-    so never combine this with a fade-in opacity effect on the same widget."""
+def _dot_pixmap(diameter: int, color: str) -> QPixmap:
+    """A filled antialiased circle — reliable for a brand dot (QSS background on an
+    empty QLabel does not paint dependably)."""
+    diameter = max(2, diameter)
+    pm = QPixmap(diameter, diameter)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(0, 0, diameter, diameter)
+    painter.end()
+    return pm
+
+
+def _avatar_pixmap(label: str, size: int) -> QPixmap:
+    initials = "".join(ch for ch in label.strip() if ch.isalnum())[:2].lower() or "sw"
+    size = max(18, size)
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#26344b"))
+    painter.drawEllipse(0, 0, size, size)
+    painter.setPen(QColor("#a9c8ff"))
+    font = QFont("Manrope")
+    font.setPointSizeF(max(8.0, size * 0.34))
+    font.setWeight(QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, initials)
+    painter.end()
+    return pm
+
+
+def _soft_shadow(widget: QWidget, *, blur: int = 28, dy: int = 8, alpha: int = 130, color: QColor | None = None) -> None:
+    """Attach a soft drop shadow. Pass `color` (with its own alpha) for a tinted glow
+    — e.g. a mint glow under the send button. NOTE: a widget can hold only one
+    QGraphicsEffect, so never combine this with a fade-in opacity effect on the same widget."""
     effect = QGraphicsDropShadowEffect(widget)
     effect.setBlurRadius(blur)
     effect.setOffset(0, dy)
-    effect.setColor(QColor(0, 0, 0, alpha))
+    effect.setColor(color if color is not None else QColor(0, 0, 0, alpha))
     widget.setGraphicsEffect(effect)
 
 
-def _animate_in(widget: QWidget, *, duration: int = 130) -> None:
-    """Fade a freshly added row in (opacity 0в†’1)."""
+def _animate_in(widget: QWidget, *, duration: int = 200) -> None:
+    """Fade a freshly added row in (opacity 0 -> 1), ChatGPT-style soft entrance."""
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
     anim = QPropertyAnimation(effect, b"opacity", widget)
     anim.setDuration(duration)
-    anim.setStartValue(0.45)
+    anim.setStartValue(0.0)
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
     # Drop the effect when done so it doesn't keep intercepting paints.
@@ -2485,6 +2747,13 @@ configure_chat_workers(
     api_timeout=STACKWIRE_API_TIMEOUT,
     auth_headers=_auth_headers,
     remote_request_error=_remote_request_error,
+)
+
+configure_speech_worker(
+    api_url=STACKWIRE_API_URL,
+    api_connect_timeout=STACKWIRE_API_CONNECT_TIMEOUT,
+    stt_timeout=STACKWIRE_STT_TIMEOUT,
+    remote_stt=STACKWIRE_REMOTE_STT,
 )
 
 
@@ -2716,778 +2985,6 @@ class RegionSelector(QWidget):
             return None
 
 
-@dataclass
-class AudioDevice:
-    index: int | None
-    name: str
-    hostapi: str = ""
-    loopback: bool = False
-    samplerate: int = 16000
-    channels: int = 1
-    loopback_match: str = ""
-    auto_loopback: bool = False
-
-
-class SpeechWorker(QObject):
-    partial = Signal(str)
-    final = Signal(str)
-    stt_latency = Signal(float)
-    failed = Signal(str)
-    info = Signal(str)
-    stopped = Signal()
-
-    def __init__(self, device: AudioDevice) -> None:
-        super().__init__()
-        self.device = device
-        self._running = True
-        self.last_silence_notice = 0.0
-        self.language_lock: str | None = None
-        self.remote_session = requests.Session()
-        self.remote_session.trust_env = False
-
-    @Slot()
-    def stop(self) -> None:
-        self._running = False
-        try:
-            self.remote_session.close()
-        except RuntimeError:
-            pass
-
-    @Slot()
-    def run(self) -> None:
-        if STT_BACKEND == "whisper":
-            try:
-                self._run_whisper()
-                return
-            except Exception as exc:  # noqa: BLE001
-                if not STT_ALLOW_VOSK_FALLBACK:
-                    LOGGER.warning("Whisper STT failed and Vosk fallback is disabled: %s", exc)
-                    self.failed.emit(
-                        "Whisper STT failed. Select a valid audio device or set "
-                        f"STT_ALLOW_VOSK_FALLBACK=1 to use low-quality Vosk fallback. Details: {exc}"
-                    )
-                    self.stopped.emit()
-                    return
-                LOGGER.warning("Whisper STT failed, falling back to Vosk: %s", exc)
-                self.info.emit(f"Whisper STT failed, Vosk fallback active: {exc}")
-        self._run_vosk()
-
-    def _whisper_model_attempts(self) -> list[tuple[str, str]]:
-        return whisper_model_attempts(STT_SETTINGS)
-
-    def _load_whisper_model(self, whisper_model_class: Any) -> Any:
-        attempts = self._whisper_model_attempts()
-        last_exc: Exception | None = None
-
-        for attempt_index, (device, compute_type) in enumerate(attempts):
-            try:
-                self.info.emit(f"Loading Whisper model {WHISPER_MODEL} on {device}/{compute_type}...")
-                LOGGER.info(
-                    "STT backend=whisper model=%s device=%s compute_type=%s",
-                    WHISPER_MODEL,
-                    device,
-                    compute_type,
-                )
-                candidate_model = whisper_model_class(
-                    WHISPER_MODEL,
-                    device=device,
-                    compute_type=compute_type,
-                )
-                self._warmup_whisper_model(candidate_model, device)
-                return candidate_model
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                has_retry = attempt_index + 1 < len(attempts)
-                if has_retry and device == "cuda" and _is_cuda_whisper_error(exc):
-                    message = f"CUDA Whisper unavailable ({_short_error(exc)}). Falling back to CPU/int8."
-                    LOGGER.warning(message)
-                    self.info.emit(message)
-                    continue
-                raise
-
-        raise RuntimeError(f"Unable to load Whisper model: {last_exc}") from last_exc
-
-    def _warmup_whisper_model(self, model: Any, device: str) -> None:
-        if device != "cuda":
-            return
-        try:
-            import numpy as np
-        except ImportError:
-            return
-        segments, _info = model.transcribe(
-            np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32),
-            language="en",
-            task="transcribe",
-            beam_size=1,
-            best_of=1,
-            condition_on_previous_text=False,
-            vad_filter=False,
-            no_speech_threshold=0.95,
-        )
-        list(segments)
-
-    def _run_whisper(self) -> None:
-        try:
-            import numpy as np
-            import sounddevice as sd
-        except ImportError as exc:
-            raise RuntimeError("audio dependencies are not installed") from exc
-
-        model = None
-        if STACKWIRE_REMOTE_STT:
-            if not STACKWIRE_API_URL:
-                raise RuntimeError("STACKWIRE_API_URL is required for remote STT")
-            self.info.emit(f"Listening with remote Whisper API: {STACKWIRE_API_URL}")
-            LOGGER.info("STT backend=remote-whisper api=%s", STACKWIRE_API_URL)
-        else:
-            try:
-                from faster_whisper import WhisperModel
-            except ImportError as exc:
-                raise RuntimeError("faster-whisper is not installed") from exc
-
-            model = self._load_whisper_model(WhisperModel)
-
-        if self.device.loopback:
-            self._run_whisper_loopback(np, model)
-            return
-
-        audio_queue: queue.Queue[object] = queue.Queue()
-
-        def callback(indata, frames, time, status):  # noqa: ANN001, ARG001
-            if status:
-                self.info.emit(str(status))
-            audio_queue.put(indata.copy())
-
-        self.info.emit(f"Listening with {'remote ' if STACKWIRE_REMOTE_STT else ''}Whisper: {self.device.name}")
-        chunk_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_CHUNK_SECONDS), WHISPER_SAMPLE_RATE)
-        buffers: list[object] = []
-        buffered_frames = 0
-
-        with sd.InputStream(
-            samplerate=WHISPER_SAMPLE_RATE,
-            blocksize=4096,
-            device=self.device.index,
-            dtype="float32",
-            channels=self.device.channels,
-            callback=callback,
-        ):
-            while self._running:
-                try:
-                    data = cast(np.ndarray, audio_queue.get(timeout=0.2))
-                except queue.Empty:
-                    continue
-
-                mono = self._to_mono_float32(data, np)
-                buffers.append(mono)
-                buffered_frames += len(mono)
-
-                if buffered_frames >= chunk_frames:
-                    self._transcribe_whisper_buffers(np, model, buffers)
-                    buffers, buffered_frames = self._keep_overlap_buffers(np, buffers)
-
-            if buffered_frames >= WHISPER_SAMPLE_RATE:
-                self._transcribe_whisper_buffers(np, model, buffers)
-        self.stopped.emit()
-
-    def _loopback_candidates(self, pa) -> list[dict[str, Any]]:  # noqa: ANN001
-        candidates: list[dict[str, Any]] = []
-        try:
-            generator = getattr(pa, "get_loopback_device_info_generator", None)
-            if generator is not None:
-                candidates = [dict(candidate) for candidate in generator()]
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.debug("failed to enumerate WASAPI loopback devices: %s", exc)
-
-        if candidates:
-            return candidates
-
-        try:
-            return [dict(pa.get_default_wasapi_loopback())]
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError("No WASAPI loopback devices found") from exc
-
-    def _normalize_audio_device_name(self, name: str) -> str:
-        lowered = name.lower()
-        lowered = lowered.replace("system audio:", " ")
-        lowered = lowered.replace("[loopback]", " ")
-        lowered = lowered.replace("loopback", " ")
-        lowered = re.sub(r"[\[\]():,._-]+", " ", lowered)
-        return re.sub(r"\s+", " ", lowered).strip()
-
-    def _audio_name_score(self, target: str, candidate: str) -> int:
-        normalized_candidate = self._normalize_audio_device_name(candidate)
-        if not target or not normalized_candidate:
-            return 0
-        if target in normalized_candidate or normalized_candidate in target:
-            return 100
-        target_tokens = set(target.split())
-        candidate_tokens = set(normalized_candidate.split())
-        return len(target_tokens & candidate_tokens)
-
-    def _measure_loopback_rms(self, pyaudio, pa, np, candidate: dict[str, Any]) -> float:  # noqa: ANN001
-        stream = None
-        try:
-            source_rate = int(candidate.get("defaultSampleRate") or WHISPER_SAMPLE_RATE)
-            channels = max(1, int(candidate.get("maxInputChannels") or 1))
-            device_index = int(candidate["index"])
-            stream = pa.open(
-                format=pyaudio.paFloat32,
-                channels=channels,
-                rate=source_rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=4096,
-            )
-            raw = stream.read(4096, exception_on_overflow=False)
-            data = np.frombuffer(raw, dtype=np.float32)
-            if data.size == 0:
-                return 0.0
-            if channels > 1:
-                usable_size = data.size - (data.size % channels)
-                if usable_size <= 0:
-                    return 0.0
-                data = data[:usable_size].reshape(-1, channels)
-            mono = self._to_mono_float32(data, np)
-            return float(np.sqrt(np.mean(mono**2))) if mono.size else 0.0
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.debug("loopback probe failed for %s: %s", candidate.get("name"), exc)
-            return -1.0
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                finally:
-                    stream.close()
-
-    def _select_loopback_device(self, pyaudio, pa, np) -> dict[str, Any]:  # noqa: ANN001
-        candidates = self._loopback_candidates(pa)
-        if not candidates:
-            raise RuntimeError("No WASAPI loopback devices found")
-
-        if not self.device.auto_loopback and self.device.loopback_match:
-            target = self._normalize_audio_device_name(self.device.loopback_match)
-            scored = sorted(
-                ((self._audio_name_score(target, str(candidate.get("name", ""))), candidate) for candidate in candidates),
-                key=lambda item: item[0],
-                reverse=True,
-            )
-            if scored and scored[0][0] > 0:
-                return scored[0][1]
-
-        if not self.device.auto_loopback:
-            return candidates[0]
-
-        if not STT_PROBE_LOOPBACK_DEVICES:
-            try:
-                default_loopback = dict(pa.get_default_wasapi_loopback())
-                self.info.emit(f"Auto system audio selected default: {default_loopback.get('name', 'WASAPI loopback')}")
-                return default_loopback
-            except Exception:
-                return candidates[0]
-
-        measured: list[tuple[float, dict[str, Any]]] = []
-        for candidate in candidates:
-            rms = self._measure_loopback_rms(pyaudio, pa, np, candidate)
-            if rms >= 0.0:
-                measured.append((rms, candidate))
-                LOGGER.info("loopback probe device=%s rms=%.6f", candidate.get("name"), rms)
-
-        if measured:
-            best_rms, best_candidate = max(measured, key=lambda item: item[0])
-            if best_rms > 0.0:
-                self.info.emit(f"Auto system audio selected: {best_candidate.get('name', 'WASAPI loopback')}")
-                return best_candidate
-
-        try:
-            default_loopback = dict(pa.get_default_wasapi_loopback())
-            self.info.emit(f"Auto system audio selected default: {default_loopback.get('name', 'WASAPI loopback')}")
-            return default_loopback
-        except Exception:
-            return candidates[0]
-
-    def _run_whisper_loopback(self, np, model) -> None:  # noqa: ANN001
-        try:
-            import pyaudiowpatch as pyaudio
-        except ImportError as exc:
-            raise RuntimeError("pyaudiowpatch is required for Windows system audio capture") from exc
-
-        pa = pyaudio.PyAudio()
-        stream = None
-        try:
-            loopback_device = self._select_loopback_device(pyaudio, pa, np)
-            device_name = str(loopback_device.get("name", "default WASAPI loopback"))
-            device_index = int(loopback_device["index"])
-            source_rate = int(loopback_device.get("defaultSampleRate") or WHISPER_SAMPLE_RATE)
-            channels = max(1, int(loopback_device.get("maxInputChannels") or 1))
-            self.info.emit(f"Listening system audio with {'remote ' if STACKWIRE_REMOTE_STT else ''}Whisper: {device_name}")
-            LOGGER.info(
-                "system audio loopback device=%s index=%s sample_rate=%s channels=%s",
-                device_name,
-                device_index,
-                source_rate,
-                channels,
-            )
-            stream = pa.open(
-                format=pyaudio.paFloat32,
-                channels=channels,
-                rate=source_rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=4096,
-            )
-        except Exception:
-            pa.terminate()
-            raise
-
-        chunk_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_CHUNK_SECONDS), WHISPER_SAMPLE_RATE)
-        buffers: list[object] = []
-        buffered_frames = 0
-
-        try:
-            while self._running:
-                raw = stream.read(4096, exception_on_overflow=False)
-                data = np.frombuffer(raw, dtype=np.float32)
-                if data.size == 0:
-                    continue
-                if channels > 1:
-                    data = data.reshape(-1, channels)
-                mono = self._to_mono_float32(data, np)
-                mono = self._resample_mono(mono, np, source_rate)
-                buffers.append(mono)
-                buffered_frames += len(mono)
-                if buffered_frames >= chunk_frames:
-                    self._transcribe_whisper_buffers(np, model, buffers)
-                    buffers, buffered_frames = self._keep_overlap_buffers(np, buffers)
-
-            if buffered_frames >= WHISPER_SAMPLE_RATE:
-                self._transcribe_whisper_buffers(np, model, buffers)
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                finally:
-                    stream.close()
-            pa.terminate()
-        self.stopped.emit()
-
-    def _resample_mono(self, mono, np, source_rate: int):  # noqa: ANN001
-        mono = mono.astype(np.float32, copy=False)
-        if source_rate == WHISPER_SAMPLE_RATE or len(mono) == 0:
-            return mono
-
-        target_len = max(1, int(round(len(mono) * WHISPER_SAMPLE_RATE / source_rate)))
-        source_positions = np.arange(len(mono), dtype=np.float32)
-        target_positions = np.linspace(0, len(mono) - 1, target_len, dtype=np.float32)
-        return np.interp(target_positions, source_positions, mono).astype(np.float32)
-
-    def _keep_overlap_buffers(self, np, buffers: list[object]) -> tuple[list[object], int]:  # noqa: ANN001
-        overlap_frames = int(max(0.0, WHISPER_CHUNK_OVERLAP_SECONDS) * WHISPER_SAMPLE_RATE)
-        if overlap_frames <= 0 or not buffers:
-            return [], 0
-
-        audio = np.concatenate(buffers).astype(np.float32)
-        if len(audio) <= overlap_frames:
-            return [audio], len(audio)
-        tail = audio[-overlap_frames:]
-        return [tail], len(tail)
-
-    def _whisper_vad_parameters(self) -> dict[str, int | float]:
-        return whisper_vad_parameters(STT_SETTINGS)
-
-    def _transcribe_local_whisper_audio(self, model, audio, *, vad_filter: bool) -> tuple[str, dict[str, float | str]]:  # noqa: ANN001
-        segments, info = model.transcribe(
-            audio,
-            language=whisper_language(STT_SETTINGS, locked_language=self.language_lock),
-            task="transcribe",
-            beam_size=STT_SETTINGS.beam_size,
-            best_of=STT_SETTINGS.best_of,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            initial_prompt=WHISPER_INITIAL_PROMPT,
-            vad_filter=vad_filter,
-            vad_parameters=self._whisper_vad_parameters() if vad_filter else None,
-            no_speech_threshold=STT_SETTINGS.no_speech_threshold,
-            log_prob_threshold=STT_SETTINGS.log_prob_threshold,
-            compression_ratio_threshold=STT_SETTINGS.compression_ratio_threshold,
-            repetition_penalty=STT_SETTINGS.repetition_penalty,
-            no_repeat_ngram_size=STT_SETTINGS.no_repeat_ngram_size,
-            hallucination_silence_threshold=STT_SETTINGS.hallucination_silence_threshold,
-            hotwords=WHISPER_HOTWORDS,
-        )
-        segment_list = list(segments)
-        text = " ".join(segment.text.strip() for segment in segment_list).strip()
-        diagnostics: dict[str, float | str] = {
-            "language": str(getattr(info, "language", whisper_language(STT_SETTINGS, locked_language=self.language_lock) or "")),
-            "avg_logprob": self._mean_segment_attr(segment_list, "avg_logprob"),
-            "no_speech_prob": self._max_segment_attr(segment_list, "no_speech_prob"),
-            "compression_ratio": self._max_segment_attr(segment_list, "compression_ratio"),
-            "vad": "1" if vad_filter else "0",
-        }
-        return text, diagnostics
-
-    def _mean_segment_attr(self, segments: list[object], attr: str) -> float:
-        values = [float(value) for segment in segments if isinstance((value := getattr(segment, attr, None)), int | float)]
-        return sum(values) / len(values) if values else 0.0
-
-    def _max_segment_attr(self, segments: list[object], attr: str) -> float:
-        values = [float(value) for segment in segments if isinstance((value := getattr(segment, attr, None)), int | float)]
-        return max(values) if values else 0.0
-
-    def _is_bad_whisper_text(self, text: str, diagnostics: dict[str, float | str], rms: float) -> bool:
-        return is_probable_stt_hallucination(
-            text,
-            avg_logprob=float(diagnostics.get("avg_logprob") or 0.0),
-            no_speech_prob=float(diagnostics.get("no_speech_prob") or 0.0),
-            compression_ratio=float(diagnostics.get("compression_ratio") or 0.0),
-            rms=rms,
-        )
-
-    def _transcribe_whisper_buffers(self, np, model, buffers: list[object]) -> None:  # noqa: ANN001
-        if not buffers:
-            return
-        audio = np.concatenate(buffers).astype(np.float32)
-        if len(audio) < WHISPER_SAMPLE_RATE:
-            return
-        signal_threshold = STT_LOOPBACK_SIGNAL_THRESHOLD if self.device.loopback else STT_MIC_SIGNAL_THRESHOLD
-        rms = float(np.sqrt(np.mean(audio**2)))
-        if rms < signal_threshold:
-            now = time.monotonic()
-            if now - self.last_silence_notice >= 8.0:
-                self.last_silence_notice = now
-                if self.device.loopback:
-                    self.info.emit(
-                        "System audio selected, but no signal is detected on the selected/active playback loopback."
-                    )
-                else:
-                    self.info.emit("Microphone selected, but no input signal is detected.")
-            return
-
-        if STACKWIRE_REMOTE_STT:
-            self._transcribe_remote_whisper_audio(np, audio)
-            return
-        if model is None:
-            raise RuntimeError("Local Whisper model is not initialized")
-
-        started = time.perf_counter()
-        text, diagnostics = self._transcribe_local_whisper_audio(model, audio, vad_filter=WHISPER_VAD_FILTER)
-        bad_text = self._is_bad_whisper_text(text, diagnostics, rms)
-        if WHISPER_RETRY_WITHOUT_VAD and WHISPER_VAD_FILTER and (not text.strip() or bad_text):
-            retry_text, retry_diagnostics = self._transcribe_local_whisper_audio(model, audio, vad_filter=False)
-            retry_bad = self._is_bad_whisper_text(retry_text, retry_diagnostics, rms)
-            if retry_text.strip() and not retry_bad:
-                text = retry_text
-                diagnostics = retry_diagnostics
-                bad_text = False
-
-        raw_text = text
-        text = clean_stt_output(raw_text)
-        bad_text = bad_text or self._is_bad_whisper_text(text, diagnostics, rms)
-        self.language_lock = update_stt_language_lock(
-            STT_SETTINGS,
-            self.language_lock,
-            str(diagnostics.get("language", "")),
-            text,
-            bad_text=bad_text,
-        )
-        latency_ms = (time.perf_counter() - started) * 1000
-        LOGGER.info(
-            "stt_latency_ms=%.0f language=%s language_lock=%s vad=%s rms=%.6f avg_logprob=%.2f no_speech=%.2f compression=%.2f raw=%r cleaned=%r",
-            latency_ms,
-            diagnostics.get("language", ""),
-            self.language_lock or "",
-            diagnostics.get("vad", ""),
-            rms,
-            float(diagnostics.get("avg_logprob") or 0.0),
-            float(diagnostics.get("no_speech_prob") or 0.0),
-            float(diagnostics.get("compression_ratio") or 0.0),
-            raw_text,
-            text,
-        )
-        self.stt_latency.emit(latency_ms)
-        if bad_text:
-            LOGGER.info("drop probable whisper hallucination=%r", text)
-            return
-        if text:
-            LOGGER.info("whisper raw_stt=%r", text)
-            self.final.emit(text)
-
-    def _transcribe_remote_whisper_audio(self, np, audio) -> None:  # noqa: ANN001
-        started = time.perf_counter()
-        payload = base64.b64encode(audio.astype(np.float32).tobytes()).decode("ascii")
-        request_payload: dict[str, str | int] = {"audio_b64": payload, "sample_rate": WHISPER_SAMPLE_RATE}
-        request_language = whisper_language(STT_SETTINGS, locked_language=self.language_lock)
-        if request_language:
-            request_payload["language"] = request_language
-        response = self.remote_session.post(
-            f"{STACKWIRE_API_URL}/transcribe",
-            json=cast(Any, request_payload),
-            timeout=(STACKWIRE_API_CONNECT_TIMEOUT, STACKWIRE_STT_TIMEOUT),
-        )
-        self._raise_remote_stt_for_status(response)
-        data = response.json()
-        raw_latency: Any = data.get("latency_ms")
-        if isinstance(raw_latency, int | float | str):
-            try:
-                latency_ms = float(raw_latency)
-            except ValueError:
-                latency_ms = (time.perf_counter() - started) * 1000
-        else:
-            latency_ms = (time.perf_counter() - started) * 1000
-        raw_text = str(data.get("raw_text") or data.get("text") or "").strip()
-        text = str(data.get("cleaned_text") or data.get("text") or "").strip()
-        text = clean_stt_output(text)
-        detected_language = str(data.get("language", "")).strip()
-        bad_text = is_probable_stt_hallucination(text)
-        self.language_lock = update_stt_language_lock(
-            STT_SETTINGS,
-            self.language_lock,
-            detected_language,
-            text,
-            bad_text=bad_text,
-        )
-        diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
-        LOGGER.info(
-            "remote stt_latency_ms=%.0f language=%s language_lock=%s vad=%s raw=%r cleaned=%r",
-            latency_ms,
-            detected_language,
-            self.language_lock or "",
-            diagnostics.get("vad", ""),
-            raw_text,
-            text,
-        )
-        self.stt_latency.emit(latency_ms)
-        if bad_text:
-            LOGGER.info("drop probable remote whisper hallucination=%r", text)
-            return
-        if text:
-            LOGGER.info("remote whisper raw_stt=%r", text)
-            self.final.emit(text)
-
-    def _raise_remote_stt_for_status(self, response: requests.Response) -> None:
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = response.text
-            try:
-                payload = response.json()
-                detail = str(payload.get("detail", payload))
-            except ValueError:
-                pass
-            raise RuntimeError(
-                f"Remote API /transcribe returned {response.status_code}: {detail[:500]}"
-            ) from exc
-
-    def _run_vosk(self) -> None:
-        try:
-            import numpy as np
-            import sounddevice as sd
-            from vosk import KaldiRecognizer, Model
-        except ImportError:
-            self.failed.emit("Audio dependencies are missing. Run: python -m pip install -r requirements.txt")
-            self.stopped.emit()
-            return
-
-        model_path = self._ensure_model()
-        if not model_path:
-            self.stopped.emit()
-            return
-
-        LOGGER.info("STT backend=vosk model=%s", model_path)
-
-        if self.device.loopback:
-            self._run_loopback(np, KaldiRecognizer, Model, model_path)
-            return
-
-        audio_queue: queue.Queue[object] = queue.Queue()
-
-        def callback(indata, frames, time, status):  # noqa: ANN001, ARG001
-            if status:
-                self.partial.emit(str(status))
-            audio_queue.put(indata.copy())
-
-        try:
-            self.info.emit("Loading speech model...")
-            model = self._load_vosk_model(Model, model_path)
-            recognizer = KaldiRecognizer(model, float(self.device.samplerate))
-            recognizer.SetWords(True)
-
-            self.info.emit(f"Listening: {self.device.name}")
-
-            with sd.InputStream(
-                samplerate=self.device.samplerate,
-                blocksize=4096,
-                device=self.device.index,
-                dtype="int16",
-                channels=self.device.channels,
-                callback=callback,
-            ):
-                while self._running:
-                    try:
-                        data = audio_queue.get(timeout=0.2)
-                        data = cast(np.ndarray, data)
-                    except queue.Empty:
-                        continue
-
-                    pcm = self._to_mono_pcm(data, np)
-                    if recognizer.AcceptWaveform(pcm):
-                        result = json.loads(recognizer.Result())
-                        text = result.get("text", "").strip()
-                        if text:
-                            self.final.emit(text)
-                    else:
-                        result = json.loads(recognizer.PartialResult())
-                        text = result.get("partial", "").strip()
-                        if text:
-                            self.partial.emit(text)
-
-                final_result = json.loads(recognizer.FinalResult())
-                final_text = final_result.get("text", "").strip()
-                if final_text:
-                    self.final.emit(final_text)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(
-                f"{exc}\n\nSelect another device. On Windows, WASAPI microphone or System audio WASAPI usually works better than MME."
-            )
-        finally:
-            self.stopped.emit()
-
-    def _run_loopback(self, np, KaldiRecognizer, Model, model_path: Path) -> None:  # noqa: ANN001
-        try:
-            import pyaudiowpatch as pyaudio
-        except ImportError:
-            self.failed.emit("System audio capture requires pyaudiowpatch: python -m pip install pyaudiowpatch")
-            self.stopped.emit()
-            return
-
-        pa = pyaudio.PyAudio()
-        stream = None
-        try:
-            self.info.emit("Loading speech model...")
-            model = self._load_vosk_model(Model, model_path)
-            sample_rate = 16000
-            recognizer = KaldiRecognizer(model, float(sample_rate))
-            recognizer.SetWords(True)
-            loopback_device = self._select_loopback_device(pyaudio, pa, np)
-            device_name = str(loopback_device.get("name", "default WASAPI loopback"))
-            source_rate = int(loopback_device.get("defaultSampleRate") or sample_rate)
-            channels = max(1, int(loopback_device.get("maxInputChannels") or 1))
-            self.info.emit(f"Listening system audio: {device_name}")
-
-            stream = pa.open(
-                format=pyaudio.paFloat32,
-                channels=channels,
-                rate=source_rate,
-                input=True,
-                input_device_index=int(loopback_device["index"]),
-                frames_per_buffer=4096,
-            )
-            while self._running:
-                raw = stream.read(4096, exception_on_overflow=False)
-                data = np.frombuffer(raw, dtype=np.float32)
-                if data.size == 0:
-                    continue
-                if channels > 1:
-                    data = data.reshape(-1, channels)
-                mono = self._to_mono_float32(data, np)
-                mono = self._resample_mono(mono, np, source_rate)
-                pcm = np.clip(mono * 32767, -32768, 32767).astype(np.int16).tobytes()
-                if recognizer.AcceptWaveform(pcm):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    if text:
-                        self.final.emit(text)
-                else:
-                    result = json.loads(recognizer.PartialResult())
-                    text = result.get("partial", "").strip()
-                    if text:
-                        self.partial.emit(text)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"System audio capture failed: {exc}")
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                finally:
-                    stream.close()
-            pa.terminate()
-            self.stopped.emit()
-
-    def _ensure_model(self) -> Path | None:
-        env_path = os.getenv("VOSK_MODEL_PATH", "").strip()
-        if env_path:
-            path = Path(env_path)
-            if path.is_dir():
-                return path
-            self.failed.emit(f"VOSK_MODEL_PATH not found: {path}")
-            return None
-
-        if DEFAULT_VOSK_MODEL_DIR.is_dir():
-            return DEFAULT_VOSK_MODEL_DIR
-
-        try:
-            MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            self.info.emit("Downloading Vosk RU model, first run only...")
-            urllib.request.urlretrieve(DEFAULT_VOSK_MODEL_URL, DEFAULT_VOSK_MODEL_ZIP)
-            self.info.emit("Unpacking Vosk model...")
-            with ZipFile(DEFAULT_VOSK_MODEL_ZIP) as archive:
-                archive.extractall(MODELS_DIR)
-            return DEFAULT_VOSK_MODEL_DIR
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"Could not download Vosk model: {exc}")
-            return None
-
-    def _ensure_fallback_model(self) -> Path | None:
-        if FALLBACK_VOSK_MODEL_DIR.is_dir():
-            return FALLBACK_VOSK_MODEL_DIR
-
-        try:
-            MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            self.info.emit("Downloading fallback Vosk model...")
-            urllib.request.urlretrieve(FALLBACK_VOSK_MODEL_URL, FALLBACK_VOSK_MODEL_ZIP)
-            self.info.emit("Unpacking fallback Vosk model...")
-            with ZipFile(FALLBACK_VOSK_MODEL_ZIP) as archive:
-                archive.extractall(MODELS_DIR)
-            return FALLBACK_VOSK_MODEL_DIR
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"Could not download fallback Vosk model: {exc}")
-            return None
-
-    def _load_vosk_model(self, model_class, model_path: Path):  # noqa: ANN001
-        try:
-            return model_class(str(model_path))
-        except Exception as exc:  # noqa: BLE001
-            fallback = self._ensure_fallback_model()
-            if fallback is None or fallback == model_path:
-                raise
-            self.info.emit(
-                f"Model {model_path.name} is incompatible with python-vosk, using {fallback.name}"
-            )
-            try:
-                return model_class(str(fallback))
-            except Exception:
-                raise exc
-
-    def _to_mono_float32(self, data, np):  # noqa: ANN001
-        if len(data.shape) == 2 and data.shape[1] > 1:
-            data = data.mean(axis=1)
-        else:
-            data = data.flatten()
-        if np.issubdtype(data.dtype, np.integer):
-            data = data.astype(np.float32) / 32768.0
-        else:
-            data = data.astype(np.float32)
-        return np.clip(data, -1.0, 1.0)
-
-    def _to_mono_pcm(self, data, np) -> bytes:  # noqa: ANN001
-        if len(data.shape) == 2 and data.shape[1] > 1:
-            data = data.mean(axis=1)
-        else:
-            data = data.flatten()
-
-        if np.issubdtype(data.dtype, np.floating):
-            data = np.clip(data, -1.0, 1.0) * 32767
-
-        return np.clip(data, -32768, 32767).astype(np.int16).tobytes()
 
 class OverlayWindow(QMainWindow):
     chats_button: QPushButton
@@ -3543,7 +3040,6 @@ class OverlayWindow(QMainWindow):
         self._closing = False
         self._close_retry_count = 0
         self.last_question_candidate = ""
-        self.pending_capture_b64 = ""
         self.pending_attachment: dict[str, str] | None = None
         # Multi-turn vision: the last analyzed screenshot stays pinned so follow-up
         # text questions can ask about the SAME image without re-capturing.
@@ -3551,12 +3047,14 @@ class OverlayWindow(QMainWindow):
         self._last_vision_b64 = ""
         self.visibility_hotkey_down = False
         self.record_hotkey_down = False
+        self.capture_hotkey_down = False
         self.submit_after_speech_stop = False
         self.speech_input_locked = False
         self.live_mode = False          # continuous listen→answer→listen loop
         self.debug_expanded = os.getenv("STACKWIRE_SHOW_DEBUG_PANEL", "0").strip().lower() in {"1", "true", "yes", "on"}
         self._first_show_done = False
         self._fade_animation: QPropertyAnimation | None = None
+        self._rail_width_animation: QParallelAnimationGroup | None = None
         self._modal_overlay: QWidget | None = None
         self._modal_dialog: QDialog | None = None
         # Authentication state (server account). Token cached locally between launches.
@@ -3573,7 +3071,9 @@ class OverlayWindow(QMainWindow):
         default_zoom = 0.86 if self.compact_screen else 1.0
         self.ui_zoom = self._clamp_zoom(_env_float("STACKWIRE_UI_SCALE", default_zoom))
         self.rail_expanded = os.getenv("STACKWIRE_RAIL_EXPANDED", "1").strip().lower() in {"1", "true", "yes", "on"}
-        self.chats_panel_visible = False
+        # Chats live next to the rail and follow its expanded state: expanded = full
+        # sidebar with chat list (variant A), collapsed = narrow icon rail (variant B).
+        self.chats_panel_visible = self.rail_expanded
         self.chat_session_id = chat_sessions.current_session_id()
         self.chat_messages: list[tuple[str, str]] = chat_sessions.load_session(self.chat_session_id) if self.chat_session_id else []
         self.last_answer_question = ""
@@ -3592,10 +3092,14 @@ class OverlayWindow(QMainWindow):
         self.auto_ask_timer.setSingleShot(True)
         self.auto_ask_timer.setInterval(2200)
         self.auto_ask_timer.timeout.connect(self.refresh_question_candidate)
-        # Live-mode timer: fires ~1.2 s after the last speech fragment to auto-submit
+        # Live-mode timer: fires ~0.9 s after the last speech fragment to auto-submit.
+        # F4 force-submits immediately without waiting for silence. The interval is
+        # adaptive (see _live_silence_interval): a finished question fires fast, an
+        # unfinished fragment waits longer so we don't cut a question in half.
+        self._live_silence_base_ms = max(250, int(os.getenv("STACKWIRE_LIVE_SILENCE_MS", "900")))
         self.live_submit_timer = QTimer(self)
         self.live_submit_timer.setSingleShot(True)
-        self.live_submit_timer.setInterval(1200)
+        self.live_submit_timer.setInterval(self._live_silence_base_ms)
         self.live_submit_timer.timeout.connect(self._live_auto_submit)
         self.global_hotkey_timer = QTimer(self)
         self.global_hotkey_timer.setInterval(120)
@@ -3617,6 +3121,17 @@ class OverlayWindow(QMainWindow):
         # Warm up the local vector store (index knowledge once) without blocking the UI.
         QTimer.singleShot(0, self._warm_vector_store)
 
+    def _target_window_opacity(self) -> float:
+        """Overlay translucency for the whole window. STACKWIRE_PANEL_OPACITY drives it
+        (1.0 = fully opaque). Mini mode is extra see-through."""
+        base = _clamp(_env_float_raw("STACKWIRE_PANEL_OPACITY", 1.0), 0.30, 1.0)
+        if getattr(self, "_mini_mode", False):
+            base = max(0.30, base - 0.18)
+        return base
+
+    def _apply_window_opacity(self) -> None:
+        self.setWindowOpacity(self._target_window_opacity())
+
     def showEvent(self, event) -> None:  # noqa: ANN001
         super().showEvent(event)
         if self._first_show_done:
@@ -3626,9 +3141,9 @@ class OverlayWindow(QMainWindow):
         animation = QPropertyAnimation(self, b"windowOpacity", self)
         animation.setDuration(260)
         animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
+        animation.setEndValue(self._target_window_opacity())
         animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(lambda: self.setWindowOpacity(1.0))
+        animation.finished.connect(self._apply_window_opacity)
         self._fade_animation = animation
         animation.start()
         QTimer.singleShot(0, self._apply_acrylic)
@@ -3698,6 +3213,8 @@ class OverlayWindow(QMainWindow):
         else:
             chip.setText("")
         chip.setVisible(False)
+        if hasattr(self, "rail_user_button") and hasattr(self, "ask_button"):
+            self.apply_icons()
 
     def _warm_vector_store(self) -> None:
         try:
@@ -3733,7 +3250,11 @@ class OverlayWindow(QMainWindow):
 
         shutdown_pending = False
 
-        if not self._shutdown_thread(self.speech_thread, "speech", timeout_ms=20_000):
+        # Short grace only: the audio capture loop can be stuck in a blocking
+        # stream.read() (e.g. WASAPI loopback with no active playback), which
+        # worker.stop() cannot interrupt. Waiting 20s froze the GUI and the window
+        # never closed. We give it a brief moment, then force-exit below.
+        if not self._shutdown_thread(self.speech_thread, "speech", timeout_ms=1_200):
             shutdown_pending = True
         else:
             self.speech_thread = None
@@ -3806,8 +3327,20 @@ class OverlayWindow(QMainWindow):
             self.status.setText("Stopping background work...")
             LOGGER.warning("close delayed waiting for background threads retry=%s", self._close_retry_count)
             event.ignore()
-            if self._close_retry_count <= 6:
-                QTimer.singleShot(1000, self.close)
+            if self._close_retry_count <= 2:
+                QTimer.singleShot(600, self.close)
+            else:
+                # A capture loop (typically WASAPI loopback with no active audio) is
+                # blocked and will not unwind. The user asked to close — terminate the
+                # process so the window actually goes away instead of hanging on the X.
+                LOGGER.warning("forcing process exit; background threads did not stop")
+                try:
+                    from app import vectorstore
+
+                    vectorstore.close()
+                except Exception:
+                    pass
+                os._exit(0)
             return
 
         try:
@@ -4051,17 +3584,19 @@ class OverlayWindow(QMainWindow):
         row = QFrame()
         row.setObjectName("chatSessionItem")
         row.setProperty("active", summary.id == self.chat_session_id)
-        row.setMinimumHeight(_px(46))
+        row.setMinimumHeight(_px(52))
         row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QHBoxLayout(row)
-        layout.setContentsMargins(8, 7, 6, 7)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 8, 8, 8)
+        layout.setSpacing(8)
         title = summary.title.strip() or "New chat"
         open_button = QPushButton()
         open_button.setObjectName("chatSessionButton")
         open_button.setMinimumWidth(0)
         open_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        open_button.setText(open_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, _px(160)))
+        open_button.setIcon(make_icon("chats", _px(15), "#b8d6e1"))
+        open_button.setIconSize(QSize(_px(15), _px(15)))
+        open_button.setText(open_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, _px(190)))
         open_button.setToolTip(title)
         open_button.clicked.connect(lambda _checked=False, session_id=summary.id: self.open_chat_session(session_id))
         rename_button = QPushButton()
@@ -4084,21 +3619,26 @@ class OverlayWindow(QMainWindow):
         return row
 
     def toggle_chats_panel(self) -> None:
-        self.chats_panel_visible = not self.chats_panel_visible
-        self.chat_panel.setVisible(self.chats_panel_visible)
-        self.chats_button.setChecked(self.chats_panel_visible)
-        if self.chats_panel_visible:
+        # Chats live inside the rail now — the standalone chat_panel is a dead, hidden
+        # placeholder. "Show chats" just means make sure the rail is expanded.
+        if not self.rail_expanded:
+            self.toggle_rail_expanded()
+        else:
             self.refresh_chat_sessions()
-        self.apply_icons()
 
     def toggle_rail_expanded(self) -> None:
         self.rail_expanded = not self.rail_expanded
+        # The chat list is part of the expanded sidebar (A); collapsing hides it (B).
+        # Chats live IN the rail now; apply_icons toggles their visibility.
+        self.chats_panel_visible = self.rail_expanded
+        if self.rail_expanded:
+            self.refresh_chat_sessions()
         os.environ["STACKWIRE_RAIL_EXPANDED"] = "1" if self.rail_expanded else "0"
         try:
             _save_local_env_values({"STACKWIRE_RAIL_EXPANDED": os.environ["STACKWIRE_RAIL_EXPANDED"]})
         except Exception:
             LOGGER.debug("rail state save failed", exc_info=True)
-        self.apply_ui_zoom()
+        self.apply_ui_zoom(animate_rail=True)
 
     def toggle_mini_mode(self) -> None:
         """Compact mode: hide the sidebar + chats panel, leaving just the chat + composer
@@ -4127,13 +3667,17 @@ class OverlayWindow(QMainWindow):
             self.resize(compact_w, compact_h)
         else:
             self.setMaximumWidth(16_777_215)  # QWIDGETSIZE_MAX — lift the cap
-            self.chat_panel.setVisible(self.chats_panel_visible)
+            # chat_panel is a dead hidden placeholder (chats live in the rail); leaving
+            # it hidden avoids the empty 236px gap that appeared on the left after mini.
+            self.chat_panel.setVisible(False)
             geo = getattr(self, "_normal_geometry", None)
             if geo is not None:
                 self.setGeometry(geo)
+        self.quick_bar.setVisible(mini)
         self.mini_button.setToolTip("Выйти из mini mode" if mini else "Mini mode (компактный чат)")
+        self._apply_window_opacity()  # mini mode is extra see-through
         self.apply_icons()
-        self.status.setText("Mini mode" if mini else "Ready")
+        self.status.setText(t("mini_mode") if mini else t("ready"))
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -4184,7 +3728,7 @@ class OverlayWindow(QMainWindow):
                 checkable=spec.checkable,
             )
             setattr(self, spec.attr, button)
-        self.settings_button = self._make_rail_button("settings", "Settings", "Settings", self.show_settings_dialog)
+        self.settings_button = self._make_rail_button("settings", "Настройки", "Настройки", self.show_settings_dialog)
 
         self.mini_button = QPushButton()
         self.mini_button.setObjectName("closeButton")  # share the title-bar button styling
@@ -4196,55 +3740,53 @@ class OverlayWindow(QMainWindow):
         self.close_button.setToolTip("Close")
         self.close_button.clicked.connect(self.close)
 
+        # Single-column sidebar (variant A): brand → New chat → chats → divider →
+        # tools → settings, all in ONE rail. Collapsing hides labels + chat list → B.
         rail = QFrame()
         rail.setObjectName("rail")
         self.rail = rail
         rail_layout = QVBoxLayout(rail)
-        rail_layout.setContentsMargins(12, 14, 12, 14)
-        rail_layout.setSpacing(10)
+        rail_layout.setContentsMargins(_px(RAIL_PADDING_X), _px(16), _px(RAIL_PADDING_X), _px(16))
+        rail_layout.setSpacing(_px(8))
 
-        brand = QVBoxLayout()
-        brand.setSpacing(2)
-        brand.addWidget(self.title_mark, 0, Qt.AlignmentFlag.AlignHCenter)
-        brand.addWidget(self.title, 0, Qt.AlignmentFlag.AlignHCenter)
-        brand.addWidget(self.subtitle, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail_layout.addLayout(brand)
-        rail_layout.addSpacing(14)
-        rail_layout.addWidget(self.rail_toggle_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail_layout.addStretch(1)
+        # Expanded: static brand at left + collapse button at right. Collapsed:
+        # the same brand control becomes the expand button.
+        self.subtitle.setVisible(False)
+        self.title_mark.setVisible(False)
+        self.title.setVisible(False)
+        self.rail_toggle_button.setVisible(False)
+        self.rail_header = QWidget()
+        self.rail_header.setObjectName("railHeader")
+        rail_header_layout = QHBoxLayout(self.rail_header)
+        rail_header_layout.setContentsMargins(0, 0, 0, 0)
+        rail_header_layout.setSpacing(_px(8))
+        self.rail_brand_button = QPushButton(APP_NAME)
+        self.rail_brand_button.setObjectName("railBrandButton")
+        self.rail_brand_button.setToolTip("Collapse sidebar" if self.rail_expanded else "Expand sidebar")
+        self.rail_brand_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rail_brand_button.clicked.connect(lambda _checked=False: (not self.rail_expanded) and self.toggle_rail_expanded())
+        rail_header_layout.addWidget(self.rail_brand_button, 1)
+        rail_header_layout.addWidget(self.rail_toggle_button, 0)
+        rail_layout.addWidget(self.rail_header)
 
-        rail_nav = QWidget()
-        rail_nav.setObjectName("railNav")
-        rail_nav_layout = QVBoxLayout(rail_nav)
-        rail_nav_layout.setContentsMargins(0, 0, 0, 0)
-        rail_nav_layout.setSpacing(10)
-        for spec in MAIN_RAIL_ACTIONS:
-            rail_nav_layout.addWidget(getattr(self, spec.attr))
-        rail_layout.addWidget(rail_nav, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail_layout.addStretch(2)
-        rail_layout.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail_layout.addWidget(self.chats_button, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        self.chat_panel = QFrame()
-        self.chat_panel.setObjectName("chatPanel")
-        self.chat_panel.setVisible(self.chats_panel_visible)
-        chat_panel_layout = QVBoxLayout(self.chat_panel)
-        chat_panel_layout.setContentsMargins(12, 14, 12, 14)
-        chat_panel_layout.setSpacing(10)
-        chat_header = QHBoxLayout()
-        chat_title = QLabel("Chats")
-        chat_title.setObjectName("chatPanelTitle")
-        self.new_chat_button = QPushButton("New")
-        self.new_chat_button.setObjectName("ghostButton")
+        self.new_chat_button = QPushButton(t("new_chat"))
+        self.new_chat_button.setObjectName("newChatButton")
         self.new_chat_button.setIcon(make_icon("plus", _px(14), ACCENT))
+        self.new_chat_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.new_chat_button.clicked.connect(self.new_chat_session)
-        chat_header.addWidget(chat_title)
-        chat_header.addStretch(1)
-        chat_header.addWidget(self.new_chat_button)
+        rail_layout.addWidget(self.new_chat_button)
+
+        self.chats_section_label = QLabel(t("chats"))
+        self.chats_section_label.setObjectName("railSectionLabel")
+        rail_layout.addWidget(self.chats_section_label)
+
         self.chat_sessions_container = QWidget()
         self.chat_sessions_container.setObjectName("chatSessionsContainer")
         self.chat_sessions_layout = QVBoxLayout(self.chat_sessions_container)
         self.chat_sessions_layout.setContentsMargins(0, 0, 0, 0)
-        self.chat_sessions_layout.setSpacing(6)
+        self.chat_sessions_layout.setSpacing(_px(4))
         self.chat_sessions_layout.addStretch(1)
         self.chat_sessions_scroll = QScrollArea()
         self.chat_sessions_scroll.setObjectName("chatSessionsScroll")
@@ -4252,8 +3794,44 @@ class OverlayWindow(QMainWindow):
         self.chat_sessions_scroll.setWidgetResizable(True)
         self.chat_sessions_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.chat_sessions_scroll.setWidget(self.chat_sessions_container)
-        chat_panel_layout.addLayout(chat_header)
-        chat_panel_layout.addWidget(self.chat_sessions_scroll, 1)
+        rail_layout.addWidget(self.chat_sessions_scroll, 1)
+
+        self.rail_divider = QFrame()
+        self.rail_divider.setObjectName("railDivider")
+        self.rail_divider.setFixedHeight(1)
+        rail_layout.addWidget(self.rail_divider)
+
+        rail_nav = QWidget()
+        rail_nav.setObjectName("railNav")
+        rail_nav_layout = QVBoxLayout(rail_nav)
+        rail_nav_layout.setContentsMargins(0, 0, 0, 0)
+        rail_nav_layout.setSpacing(_px(6))
+        self.rail_group_divider = QFrame()
+        self.rail_group_divider.setObjectName("railGroupDivider")
+        self.rail_group_divider.setFixedHeight(1)
+        for spec in MAIN_RAIL_ACTIONS:
+            button = getattr(self, spec.attr)
+            if spec.attr == "chats_button":
+                continue
+            rail_nav_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+            if spec.attr == "capture_button":
+                rail_nav_layout.addWidget(self.rail_group_divider, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail_layout.addWidget(rail_nav)
+        rail_layout.addStretch(1)
+        rail_layout.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.rail_user_button = QPushButton()
+        self.rail_user_button.setObjectName("railUserButton")
+        self.rail_user_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rail_user_button.setToolTip("Account")
+        self.rail_user_button.clicked.connect(self.show_settings_dialog)
+        rail_layout.addWidget(self.rail_user_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        # The standalone chat panel is gone (chats moved into the rail). Keep a hidden
+        # empty placeholder so legacy references (toggle_mini_mode, apply_ui_zoom) survive.
+        self.chat_panel = QFrame()
+        self.chat_panel.setObjectName("chatPanel")
+        self.chat_panel.setFixedWidth(0)
+        self.chat_panel.setVisible(False)
 
         content = QFrame()
         content.setObjectName("content")
@@ -4274,10 +3852,31 @@ class OverlayWindow(QMainWindow):
         self.account_chip.setObjectName("accountChip")
         self.account_chip.setVisible(False)
 
+        # Content-area wordmark: a glowing mint dot + the brand in Space Grotesk.
+        # Mirrors the rail brand and carries identity in mini mode (rail hidden).
+        self.brand_dot = QLabel()
+        self.brand_dot.setObjectName("brandDot")
+        self.brand_dot.setPixmap(icon_pixmap("mark", _px(18), ACCENT))  # logo mark, not a plain dot
+        _soft_shadow(self.brand_dot, blur=_px(10), dy=0, color=QColor(154, 214, 189, 200))
+        self.header_wordmark = QLabel(APP_NAME)
+        self.header_wordmark.setObjectName("headerWordmark")
+        # Status pills (right side of the header): Hidden = capture-exclusion (static);
+        # Слушаю = shown only while listening (toggled in apply_icons).
+        self.ghost_pill = QLabel("Hidden")
+        self.ghost_pill.setObjectName("ghostPill")
+        self.ghost_pill.setVisible(STACKWIRE_HIDE_FROM_CAPTURE)
+        self.listen_pill = QLabel("Слушаю")
+        self.listen_pill.setObjectName("listenPill")
+        self.listen_pill.setVisible(False)
+
+        header.addWidget(self.brand_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.header_wordmark, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addStretch(1)
-        header.addWidget(self.status)
-        header.addWidget(self.mini_button)
-        header.addWidget(self.close_button)
+        header.addWidget(self.status, 0, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.ghost_pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        header.addSpacing(_px(2))
+        header.addWidget(self.mini_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignVCenter)
         self.update_account_chip()
 
         # Chat is a scrollable column of message-bubble widgets (GPT-style), with an
@@ -4325,7 +3924,7 @@ class OverlayWindow(QMainWindow):
 
         self.input = PromptEdit()
         self.input.setObjectName("prompt")
-        self.input.setPlaceholderText("Message StackWire...")
+        self.input.setPlaceholderText(tr("Задайте вопрос или /команду...", "Ask anything or /command…"))
         self.input.set_height_limits(_px(40), _px(132))
         self.input.submitted.connect(self.submit_question)
         self.input.image_pasted.connect(self._on_clipboard_image)
@@ -4338,8 +3937,10 @@ class OverlayWindow(QMainWindow):
         self.ask_button = QPushButton()
         self.ask_button.setObjectName("composerSend")
         self.ask_button.setToolTip("Ask")
-        self.ask_button.setFixedSize(_px(40), _px(40))
+        self.ask_button.setFixedSize(_px(38), _px(38))
         self.ask_button.clicked.connect(self.submit_question)
+        # Soft mint glow under the filled send button — the composer's focal point.
+        _soft_shadow(self.ask_button, blur=_px(18), dy=_px(4), color=QColor(154, 214, 189, 115))
 
         footer.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         footer.addWidget(self.input, 1)
@@ -4373,9 +3974,47 @@ class OverlayWindow(QMainWindow):
             sugg_layout.addWidget(btn, 1)
             self._suggestion_buttons.append(btn)
 
+        # Live transcript strip: while listening, shows the last heard lines
+        # (tagged [Собеседник]/[Я] in interview mode) so the user can SEE that
+        # speech recognition is working and what exactly was understood.
+        self.live_panel = QLabel("")
+        self.live_panel.setObjectName("livePanel")
+        self.live_panel.setWordWrap(True)
+        self.live_panel.setVisible(False)
+        self.live_panel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # Audio-level waveform shown while speech is being recognized.
+        self.voice_wave = VoiceWave()
+
+        # Quick actions (mini mode): one-tap controls for live conversations.
+        # Own style — small mint pills, no copying other tools' look.
+        self.quick_bar = QWidget()
+        self.quick_bar.setObjectName("quickBar")
+        self.quick_bar.setVisible(False)
+        quick_layout = QHBoxLayout(self.quick_bar)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.setSpacing(_px(6))
+        for label, icon_kind, tooltip, handler in (
+            ("Spark", "spark", "Instant response to what was heard (F4)", self.force_live_answer),
+            ("Short", "short", "Condense the last answer", self.quick_shorten),
+            ("Amp", "amp", "Amplify — go deeper", self.quick_deeper),
+            ("Loop", "loop", "Close the loop — recap", self.quick_recap),
+        ):
+            chip = QPushButton(label)
+            chip.setObjectName("quickChip")
+            chip.setIcon(make_icon(icon_kind, _px(13), "#9ad6bd"))
+            chip.setToolTip(tooltip)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(handler)
+            quick_layout.addWidget(chip)  # hug content (no stretch) — compact pills, not full-width
+        quick_layout.addStretch(1)
+
         content_layout.addLayout(header)
         content_layout.addWidget(self.chat_area, 1)
         content_layout.addWidget(self.suggestions_bar)
+        content_layout.addWidget(self.live_panel)
+        content_layout.addWidget(self.voice_wave)
+        content_layout.addWidget(self.quick_bar)
         content_layout.addWidget(composer)
         content_layout.addWidget(self.debug_panel)
         content_layout.addLayout(bottom)
@@ -4477,6 +4116,85 @@ class OverlayWindow(QMainWindow):
             shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
             shortcut.activated.connect(handler)
             self.zoom_shortcuts.append(shortcut)
+        # F4 — "answer now": submit the currently heard speech immediately,
+        # without waiting for the live-mode silence timer.
+        answer_now = QShortcut(QKeySequence("F4"), self)
+        answer_now.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        answer_now.activated.connect(self.force_live_answer)
+        self.zoom_shortcuts.append(answer_now)
+
+    def _silent_chip_action(self, instruction: str, status_text: str) -> None:
+        """Run a chip action without showing the instruction as a user message in chat.
+
+        The LLM receives the instruction as the current question; only the assistant
+        response appears in the chat. No text is written to the input field."""
+        if self._generating or not self.ask_button.isEnabled():
+            self.status.setText("Подождите, идёт генерация…")
+            return
+        if getattr(self, "image_thread", None) is not None or getattr(self, "imagegen_thread", None) is not None:
+            self.status.setText("Подождите, идёт генерация…")
+            return
+        if not self._require_login():
+            return
+        self._hide_suggestions()
+        # Lock STT input + stop the live timers so background speech can't sneak a
+        # question into the middle of this chip's generation. Cleared on finish
+        # (show_answer's live branch / on next toggle_listening).
+        if self._speech_is_running():
+            self.speech_input_locked = True
+            self.live_submit_timer.stop()
+            self.auto_ask_timer.stop()
+        self.ask_button.setEnabled(False)
+        self.update_answer_actions(force_disabled=True)
+        self.status.setText(status_text)
+        context = self._recent_chat_context()
+        self.chat_messages.append(("assistant", "[[thinking:0]]"))
+        self._begin_streaming()
+        self._launch_ask_stream(instruction, context, trusted_text=True)
+
+    def quick_shorten(self) -> None:
+        if not self.last_answer_text.strip():
+            self.status.setText("Нет ответа для сжатия")
+            return
+        answer = self.last_answer_text.strip()[:1500]
+        self._silent_chip_action(
+            f"Сократи до 3–5 предложений, сохрани главное. Не добавляй лишнего:\n\n{answer}",
+            "Сжимаю…",
+        )
+
+    def quick_deeper(self) -> None:
+        if not self.last_answer_text.strip():
+            self.status.setText("Нет ответа для углубления")
+            return
+        answer = self.last_answer_text.strip()[:1200]
+        self._silent_chip_action(
+            f"Раскрой глубже: нюансы, подводные камни, что ещё важно знать. Не повторяй уже сказанное:\n\n{answer}",
+            "Углубляю…",
+        )
+
+    def quick_recap(self) -> None:
+        if not self.chat_messages:
+            self.status.setText("Разговор ещё пуст")
+            return
+        self._silent_chip_action(
+            "Сделай краткое резюме разговора: ключевые вопросы и главные выводы, маркированным списком.",
+            "Резюмирую…",
+        )
+
+    def force_live_answer(self) -> None:
+        """F4: answer the currently captured speech right now (no silence wait)."""
+        if not self._speech_is_running():
+            self.status.setText("F4: сначала включите прослушивание")
+            return
+        self.live_submit_timer.stop()
+        if not self.live_mode:
+            # Not in live mode: push heard text through the normal submit path.
+            candidate = self.last_final_speech or self.last_question_candidate
+            if candidate:
+                self.input.setPlainText(candidate)
+                self.submit_question()
+            return
+        self._live_auto_submit(forced=True)
 
     def install_global_hotkeys(self) -> None:
         if sys.platform == "win32":
@@ -4503,6 +4221,15 @@ class OverlayWindow(QMainWindow):
                 self.toggle_recording_hotkey()
             elif not record_pressed:
                 self.record_hotkey_down = False
+
+            # F6 — global region capture: works from ANY app, even with the
+            # overlay hidden; the window pops back up with the analysis.
+            capture_pressed = bool(user32.GetAsyncKeyState(0x75) & 0x8000)
+            if capture_pressed and not self.capture_hotkey_down:
+                self.capture_hotkey_down = True
+                self.start_region_capture()
+            elif not capture_pressed:
+                self.capture_hotkey_down = False
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("global hotkey poll failed: %s", exc)
             self.global_hotkey_timer.stop()
@@ -4522,7 +4249,60 @@ class OverlayWindow(QMainWindow):
         self.render_chat()
         self.status.setText(f"Zoom: {self.ui_zoom:.0%}")
 
-    def apply_ui_zoom(self) -> None:
+    def _set_status_listening(self, active: bool) -> None:
+        if not hasattr(self, "status"):
+            return
+        self.status.setProperty("listening", "true" if active else "false")
+        style = self.status.style()
+        style.unpolish(self.status)
+        style.polish(self.status)
+        self.status.update()
+
+    def on_speech_info(self, text: str) -> None:
+        lowered = text.strip().lower()
+        if lowered.startswith("слушаю") or "system audio" in lowered or "системный звук" in lowered:
+            self.status.setText("Слушаю")
+            self._set_status_listening(True)
+            return
+        self.status.setText(text)
+        self._set_status_listening(self._speech_is_running())
+
+    def _rail_target_width(self) -> int:
+        return _px(RAIL_EXPANDED_WIDTH if self.rail_expanded else RAIL_COLLAPSED_WIDTH)
+
+    def _set_rail_width(self, *, animate: bool = False) -> None:
+        if not hasattr(self, "rail"):
+            return
+        target = self._rail_target_width()
+        if self._rail_width_animation is not None:
+            self._rail_width_animation.stop()
+            self._rail_width_animation = None
+
+        start = self.rail.width() if self.rail.width() > 0 else target
+        if not animate or start == target:
+            self.rail.setFixedWidth(target)
+            return
+
+        self.rail.setMinimumWidth(start)
+        self.rail.setMaximumWidth(start)
+        group = QParallelAnimationGroup(self.rail)
+        for prop in (b"minimumWidth", b"maximumWidth"):
+            anim = QPropertyAnimation(self.rail, prop, group)
+            anim.setDuration(RAIL_ANIMATION_MS)
+            anim.setStartValue(start)
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(anim)
+
+        def finish() -> None:
+            self.rail.setFixedWidth(target)
+            self._rail_width_animation = None
+
+        group.finished.connect(finish)
+        self._rail_width_animation = group
+        group.start()
+
+    def apply_ui_zoom(self, *, animate_rail: bool = False) -> None:
         global UI_ZOOM
         UI_ZOOM = self.ui_zoom
 
@@ -4537,29 +4317,84 @@ class OverlayWindow(QMainWindow):
         for _btn in (self.attach_button, self.listen_button):
             _btn.setFixedSize(_px(38), _px(38))
         if hasattr(self, "rail"):
-            self.rail.setFixedWidth(_px(190 if self.rail_expanded else 116))
+            self.rail.setProperty("expanded", "true" if self.rail_expanded else "false")
+            self._set_rail_width(animate=animate_rail)
         if hasattr(self, "chat_panel"):
-            self.chat_panel.setFixedWidth(_px(270))
+            self.chat_panel.setFixedWidth(0)  # dead placeholder — never takes layout width
         self.debug_panel.setMaximumHeight(_px(140))
         self.setStyleSheet(build_window_styles(self.ui_zoom))
         self.apply_icons()
 
     def apply_icons(self) -> None:
         icon_size = _px(16)
-        self.title_mark.setPixmap(icon_pixmap("mark", _px(24), ACCENT))
+        rail_icon_size = _px(RAIL_ICON_SIZE)
         listening = self._speech_is_running()
-        self.rail_toggle_button.setIcon(make_icon("collapse" if self.rail_expanded else "menu", icon_size, "#83aeb8"))
-        self.rail_toggle_button.setToolTip("Collapse sidebar" if self.rail_expanded else "Expand sidebar")
-        self.chats_button.setChecked(self.chats_panel_visible)
-        self.chats_button.setIcon(make_icon("chats", icon_size, ACCENT if self.chats_panel_visible else "#83aeb8"))
-        self.notes_button.setIcon(make_icon("notes", icon_size, "#83aeb8"))
+        if hasattr(self, "listen_pill"):
+            self.listen_pill.setVisible(False)
+        if hasattr(self, "status"):
+            self._set_status_listening(listening)
+        expanded = self.rail_expanded
+        collapsed_prop = "false" if expanded else "true"
+        if hasattr(self, "rail"):
+            self.rail.setProperty("expanded", "true" if expanded else "false")
+        if hasattr(self, "chats_button"):
+            self.chats_button.setVisible(not expanded)
+            self.chats_button.setText("")
+            self.chats_button.setChecked(not expanded or self.chats_panel_visible)
+            self.chats_button.setProperty("railCollapsed", collapsed_prop)
+            self.chats_button.setFixedSize(
+                _px(RAIL_COLLAPSED_ACTIVE_SIZE if not expanded else RAIL_ITEM_WIDTH),
+                _px(RAIL_COLLAPSED_ACTIVE_SIZE if not expanded else RAIL_EXPANDED_ROW_HEIGHT),
+            )
+        self.title.setVisible(False)
+        self.subtitle.setVisible(False)
+        self.title_mark.setVisible(False)
+        self.rail_toggle_button.setVisible(expanded)
+        self.rail_toggle_button.setText("")
+        self.rail_toggle_button.setIcon(make_icon("collapse" if expanded else "menu", rail_icon_size, "#83aeb8"))
+        self.rail_toggle_button.setIconSize(QSize(rail_icon_size, rail_icon_size))
+        self.rail_toggle_button.setFixedSize(_px(RAIL_TOGGLE_SIZE), _px(RAIL_TOGGLE_SIZE))
+        self.rail_toggle_button.setProperty("railCollapsed", collapsed_prop)
+        self.rail_toggle_button.setToolTip("Collapse sidebar" if expanded else "Expand sidebar")
+        show_header_brand = getattr(self, "_mini_mode", False)
+        if hasattr(self, "header_wordmark"):
+            self.brand_dot.setVisible(show_header_brand)
+            self.header_wordmark.setVisible(show_header_brand)
+        if hasattr(self, "rail_brand_button"):
+            self.rail_brand_button.setVisible(True)
+            brand_icon_size = _px(22 if expanded else 22)
+            self.rail_brand_button.setText(APP_NAME if expanded else "")
+            self.rail_brand_button.setIcon(make_icon("mark" if expanded else "menu", brand_icon_size, ACCENT if expanded else "#83aeb8"))
+            self.rail_brand_button.setIconSize(QSize(brand_icon_size, brand_icon_size))
+            self.rail_brand_button.setFixedSize(_px(RAIL_BRAND_WIDTH if expanded else RAIL_COLLAPSED_ACTIVE_SIZE), _px(42 if expanded else 44))
+            self.rail_brand_button.setProperty("railCollapsed", collapsed_prop)
+            self.rail_brand_button.setProperty("brandInteractive", "false" if expanded else "true")
+            self.rail_brand_button.setCursor(Qt.CursorShape.ArrowCursor if expanded else Qt.CursorShape.PointingHandCursor)
+            self.rail_brand_button.setToolTip("" if expanded else "Expand sidebar")
+        for _attr in ("chats_section_label", "chat_sessions_scroll", "rail_divider"):
+            _w = getattr(self, _attr, None)
+            if _w is not None:
+                _w.setVisible(expanded)
+        if hasattr(self, "rail_group_divider"):
+            self.rail_group_divider.setVisible(not expanded)
+            self.rail_group_divider.setFixedSize(_px(RAIL_DIVIDER_WIDTH), _px(1))
+        if hasattr(self, "new_chat_button"):
+            self.new_chat_button.setVisible(expanded)
+            self.new_chat_button.setText("Новый чат")
+            self.new_chat_button.setIcon(make_icon("plus", icon_size, ACCENT))
+            self.new_chat_button.setIconSize(QSize(icon_size, icon_size))
+            self.new_chat_button.setFixedSize(_px(RAIL_ITEM_WIDTH), _px(RAIL_NEW_CHAT_HEIGHT))
+        self.chats_button.setIcon(make_icon("chats", rail_icon_size, "#83aeb8"))
+        self.notes_button.setIcon(make_icon("notes", rail_icon_size, "#83aeb8"))
         self.listen_button.setIcon(make_icon("stop" if listening else "listen", icon_size, CORAL if listening else ACCENT))
         self.listen_button.setToolTip("Stop listening" if listening else "Listen")
-        self.capture_button.setIcon(make_icon("capture", icon_size, "#83aeb8"))
-        self.diff_button.setIcon(make_icon("diff", icon_size, "#83aeb8"))
-        self.search_button.setIcon(make_icon("search", icon_size, "#83aeb8"))
-        self.debug_button.setIcon(make_icon("debug", icon_size, "#83aeb8"))
-        self.settings_button.setIcon(make_icon("settings", icon_size, "#83aeb8"))
+        self.capture_button.setIcon(make_icon("capture", rail_icon_size, "#83aeb8"))
+        self.diff_button.setIcon(make_icon("diff", rail_icon_size, "#83aeb8"))
+        self.search_button.setIcon(make_icon("search", rail_icon_size, "#83aeb8"))
+        self.debug_button.setIcon(make_icon("debug", rail_icon_size, "#83aeb8"))
+        self.settings_button.setIcon(make_icon("settings", rail_icon_size, "#83aeb8"))
+        has_account = bool(self.authenticated and self.auth_username.strip())
+        self.settings_button.setVisible(not has_account)
         self.attach_button.setIcon(make_icon("attach", icon_size, "#83aeb8"))
         if self._generating:
             self.ask_button.setIcon(make_icon("stop_gen", icon_size, "#10131a"))
@@ -4573,23 +4408,22 @@ class OverlayWindow(QMainWindow):
             self.rail_toggle_button,
             self.chats_button,
             self.notes_button,
-            self.listen_button,
             self.capture_button,
             self.diff_button,
             self.search_button,
             self.debug_button,
             self.settings_button,
+        ):
+            button.setIconSize(QSize(rail_icon_size, rail_icon_size))
+        for button in (
+            self.listen_button,
             self.attach_button,
             self.ask_button,
             self.mini_button,
             self.close_button,
         ):
             button.setIconSize(QSize(icon_size, icon_size))
-        # Rail icon buttons stay 34px squares; composer icons (attach/listen) keep their
-        # 38px pill sizing set in apply_ui_zoom — don't resize them here.
         for button in (
-            self.rail_toggle_button,
-            self.chats_button,
             self.notes_button,
             self.capture_button,
             self.diff_button,
@@ -4598,31 +4432,78 @@ class OverlayWindow(QMainWindow):
             self.settings_button,
         ):
             label = str(button.property("label") or "")
-            button.setText(label if self.rail_expanded else "")
-            if button is self.rail_toggle_button and self.rail_expanded:
-                button.setText("Compact")
-            button.setFixedSize(_px(166 if self.rail_expanded else 34), _px(36 if self.rail_expanded else 34))
+            button.setText(_i18n.tr_rail(label) if expanded else "")
+            button.setProperty("railCollapsed", collapsed_prop)
+            button.setFixedSize(
+                _px(RAIL_ITEM_WIDTH if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+                _px(RAIL_EXPANDED_ROW_HEIGHT if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+            )
+        if hasattr(self, "rail_user_button"):
+            account_name = self.auth_username.strip()
+            self.rail_user_button.setVisible(has_account)
+            avatar_size = _px(28)
+            self.rail_user_button.setText(account_name if expanded else "")
+            self.rail_user_button.setIcon(QIcon(_avatar_pixmap(account_name, avatar_size)))
+            self.rail_user_button.setIconSize(QSize(avatar_size, avatar_size))
+            self.rail_user_button.setFixedSize(
+                _px(RAIL_ITEM_WIDTH if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+                _px(RAIL_USER_HEIGHT if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+            )
+            self.rail_user_button.setProperty("railCollapsed", collapsed_prop)
+            self.rail_user_button.setToolTip(account_name)
+        self.settings_button.setFixedSize(
+            _px(RAIL_ITEM_WIDTH if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+            _px(RAIL_EXPANDED_ROW_HEIGHT if expanded else RAIL_COLLAPSED_BUTTON_SIZE),
+        )
         self.close_button.setFixedSize(_px(34), _px(34))
         self.mini_button.setFixedSize(_px(34), _px(34))
+        for widget in (
+            getattr(self, "rail", None),
+            getattr(self, "rail_toggle_button", None),
+            getattr(self, "rail_brand_button", None),
+            getattr(self, "chats_button", None),
+            getattr(self, "notes_button", None),
+            getattr(self, "capture_button", None),
+            getattr(self, "diff_button", None),
+            getattr(self, "search_button", None),
+            getattr(self, "debug_button", None),
+            getattr(self, "settings_button", None),
+            getattr(self, "rail_user_button", None),
+        ):
+            if widget is None:
+                continue
+            style = widget.style()
+            style.unpolish(widget)
+            style.polish(widget)
+            widget.update()
 
     def _clamp_zoom(self, value: float) -> float:
         return max(MIN_UI_ZOOM, min(MAX_UI_ZOOM, value))
 
     def apply_capture_exclusion(self) -> None:
-        if not STACKWIRE_HIDE_FROM_CAPTURE or sys.platform != "win32":
+        # Read env live so the View → Hidden-mode toggle applies without a restart.
+        hide = os.getenv(
+            "STACKWIRE_HIDE_FROM_CAPTURE", "1" if STACKWIRE_HIDE_FROM_CAPTURE else "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if hasattr(self, "ghost_pill"):
+            self.ghost_pill.setVisible(hide)
+        if sys.platform != "win32":
             return
-
         try:
             import ctypes
 
             hwnd = int(self.winId())
+            wda_none = 0x00000000
             wda_exclude_from_capture = 0x00000011
             wda_monitor = 0x00000001
             user32 = ctypes.windll.user32
-            ok = user32.SetWindowDisplayAffinity(hwnd, wda_exclude_from_capture)
-            if not ok:
-                user32.SetWindowDisplayAffinity(hwnd, wda_monitor)
-            LOGGER.info("capture exclusion applied ok=%s", bool(ok))
+            if hide:
+                ok = user32.SetWindowDisplayAffinity(hwnd, wda_exclude_from_capture)
+                if not ok:
+                    user32.SetWindowDisplayAffinity(hwnd, wda_monitor)
+            else:
+                user32.SetWindowDisplayAffinity(hwnd, wda_none)
+            LOGGER.info("capture exclusion hide=%s", hide)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("failed to apply capture exclusion: %s", exc)
 
@@ -4666,7 +4547,7 @@ class OverlayWindow(QMainWindow):
         self.hide()
         QTimer.singleShot(180, self.show_region_selector)
 
-    def _launch_image_analysis(self, image_b64: str, prompt: str) -> None:
+    def _launch_image_analysis(self, image_b64: str, prompt: str, *, creative: bool = False) -> None:
         if self.image_thread is not None:
             return
         self._last_vision_b64 = image_b64  # pinned as follow-up context once the answer lands
@@ -4676,10 +4557,12 @@ class OverlayWindow(QMainWindow):
         self.image_thread = QThread()
         # Stream the vision answer through the SAME pipeline as text answers: deltas are
         # tagged with the active stream generation so on_answer_delta renders them live.
+        # creative=True (regenerate) bumps temperature + random seed for a fresh variant.
         self.image_worker = ImageAnalysisWorker(
             image_b64, prompt,
             image_generation=image_generation,
             stream_generation=self._active_stream_generation,
+            creative=creative,
         )
         self.image_worker.moveToThread(self.image_thread)
         self.image_thread.started.connect(self.image_worker.run)
@@ -4803,25 +4686,6 @@ class OverlayWindow(QMainWindow):
         self.status.setText("Скриншот готов — задайте вопрос и Enter, или просто Enter для разбора")
         self.input.setFocus()
 
-    def submit_capture_question(self, prompt: str) -> None:
-        image_b64 = self.pending_capture_b64
-        if not image_b64:
-            return
-        if not self._require_login():
-            return
-
-        prompt = prompt.strip() or "What is shown in the screenshot and what is important?"
-        self.pending_capture_b64 = ""
-        self.ask_button.setEnabled(False)
-        self.capture_button.setEnabled(False)
-        self.chat_messages.append(("user", f"Screenshot request\n\n{prompt}"))
-        self.chat_messages.append(("assistant", "Analyzing selected screen area..."))
-        self.input.clear()
-        self.render_chat(focus_latest_assistant=True)
-        self.status.setText("Analyzing captured area...")
-
-        self._launch_image_analysis(image_b64, prompt)
-
     def submit_vision_followup(self, question: str) -> None:
         """Answer a follow-up question about the screenshot pinned in context.
 
@@ -4901,7 +4765,7 @@ class OverlayWindow(QMainWindow):
             (
                 device
                 for device in devices
-                if "stereo mix" in device.name.lower() or "СЃС‚РµСЂРµРѕ РјРёРєС€РµСЂ" in device.name.lower()
+                if "stereo mix" in device.name.lower() or "стерео микшер" in device.name.lower()
             ),
             None,
         )
@@ -4964,6 +4828,16 @@ class OverlayWindow(QMainWindow):
             self.device_combo.addItem("No input devices found", None)
             return
 
+        if sys.platform == "win32":
+            dual_device = AudioDevice(
+                index=None,
+                name="Smart Capture (Recommended)",
+                loopback=True,
+                auto_loopback=True,  # follow the default playback device (where YouTube/Meet actually plays)
+                dual=True,
+            )
+            self.device_combo.addItem(dual_device.name, dual_device)
+
         for device in devices:
             self.device_combo.addItem(device.name, device)
 
@@ -4981,16 +4855,16 @@ class OverlayWindow(QMainWindow):
         if not device.loopback and "WASAPI" in api:
             return (0, name)
         if device.loopback:
-            if "realtek" in name or "РґРёРЅР°РјРёРєРё" in name or "speakers" in name:
+            if "realtek" in name or "динамики" in name or "speakers" in name:
                 return (1, name)
             return (2, name)
         if "DIRECTSOUND" in api:
             return (3, name)
-        if "СЃС‚РµСЂРµРѕ РјРёРєС€РµСЂ" in name or "stereo mix" in name:
+        if "стерео микшер" in name or "stereo mix" in name:
             return (4, name)
-        if not device.loopback and ("РјРёРєСЂРѕС„РѕРЅ" in name or "microphone" in name or "mic " in name):
+        if not device.loopback and ("микрофон" in name or "microphone" in name or "mic " in name):
             return (5, name)
-        if not device.loopback and ("Р»РёРЅРµР№РЅС‹Р№" in name or "Р»РёРЅ. РІС…РѕРґ" in name or "line in" in name):
+        if not device.loopback and ("линейный" in name or "лин. вход" in name or "line in" in name):
             return (7, name)
         if "MME" in api:
             return (9, name)
@@ -5126,6 +5000,30 @@ class OverlayWindow(QMainWindow):
         # Unknown slash token → treat as ordinary text.
         return False, text
 
+    def _recent_chat_context(self, messages: list[tuple[str, str]] | None = None) -> list[str]:
+        """Compact 'User:/Assistant:' lines from the last ~6 Q&A exchanges.
+
+        Used by every ask path (typed, live interview, regenerate) so the model
+        always remembers what was already said and doesn't repeat itself."""
+        source = self.chat_messages if messages is None else messages
+        history_messages = [
+            (role, content)
+            for role, content in source
+            if role in ("user", "assistant")
+            and content.strip()
+            and not self._is_thinking(content)
+            and "[[screenshot:" not in content
+            and "[[file:" not in content
+            and "[[generated_image:" not in content
+        ][-12:]  # last 6 Q&A pairs
+        chat_context: list[str] = []
+        for role, content in history_messages:
+            prefix = "User" if role == "user" else "Assistant"
+            text = content.split("\n\n", 1)[-1].strip()
+            text = text[:350] + "..." if len(text) > 350 else text
+            chat_context.append(f"{prefix}: {text}")
+        return chat_context
+
     def submit_question(self) -> None:
         # If currently generating, the ask button acts as stop.
         if self._generating:
@@ -5152,10 +5050,6 @@ class OverlayWindow(QMainWindow):
             if handled:
                 return
 
-        if self.pending_capture_b64:
-            self.submit_capture_question(question)
-            return
-
         # A screenshot is pinned in context → answer this question about that image.
         if self._vision_context_b64:
             self.submit_vision_followup(question)
@@ -5165,22 +5059,7 @@ class OverlayWindow(QMainWindow):
         trusted_text = self.is_manual_input(question)
         self.stop_speech_capture_for_submit()
         speech_context = (self.raw_transcript_lines or self.transcript_lines)[-STT_CONTEXT_LINES:]
-        # Build Q&A history context: last 4 exchanges (user + assistant pairs).
-        history_messages = [
-            (role, content)
-            for role, content in self.chat_messages
-            if role in ("user", "assistant")
-            and content.strip()
-            and not self._is_thinking(content)
-            and "[[screenshot:" not in content
-            and "[[file:" not in content
-        ][-8:]  # last 4 Q&A pairs
-        chat_context: list[str] = []
-        for role, content in history_messages:
-            prefix = "User" if role == "user" else "Assistant"
-            text = content.split("\n\n", 1)[-1].strip()
-            text = text[:350] + "..." if len(text) > 350 else text
-            chat_context.append(f"{prefix}: {text}")
+        chat_context = self._recent_chat_context()
         context = [*speech_context, *chat_context][-(STT_CONTEXT_LINES + len(chat_context)) :]
         self.ask_button.setEnabled(False)
         self.update_answer_actions(force_disabled=True)
@@ -5253,25 +5132,13 @@ class OverlayWindow(QMainWindow):
         screenshot_match = re.search(r"\[\[screenshot:([A-Za-z0-9+/=]+)\]\]", user_content)
         if screenshot_match:
             caption = re.sub(r"\[\[(?:screenshot|file):[^\]]*\]\]", "", user_content).strip()
-            self._launch_image_analysis(screenshot_match.group(1), caption)
+            # creative=True so regenerating a screenshot answer yields a DIFFERENT variant
+            # (the text path already does this; vision used to silently repeat the same answer).
+            self._launch_image_analysis(screenshot_match.group(1), caption, creative=True)
             return
 
         # Build the same kind of short Q&A history context submit_question uses.
-        history_messages = [
-            (role, content)
-            for role, content in prior_messages
-            if role in ("user", "assistant")
-            and content.strip()
-            and not self._is_thinking(content)
-            and "[[screenshot:" not in content
-            and "[[file:" not in content
-        ][-8:]
-        chat_context: list[str] = []
-        for role, content in history_messages:
-            prefix = "User" if role == "user" else "Assistant"
-            text = content.split("\n\n", 1)[-1].strip()
-            text = text[:350] + "..." if len(text) > 350 else text
-            chat_context.append(f"{prefix}: {text}")
+        chat_context = self._recent_chat_context(prior_messages)
         self._launch_ask_stream(user_content.strip(), chat_context, trusted_text=True, creative=True)
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -5361,17 +5228,47 @@ class OverlayWindow(QMainWindow):
                 return index
         return -1
 
+    def _can_append_incrementally(self) -> bool:
+        """True when only the last two messages (user + thinking) are new and every
+        earlier row widget is still alive — then we can append instead of rebuilding."""
+        total = len(self.chat_messages)
+        if total < 2:
+            return False
+        expected = set(range(total - 2))
+        if set(self._message_rows.keys()) != expected:
+            return False
+        return all(shiboken6.isValid(row) for row in self._message_rows.values())
+
+    def _append_streaming_rows(self) -> None:
+        """ChatGPT-style smooth append: keep existing rows untouched, add just the new
+        user bubble + thinking row, then glide the viewport to the new question."""
+        total = len(self.chat_messages)
+        self.chat_area.show_list()
+        for index in (total - 2, total - 1):
+            role, content = self.chat_messages[index]
+            self._add_message_row(index, role, content, animate=True)
+        user_row = self._message_rows.get(total - 2)
+        if user_row is not None:
+            QTimer.singleShot(0, lambda row=user_row: self.chat_area.scroll_to_message_start(row, animated=True))
+        self._persist_current_chat()
+
     def _begin_streaming(self) -> None:
-        # Rebuild the message widgets; the trailing assistant message starts as
-        # animated thinking dots, then we stream rich text into that one row only.
+        # The trailing assistant message starts as animated thinking dots, then we
+        # stream rich text into that one row only.
         self._stream_generation += 1
         self._active_stream_generation = self._stream_generation
         self._stream_active = True
         self._stream_buffer = ""
         self._stream_render_pending = False
         _DIAGRAM_RENDER["enabled"] = False  # skip diagram rendering on partial source
-        # Animate just the freshly added user message + assistant row into view.
-        self.render_chat(animate_from=max(0, len(self.chat_messages) - 2))
+        if self._can_append_incrementally():
+            # Smooth path: append only the new user + assistant rows. No full rebuild,
+            # no flicker, no scroll jump — existing widgets (and their code-snippet
+            # anchor ids) stay exactly as they are.
+            self._append_streaming_rows()
+        else:
+            # Fallback (chat switch, regenerate truncation, edits): full rebuild.
+            self.render_chat(animate_from=max(0, len(self.chat_messages) - 2))
         self._stream_prefix_snippets = len(CODE_SNIPPETS)
         self._stream_row = self._assistant_rows.get(self._last_assistant_index())
         # Show ask_button as stop button while generating
@@ -5740,8 +5637,6 @@ class OverlayWindow(QMainWindow):
         self.ask_button.setEnabled(True)
         self.listen_button.setEnabled(True)
         self.capture_button.setEnabled(True)
-        if self.pending_capture_b64:
-            self.input.setFocus()
         self.update_answer_actions()
         self.apply_icons()
         if self.live_mode:
@@ -5893,7 +5788,7 @@ class OverlayWindow(QMainWindow):
         if not (0 <= index < len(self.chat_messages)):
             return ""
         content = self.chat_messages[index][1]
-        match = re.match(r"^Р’РѕРїСЂРѕСЃ\s+\d+\s*\n\n(.+)$", content.strip(), flags=re.DOTALL)
+        match = re.match(r"^Вопрос\s+\d+\s*\n\n(.+)$", content.strip(), flags=re.DOTALL)
         return (match.group(1).strip() if match else content).strip()
 
     def copy_message(self, index: int) -> None:
@@ -5980,6 +5875,8 @@ class OverlayWindow(QMainWindow):
             self.model_chip.setText(current_answer_model())
             self.update_account_chip()
             self.update_debug_panel()
+            self._apply_window_opacity()       # View: opacity live
+            self.apply_capture_exclusion()     # View: hidden mode live
             self.render_chat()
             self.status.setText("Settings saved")
 
@@ -6029,7 +5926,6 @@ class OverlayWindow(QMainWindow):
         self.transcript_lines.clear()
         self.last_question_candidate = ""
         self.current_partial_speech = ""
-        self.pending_capture_b64 = ""
         self.pending_attachment = None
         self._refresh_attachment_bar()
         self.speech_input_locked = False
@@ -6057,10 +5953,10 @@ class OverlayWindow(QMainWindow):
         if not context:
             return question
         return (
-            "РљРѕРЅС‚РµРєСЃС‚ СЂР°СЃРїРѕР·РЅР°РЅРЅС‹Р№ РёР· Р·Р°РїРёСЃРё:\n"
+            "Контекст распознанный из записи:\n"
             f"{context}\n\n"
-            "Р—Р°РґР°С‡Р°: РЅР°Р№РґРё РїРѕСЃР»РµРґРЅРёР№ С‚РµС…РЅРёС‡РµСЃРєРёР№ РІРѕРїСЂРѕСЃ РІ СЌС‚РѕРј РєРѕРЅС‚РµРєСЃС‚Рµ, РѕС‚Р±СЂРѕСЃСЊ Р»РёС€РЅРёРµ С„СЂР°Р·С‹, РёСЃРїСЂР°РІСЊ РѕС€РёР±РєРё СЂРµС‡РµРІРѕРіРѕ СЂР°СЃРїРѕР·РЅР°РІР°РЅРёСЏ Рё РѕС‚РІРµС‚СЊ.\n\n"
-            "Р•СЃР»Рё РїРѕР»Рµ РЅРёР¶Рµ СѓР¶Рµ РїРѕС…РѕР¶Рµ РЅР° РІРѕРїСЂРѕСЃ, РѕС‚РІРµС‡Р°Р№ РЅР° РЅРµРіРѕ:\n"
+            "Задача: найди последний технический вопрос в этом контексте, отбрось лишние фразы, исправь ошибки речевого распознавания и ответь.\n\n"
+            "Если поле ниже уже похоже на вопрос, отвечай на него:\n"
             f"{question}"
         )
 
@@ -6217,8 +6113,33 @@ class OverlayWindow(QMainWindow):
         self._persist_current_chat()
 
     # ------------------------------------------------------------------ live mode
-    def _live_auto_submit(self) -> None:
-        """Called by live_submit_timer when speech has settled for ~1.2 s."""
+    def _live_silence_interval(self) -> int:
+        """Adaptive silence gap before auto-submitting in live mode.
+
+        A finished question (ends with '?') fires fast — the speaker is clearly
+        done. A question still in progress (a question word but no terminal mark)
+        or a fragment that ends mid-thought (comma / conjunction) waits longer so
+        we don't cut the question in half."""
+        base = self._live_silence_base_ms
+        text = (self.last_final_speech or "").strip()
+        if not text:
+            return base
+        if text.endswith("?"):
+            return max(300, int(base * 0.5))
+        # Trails off on a conjunction/comma → speaker is mid-sentence, give more room.
+        lowered = text.lower()
+        if text.endswith((",", "-", "—")) or lowered.endswith((" и", " а", " но", " или", " что", " чтобы")):
+            return int(base * 1.4)
+        return base
+
+    def _live_auto_submit(self, forced: bool = False) -> None:
+        """Auto-submit the captured speech. Called by live_submit_timer after a
+        silence gap (forced=False) or by F4/Spark as a manual override (forced=True).
+
+        When NOT forced we only answer utterances that actually look like a question/
+        request — otherwise every 2+ word remark from the other person ("так, окей",
+        small talk) would trigger a full answer and flood the chat. F4 bypasses this
+        so the user can force an answer to anything that was just said."""
         if not self.live_mode:
             return
         if self.speech_input_locked:
@@ -6231,6 +6152,10 @@ class OverlayWindow(QMainWindow):
         if not candidate or len(candidate.split()) < 2:
             # Too short / noise — wait for more speech
             return
+        if not forced and not looks_like_question(candidate):
+            # A statement, not a question — keep listening instead of answering noise.
+            # (F4 / Spark sets forced=True to answer it anyway.)
+            return
 
         # ---- lock STT input (but do NOT stop the worker) ----
         self.speech_input_locked = True
@@ -6239,7 +6164,12 @@ class OverlayWindow(QMainWindow):
         self.current_partial_speech = ""
 
         question = condense_spoken_question(candidate) or candidate
-        context = list((self.raw_transcript_lines or self.transcript_lines)[-STT_CONTEXT_LINES:])
+        # Speech context + chat history: in a live interview the model MUST remember
+        # what it already answered, otherwise consecutive similar questions get the
+        # same answer dumped again.
+        speech_context = list((self.raw_transcript_lines or self.transcript_lines)[-STT_CONTEXT_LINES:])
+        chat_context = self._recent_chat_context()
+        context = [*speech_context, *chat_context]
 
         self.ask_button.setEnabled(False)
         self.update_answer_actions(force_disabled=True)
@@ -6252,7 +6182,10 @@ class OverlayWindow(QMainWindow):
         self.current_partial_speech = ""
         self.last_question_candidate = ""
         self._begin_streaming()
-        self._launch_ask_stream(question, context, trusted_text=False)
+        # trusted_text=True skips the LLM recovery rewrite (1-3 s saved before the
+        # first token). The answer prompt reconstructs noisy/fragmentary speech
+        # itself, and chat history still flows through `context`.
+        self._launch_ask_stream(question, context, trusted_text=True)
 
     def toggle_listening(self) -> None:
         if self._speech_is_running():
@@ -6285,8 +6218,10 @@ class OverlayWindow(QMainWindow):
         self.speech_worker.partial.connect(self.on_partial_speech)
         self.speech_worker.final.connect(self.on_final_speech)
         self.speech_worker.stt_latency.connect(self.on_stt_latency)
+        self.speech_worker.level.connect(self.voice_wave.push_level)
+        self.voice_wave.start()
         self.speech_worker.failed.connect(self.show_error)
-        self.speech_worker.info.connect(self.status.setText)
+        self.speech_worker.info.connect(self.on_speech_info)
         self.speech_worker.stopped.connect(self.on_speech_stopped)
         self.speech_worker.stopped.connect(self.speech_thread.quit)
         self.speech_thread.finished.connect(self.on_speech_thread_finished)
@@ -6301,6 +6236,7 @@ class OverlayWindow(QMainWindow):
             return
         if text:
             self.current_partial_speech = clean_live_transcript(text)
+            self._update_live_panel()
             visible = clean_live_transcript(append_transcript_segment(self.last_final_speech, self.current_partial_speech))
             if visible and not self.ask_button.isEnabled():
                 self.status.setText(f"Hearing: {visible[:90]}")
@@ -6314,7 +6250,7 @@ class OverlayWindow(QMainWindow):
         self.last_stt_latency_ms = latency_ms
         LOGGER.info("stt_latency_ms=%.0f", latency_ms)
 
-    def on_final_speech(self, text: str) -> None:
+    def on_final_speech(self, text: str, source: str = "") -> None:
         if self.speech_input_locked:
             return
         if not text:
@@ -6323,10 +6259,23 @@ class OverlayWindow(QMainWindow):
         normalized = clean_live_transcript(text)
         if not normalized:
             return
-        self.raw_transcript_lines.append(raw_text)
+        if source == "me":
+            # Interview mode, the user's own voice: keep it as conversation context
+            # (so the model knows what was already said), but NEVER treat it as a
+            # question to answer or push it into the input field.
+            self.raw_transcript_lines.append(f"[Я]: {raw_text}")
+            self.raw_transcript_lines = self.raw_transcript_lines[-60:]
+            LOGGER.info("own speech context=%r", raw_text)
+            self._update_live_panel()
+            return
+        if source == "interviewer":
+            self.raw_transcript_lines.append(f"[Собеседник]: {raw_text}")
+        else:
+            self.raw_transcript_lines.append(raw_text)
         self.raw_transcript_lines = self.raw_transcript_lines[-60:]
         self.transcript_lines.append(normalized)
         self.transcript_lines = self.transcript_lines[-60:]
+        self._update_live_panel()
         LOGGER.info("raw transcript=%r", raw_text)
         LOGGER.info("normalized transcript=%r", normalized)
         self.update_debug_panel(raw_stt=raw_text, stt_latency_ms=self.last_stt_latency_ms)
@@ -6354,10 +6303,25 @@ class OverlayWindow(QMainWindow):
             # Live mode: restart silence-timer on every new fragment.
             # When it fires without new speech arriving, we auto-submit.
             self.status.setText(f"Live — слышу: {self.last_final_speech[:80]}")
-            self.live_submit_timer.start()
+            self.live_submit_timer.start(self._live_silence_interval())
         else:
             self.status.setText("Speech captured. Press Enter when question is ready.")
             self.auto_ask_timer.start()
+
+    def _update_live_panel(self) -> None:
+        """Refresh the live transcript strip (visible only while listening)."""
+        panel = getattr(self, "live_panel", None)
+        if panel is None:
+            return
+        if not self._speech_is_running():
+            panel.setVisible(False)
+            return
+        lines = self.raw_transcript_lines[-4:]
+        if self.current_partial_speech:
+            lines = [*lines, f"… {self.current_partial_speech}"]
+        text = "\n".join(line.strip() for line in lines if line.strip())
+        panel.setText(text or "Слушаю…")
+        panel.setVisible(True)
 
     def refresh_question_candidate(self) -> None:
         if self.speech_input_locked:
@@ -6372,20 +6336,32 @@ class OverlayWindow(QMainWindow):
 
     def on_speech_stopped(self) -> None:
         self.listen_button.setEnabled(True)
+        if hasattr(self, "voice_wave"):
+            self.voice_wave.stop()
         self.apply_icons()
+        self._update_live_panel()
         if self.status.text().startswith(("Listening", "Stopping")):
             self.status.setText("Ready")
 
     def on_speech_thread_finished(self) -> None:
+        # Guard against a stale restart race: if the user stopped and immediately
+        # restarted listening, a PREVIOUS thread's finished signal can arrive after
+        # toggle_listening already created a fresh worker/thread. Only clear the
+        # references if the thread that finished is still the current one — otherwise
+        # we'd null out the live worker, desync the UI and leak the new thread.
+        finished_thread = self.sender()
+        if self.speech_thread is not None and finished_thread is not self.speech_thread:
+            return
         self.speech_worker = None
         self.speech_thread = None
         self.listen_button.setEnabled(True)
         self.apply_icons()
+        self._update_live_panel()
         if self.submit_after_speech_stop:
             QTimer.singleShot(150, self.submit_recorded_question)
 
     def on_image_thread_finished(self) -> None:
-        self.image_worker = None
+        self.image_worker = None                                                            
         self.image_thread = None
         self._active_image_generation = 0
         self.capture_button.setEnabled(True)
