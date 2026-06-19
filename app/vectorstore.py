@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -296,6 +297,55 @@ def remember_good_answer(answer_id: int, question: str, answer: str, *, domain: 
         LOGGER.debug("vector remember_good_answer failed", exc_info=True)
 
 
+def _chunk_text(text: str, *, size: int = 800, max_chunks: int = 80) -> list[str]:
+    paragraphs = [p.strip() for p in text.split(chr(10) + chr(10)) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        if len(para) > size:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(para), size):
+                chunks.append(para[i : i + size])
+        elif len(current) + len(para) + 2 <= size:
+            current = (current + chr(10) + chr(10) + para) if current else para
+        else:
+            chunks.append(current)
+            current = para
+    if current:
+        chunks.append(current)
+    return chunks[:max_chunks]
+
+
+def remember_document(name: str, text: str) -> None:
+    """Index an attached document's text (kind='document') so the model can retrieve
+    from it across the conversation. Persisted in the local store, like a project file."""
+    name = (name or "").strip()
+    text = (text or "").strip()
+    if not name or len(text) < 40 or not is_available():
+        return
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        ensure_indexed()
+        chunks = _chunk_text(text)
+        documents: list[str] = []
+        metadata: list[dict] = []
+        ids: list[str] = []
+        for index, chunk in enumerate(chunks):
+            documents.append(chunk)
+            metadata.append({"kind": "document", "text": chunk, "title": name, "source": f"attachment:{name}"})
+            digest = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:12]
+            ids.append(_point_id(f"document:{name}:{index}:{digest}"))
+        if documents:
+            client.add(collection_name=COLLECTION, documents=documents, metadata=metadata, ids=ids)
+            LOGGER.info("vector store indexed document=%r chunks=%s", name, len(documents))
+    except Exception:
+        LOGGER.debug("vector remember_document failed", exc_info=True)
+
+
 # --------------------------------------------------------------------------- #
 # Searching
 # --------------------------------------------------------------------------- #
@@ -343,7 +393,7 @@ def _search(query: str, *, kinds: tuple[str, ...], limit: int, score_threshold: 
 
 
 def search_knowledge(query: str, *, limit: int = 3, score_threshold: float = 0.2) -> list[VectorHit]:
-    return _search(query, kinds=("knowledge",), limit=limit, score_threshold=score_threshold)
+    return _search(query, kinds=("knowledge", "document"), limit=limit, score_threshold=score_threshold)
 
 
 def search_memory(query: str, *, limit: int = 3, score_threshold: float = 0.45) -> list[VectorHit]:

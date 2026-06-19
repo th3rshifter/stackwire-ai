@@ -616,7 +616,7 @@ class QuestionRecovery:
 You repair a noisy speech-to-text transcript for a general-purpose assistant.
 The speaker is mostly Russian and can ask about ANY topic — everyday life, science,
 history, culture, cooking, health, math, language, software, or IT. Treat the input as
-ordinary speech by default; only assume a technical/DevOps reading when the words clearly
+ordinary speech by default; only assume a technical reading when the words clearly
 sound technical. The transcript may mix Russian and English terms.
 {mode_hint}
 
@@ -663,7 +663,7 @@ Transcript repair rules:
 - Do not add technologies, tools or concepts that are not present by sound in raw transcript or explicitly present in context.
 - Do not rewrite fragments into a cleaner semantic question. Do not merge several fragments into one new question.
 - Do not reduce the transcript to a definition of one detected technical term when the raw transcript contains a broader question.
-- Do not add clarifying words such as "роль", "используется", "в Linux", "в Kubernetes", "CI/CD", "networking" unless they are audible in raw transcript or present in context.
+- Do not add clarifying words (e.g. "роль", "используется", a domain or technology name) unless they are audible in raw transcript or present in context.
 - If raw transcript is already readable, keep it and only normalize punctuation/capitalization.
 - If confidence is not high, return the cleaned raw transcript as recovered_question, set needs_manual_fix=true, and put only that same text in candidate_questions.
 - candidate_questions must contain at most one item: the same repaired transcript as recovered_question.

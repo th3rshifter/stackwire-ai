@@ -31,7 +31,7 @@ STACK_TERMINOLOGY_PROMPT = (
 
 
 WHISPER_TECHNICAL_PROMPT = (
-    "This is Russian DevOps/SRE technical content with mixed Russian and English terminology. "
+    "This is Russian technical content with mixed Russian and English terminology. "
     "Preserve English product names, commands, file paths, acronyms, protocols, config keys, "
     "CLI tools, cloud services and technology names in English. "
     "When an English technical term is pronounced inside Russian speech, output the canonical spelling, "

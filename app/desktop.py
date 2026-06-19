@@ -85,6 +85,7 @@ from app.notes import notes_path  # noqa: E402
 from app.question_recovery import STACKWIRE_MODE, current_recovery_model  # noqa: E402
 from app.storage import create_session, log_feedback, save_good_answer  # noqa: E402
 from app.tech_terms import WHISPER_TECHNICAL_PROMPT, normalize_spoken_technical_terms  # noqa: E402
+from app.documents import extract_text as _extract_document_text, DOCUMENT_EXTENSIONS as _DOCUMENT_EXTENSIONS, extractor_available as _document_extractor_available  # noqa: E402
 from app.transcript_repair import clean_stt_output, collapse_repeated_phrases, condense_spoken_question, is_probable_stt_hallucination, repair_live_transcript  # noqa: E402
 from app.ui.actions import MAIN_RAIL_ACTIONS, RailActionSpec  # noqa: E402
 from app.ui.styles import build_window_styles as _build_window_styles  # noqa: E402
@@ -92,7 +93,7 @@ from app import i18n as _i18n  # noqa: E402
 from app.widgets.chat import AssistantRow, ChatArea, NeuralBackground, VoiceWave, configure_chat_widgets  # noqa: E402
 from app.widgets.dialogs import ClickableImageLabel, FullImageDialog, NotesDialog, configure_dialog_widgets  # noqa: E402
 from app.workers.chat import AskStreamWorker, ExpandWorker, ImageAnalysisWorker, ImageGenWorker, SuggestionsWorker, configure_chat_workers  # noqa: E402
-from app.workers.speech import AudioDevice, SpeechWorker, configure_speech_worker  # noqa: E402
+from app.workers.speech import AudioDevice, SpeechWorker, configure_speech_worker, preload_whisper_model  # noqa: E402
 
 
 def _env_float_raw(name: str, default: float) -> float:
@@ -257,6 +258,9 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/explain", "Подробно объяснить тему"),
     ("/code", "Показать рабочий пример кода"),
     ("/translate", "Перевести текст"),
+    ("/think", "Размышления модели (вкл/выкл)"),
+    ("/agent", "Агент: команды с подтверждением"),
+    ("/canvas", "Код ответа в боковой панели"),
 )
 
 LIGHTWEIGHT_STT_CORRECTIONS: tuple[tuple[str, str], ...] = (
@@ -603,6 +607,10 @@ def icon_pixmap(kind: str, size: int, color: str = TEXT) -> QPixmap:
     elif kind == "plus":
         painter.drawLine(int(s * 0.50), int(s * 0.24), int(s * 0.50), int(s * 0.76))
         painter.drawLine(int(s * 0.24), int(s * 0.50), int(s * 0.76), int(s * 0.50))
+    elif kind == "tools":
+        _r = s * 0.12
+        for _cx, _cy in ((0.34, 0.34), (0.66, 0.34), (0.34, 0.66), (0.66, 0.66)):
+            painter.drawRoundedRect(int(s * _cx - _r), int(s * _cy - _r), int(2 * _r), int(2 * _r), int(_r * 0.6), int(_r * 0.6))
     elif kind == "trash":
         painter.drawLine(int(s * 0.28), int(s * 0.30), int(s * 0.72), int(s * 0.30))
         painter.drawLine(int(s * 0.38), int(s * 0.22), int(s * 0.62), int(s * 0.22))
@@ -2034,6 +2042,11 @@ class SettingsDialog(QDialog):
         self.openai_key_edit.setPlaceholderText("optional API key")
         self.openai_key_edit.editingFinished.connect(self.refresh_modelhub)
 
+        self.provider_preset = NoWheelComboBox()
+        self.provider_preset.setObjectName("settingsCombo")
+        self.provider_preset.addItems(["— provider —", "DeepSeek", "OpenAI", "Groq", "OpenRouter", "Together"])
+        self.provider_preset.currentTextChanged.connect(self._apply_provider_preset)
+        provider_form.addRow("Quick setup", self.provider_preset)
         provider_form.addRow("Provider", self.provider_combo)
         provider_form.addRow("Ollama endpoint", self.ollama_endpoint_edit)
         provider_form.addRow("OpenAI-compatible", self.openai_endpoint_edit)
@@ -2100,6 +2113,24 @@ class SettingsDialog(QDialog):
         self._on_provider_changed()
         self.render_model_cards()
         return page
+
+    PROVIDER_PRESETS = {
+        "DeepSeek": "https://api.deepseek.com/v1",
+        "OpenAI": "https://api.openai.com/v1",
+        "Groq": "https://api.groq.com/openai/v1",
+        "OpenRouter": "https://openrouter.ai/api/v1",
+        "Together": "https://api.together.xyz/v1",
+    }
+
+    def _apply_provider_preset(self, name: str) -> None:
+        url = self.PROVIDER_PRESETS.get((name or "").strip())
+        if not url:
+            return
+        self.provider_combo.setCurrentText("openai_compatible")
+        self.openai_endpoint_edit.setText(url)
+        self._on_provider_changed(refresh=False)
+        self.openai_key_edit.setFocus()
+        self.modelhub_status.setText(f"{name}: enter your API key, then press Refresh to list models.")
 
     def _on_provider_changed(self, *, refresh: bool = False) -> None:
         provider = self.provider_combo.currentText().strip()
@@ -2468,7 +2499,7 @@ class SettingsDialog(QDialog):
 
     def _reindex(self) -> None:
         try:
-            from app import vectorstore
+            from app import vectorstore 
 
             vectorstore.ensure_indexed(force=True)
             info = vectorstore.stats()
@@ -2494,6 +2525,12 @@ class SettingsDialog(QDialog):
         combo.setEditable(False)
         combo.setObjectName("settingsCombo")
         choices = _dedupe_models(models)
+        current = (current or "").strip()
+        # Keep the configured model selectable/visible even when it isn't a local Ollama
+        # model (e.g. a remote API model like deepseek-v4-flash not in the Ollama list) —
+        # otherwise the combo silently falls back to index 0 and looks like it "reset".
+        if current and current not in choices and not any(_model_name_matches(current, m) for m in choices):
+            choices = [current, *choices]
         combo.addItems(choices)
         combo.setEnabled(bool(choices))
         if current in choices:
@@ -2542,7 +2579,7 @@ class SettingsDialog(QDialog):
         form.addRow("", self.view_hidden)
 
         hint = QLabel(
-            "Optionally hide the panel from screen capture (e.g. for screenshots or video recording) and from the taskbar. The panel will still be visible in the Alt-Tab switcher and can be focused with a global hotkey."
+            "Optionally."
         )
         hint.setObjectName("dialogNote")
         hint.setWordWrap(True)
@@ -3037,6 +3074,9 @@ class OverlayWindow(QMainWindow):
         self._active_stream_generation = 0
         self._ask_threads: list[QThread] = []
         self._generating = False          # True while LLM is producing tokens
+        self._message_thinking: dict[int, str] = {}   # finalized reasoning per assistant index
+        self._think_open: set[int] = set()            # which reasoning blocks are expanded
+        self.setAcceptDrops(True)            # drag & drop files / images onto the window
         self.typing_timer = QTimer(self)
         self.typing_timer.setInterval(60)
         self.typing_timer.timeout.connect(self._tick_typing)
@@ -3055,6 +3095,7 @@ class OverlayWindow(QMainWindow):
         self.region_selector: RegionSelector | None = None
         self.speech_thread: QThread | None = None
         self.speech_worker: SpeechWorker | None = None
+        QTimer.singleShot(600, preload_whisper_model)  # warm the STT model in the background at startup
         self.drag_position: QPoint | None = None
         self.last_final_speech = ""
         self.current_partial_speech = ""
@@ -3067,7 +3108,7 @@ class OverlayWindow(QMainWindow):
         self._closing = False
         self._close_retry_count = 0
         self.last_question_candidate = ""
-        self.pending_attachment: dict[str, str] | None = None
+        self.pending_attachments: list[dict[str, str]] = []
         # Multi-turn vision: the last analyzed screenshot stays pinned so follow-up
         # text questions can ask about the SAME image without re-capturing.
         self._vision_context_b64 = ""
@@ -3442,6 +3483,49 @@ class OverlayWindow(QMainWindow):
         button.clicked.connect(handler)
         return button
 
+    def _build_tools_menu(self):  # noqa: ANN201
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setObjectName("toolsMenu")
+        _off = {"0", "false", "no", "off"}
+        dt = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in _off
+        ag = os.getenv("STACKWIRE_AGENT", "0").strip().lower() not in _off
+        cv = self.canvas_panel.isVisible() if hasattr(self, "canvas_panel") else False
+        for _label, _kind, _on, _handler in (
+            (tr("Размышления", "Think"), "deepthink", dt, self.toggle_deepthink),
+            (tr("Агент", "Agent"), "agent", ag, self.toggle_agent),
+            ("Canvas", "canvas", cv, self.toggle_canvas),
+        ):
+            _act = menu.addAction(make_icon(_kind, _px(16), ACCENT if _on else "#9fb0bd"), _label)
+            _act.setCheckable(True)
+            _act.setChecked(_on)
+            _act.triggered.connect(lambda _checked=False, h=_handler: h())
+        return menu
+
+    def _show_tools_menu(self) -> None:
+        if not hasattr(self, "tools_button"):
+            return
+        menu = self._build_tools_menu()
+        _anchor = self.tools_button.mapToGlobal(self.tools_button.rect().topLeft())
+        menu.exec(QPoint(_anchor.x(), _anchor.y() - menu.sizeHint().height() - _px(4)))
+
+    def _refresh_tool_pills(self) -> None:
+        """Pills are collapsed by default — a mode pill shows only while that mode is
+        ON (toggle modes via the / command menu). Keeps the composer clean like GPT/Claude."""
+        if not hasattr(self, "composer_tools"):
+            return
+        _off = {"0", "false", "no", "off"}
+        dt = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in _off
+        ag = os.getenv("STACKWIRE_AGENT", "0").strip().lower() not in _off
+        cv = self.canvas_panel.isVisible() if hasattr(self, "canvas_panel") else False
+        if hasattr(self, "deepthink_button"):
+            self.deepthink_button.setVisible(dt)
+        if hasattr(self, "agent_button"):
+            self.agent_button.setVisible(ag)
+        if hasattr(self, "canvas_button"):
+            self.canvas_button.setVisible(cv)
+        self.composer_tools.setVisible(dt or ag or cv)
+
     def toggle_deepthink(self) -> None:
         on = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in {"0", "false", "no", "off"}
         on = not on
@@ -3472,6 +3556,33 @@ class OverlayWindow(QMainWindow):
         else:
             self.canvas_edit.setPlainText("")
             self.canvas_title.setText("Canvas — в ответе нет кода")
+        if getattr(self, "canvas_preview_btn", None) is not None and self.canvas_preview_btn.isChecked():
+            self._render_canvas_preview()
+
+    def _toggle_canvas_preview(self) -> None:
+        show_preview = self.canvas_preview_btn.isChecked()
+        if show_preview:
+            self._render_canvas_preview()
+        self.canvas_preview.setVisible(show_preview)
+        self.canvas_edit.setVisible(not show_preview)
+
+    def _render_canvas_preview(self) -> None:
+        code = self.canvas_edit.toPlainText()
+        lang = (self._last_answer_code()[1] or "").lower()
+        stripped = code.lstrip().lower()
+        if not code.strip():
+            self.canvas_preview.setHtml("<p style='color:#667'>Нет кода для превью.</p>")
+            return
+        if lang in ("html", "htm") or stripped.startswith(("<!doctype", "<html", "<body", "<div", "<table")):
+            self.canvas_preview.setHtml(code)
+        elif lang == "svg" or stripped.startswith("<svg"):
+            b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
+            self.canvas_preview.setHtml(f'<img src="data:image/svg+xml;base64,{b64}">')
+        else:
+            self.canvas_preview.setHtml(
+                "<p style='color:#667'>Превью рендерится для HTML и SVG (нативно, без JS). "
+                f"Для «{lang or 'этого типа'}» смотри вкладку «Код».</p>"
+            )
 
     def _copy_canvas(self) -> None:
         text = self.canvas_edit.toPlainText()
@@ -3620,10 +3731,28 @@ class OverlayWindow(QMainWindow):
         self._agent_messages.append({"role": "user", "content": "I declined that command. Suggest an alternative or answer without running it."})
         self._run_agent_turn()
 
+    def _change_agent_cwd(self) -> None:
+        from app.agent import agent_cwd
+        from PySide6.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(self, tr("Рабочая папка агента", "Agent working folder"), agent_cwd())
+        if not folder:
+            return
+        os.environ["STACKWIRE_AGENT_CWD"] = folder
+        try:
+            _save_local_env_values({"STACKWIRE_AGENT_CWD": folder})
+        except Exception:
+            LOGGER.debug("agent cwd save failed", exc_info=True)
+        if hasattr(self, "agent_cwd_label"):
+            self.agent_cwd_label.setText("📁 " + folder)
+        self.status.setText(tr("Папка агента: ", "Agent folder: ") + folder)
+
     def _show_agent_confirm(self, command: str, dangerous: bool) -> None:
         self.ask_button.setEnabled(True)
         if hasattr(self, "agent_confirm_bar"):
             self.agent_command_label.setText(command)
+            if hasattr(self, "agent_cwd_label"):
+                from app.agent import agent_cwd
+                self.agent_cwd_label.setText("📁 " + agent_cwd())
             self.agent_warn_label.setVisible(dangerous)
             self.agent_confirm_bar.setVisible(True)
         self.status.setText("Agent: подтвердите команду" + (" (ОПАСНО!)" if dangerous else ""))
@@ -4122,9 +4251,13 @@ class OverlayWindow(QMainWindow):
         attach_bar_layout.setSpacing(8)
         self.attach_chip = QLabel("")
         self.attach_chip.setObjectName("attachChip")
-        self.attach_remove = QPushButton("вњ•")
+        self.attach_remove = QPushButton()
         self.attach_remove.setObjectName("attachRemove")
-        self.attach_remove.setFixedSize(22, 22)
+        self.attach_remove.setFixedSize(_px(24), _px(24))
+        self.attach_remove.setIcon(make_icon("close", _px(12), "#9fb0bd"))
+        self.attach_remove.setIconSize(QSize(_px(12), _px(12)))
+        self.attach_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.attach_remove.setToolTip(tr("Убрать вложение", "Remove attachment"))
         self.attach_remove.clicked.connect(self.clear_attachment)
         attach_bar_layout.addWidget(self.attach_chip, 1)
         attach_bar_layout.addWidget(self.attach_remove, 0)
@@ -4134,6 +4267,11 @@ class OverlayWindow(QMainWindow):
         footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(8)
 
+        self.tools_button = QPushButton()
+        self.tools_button.setObjectName("composerIcon")
+        self.tools_button.setToolTip(tr("Инструменты: DeepThink, Agent, Canvas", "Tools: DeepThink, Agent, Canvas"))
+        self.tools_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tools_button.clicked.connect(self._show_tools_menu)
         self.attach_button = QPushButton()
         self.attach_button.setObjectName("composerIcon")
         self.attach_button.setToolTip("Attach file")
@@ -4159,11 +4297,37 @@ class OverlayWindow(QMainWindow):
         # Soft mint glow under the filled send button — the composer's focal point.
         _soft_shadow(self.ask_button, blur=_px(18), dy=_px(4), color=QColor(154, 214, 189, 115))
 
+        footer.addWidget(self.tools_button, 0, Qt.AlignmentFlag.AlignBottom)
         footer.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         footer.addWidget(self.input, 1)
         footer.addWidget(self.listen_button, 0, Qt.AlignmentFlag.AlignBottom)
         footer.addWidget(self.ask_button, 0, Qt.AlignmentFlag.AlignBottom)
         composer_layout.addLayout(footer)
+
+        # Tool pills (ChatGPT / Claude style): per-conversation mode toggles live ON the
+        # composer — the active mode lights up right where you type — instead of being
+        # abstract on/off switches buried in the left rail.
+        self.composer_tools = QWidget()
+        self.composer_tools.setObjectName("composerTools")
+        tools_layout = QHBoxLayout(self.composer_tools)
+        tools_layout.setContentsMargins(_px(2), 0, _px(2), 0)
+        tools_layout.setSpacing(_px(6))
+        for _attr, _kind, _label, _tip, _handler in (
+            ("deepthink_button", "deepthink", tr("Размышление", "Think"), tr("Показывать рассуждения модели перед ответом", "Show the model's reasoning before the answer"), self.toggle_deepthink),
+            ("agent_button", "agent", tr("Агент", "Agent"), tr("Выполнять команды с подтверждением", "Run commands with confirmation"), self.toggle_agent),
+            ("canvas_button", "canvas", "Canvas", tr("Код ответа в боковой панели", "Answer code in a side panel"), self.toggle_canvas),
+        ):
+            _pill = QPushButton(_label)
+            _pill.setObjectName("composerToolPill")
+            _pill.setProperty("kind", _kind)
+            _pill.setCheckable(True)
+            _pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            _pill.setToolTip(_tip)
+            _pill.clicked.connect(_handler)
+            setattr(self, _attr, _pill)
+            tools_layout.addWidget(_pill)
+        tools_layout.addStretch(1)
+        composer_layout.addWidget(self.composer_tools)
 
         self.debug_panel = QLabel()
         self.debug_panel.setObjectName("debugPanel")
@@ -4196,6 +4360,7 @@ class OverlayWindow(QMainWindow):
         # speech recognition is working and what exactly was understood.
         self.live_panel = QLabel("")
         self.live_panel.setObjectName("livePanel")
+        self.live_panel.setTextFormat(Qt.TextFormat.RichText)
         self.live_panel.setWordWrap(True)
         self.live_panel.setVisible(False)
         self.live_panel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -4247,6 +4412,17 @@ class OverlayWindow(QMainWindow):
         _atop.addWidget(_atitle)
         _atop.addStretch(1)
         _atop.addWidget(self.agent_warn_label)
+        _acwd = QHBoxLayout()
+        _acwd.setSpacing(_px(6))
+        self.agent_cwd_label = QLabel("")
+        self.agent_cwd_label.setObjectName("agentCwdLabel")
+        self.agent_cwd_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.agent_cwd_btn = QPushButton(tr("Сменить папку", "Change folder"))
+        self.agent_cwd_btn.setObjectName("agentCwdButton")
+        self.agent_cwd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.agent_cwd_btn.clicked.connect(self._change_agent_cwd)
+        _acwd.addWidget(self.agent_cwd_label, 1)
+        _acwd.addWidget(self.agent_cwd_btn, 0)
         self.agent_command_label = QLabel("")
         self.agent_command_label.setObjectName("agentCommandLabel")
         self.agent_command_label.setWordWrap(True)
@@ -4264,6 +4440,7 @@ class OverlayWindow(QMainWindow):
         _abtns.addWidget(self.agent_deny_btn)
         _abtns.addWidget(self.agent_run_btn)
         _acl.addLayout(_atop)
+        _acl.addLayout(_acwd)
         _acl.addWidget(self.agent_command_label)
         _acl.addLayout(_abtns)
         content_layout.addWidget(self.agent_confirm_bar)
@@ -4296,15 +4473,27 @@ class OverlayWindow(QMainWindow):
         self.canvas_close.setFixedSize(_px(28), _px(28))
         self.canvas_close.setCursor(Qt.CursorShape.PointingHandCursor)
         self.canvas_close.clicked.connect(self.toggle_canvas)
+        self.canvas_preview_btn = QPushButton(tr("Превью", "Preview"))
+        self.canvas_preview_btn.setObjectName("canvasPreviewBtn")
+        self.canvas_preview_btn.setCheckable(True)
+        self.canvas_preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.canvas_preview_btn.setToolTip(tr("Превью HTML/SVG (нативно, без JS)", "Preview HTML/SVG (native, no JS)"))
+        self.canvas_preview_btn.clicked.connect(self._toggle_canvas_preview)
         _ch.addWidget(self.canvas_title)
         _ch.addStretch(1)
+        _ch.addWidget(self.canvas_preview_btn)
         _ch.addWidget(self.canvas_copy)
         _ch.addWidget(self.canvas_close)
         self.canvas_edit = QPlainTextEdit()
         self.canvas_edit.setObjectName("canvasEdit")
         self.canvas_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.canvas_preview = QTextBrowser()
+        self.canvas_preview.setObjectName("canvasPreview")
+        self.canvas_preview.setOpenExternalLinks(True)
+        self.canvas_preview.setVisible(False)
         _cv.addLayout(_ch)
         _cv.addWidget(self.canvas_edit, 1)
+        _cv.addWidget(self.canvas_preview, 1)
         shell_layout.addWidget(content, 1)
         shell_layout.addWidget(self.canvas_panel)
         layout.addWidget(shell)
@@ -4678,15 +4867,16 @@ class OverlayWindow(QMainWindow):
         if hasattr(self, "deepthink_button"):
             _dt = os.getenv("STACKWIRE_DEEPTHINK", "0").strip().lower() not in {"0", "false", "no", "off"}
             self.deepthink_button.setChecked(_dt)
-            self.deepthink_button.setIcon(make_icon("deepthink", rail_icon_size, ACCENT if _dt else "#83aeb8"))
+            self.deepthink_button.setIcon(make_icon("deepthink", rail_icon_size, "#0c1f18" if _dt else "#83aeb8"))
         if hasattr(self, "canvas_button"):
             _cv_open = self.canvas_panel.isVisible() if hasattr(self, "canvas_panel") else False
             self.canvas_button.setChecked(_cv_open)
-            self.canvas_button.setIcon(make_icon("canvas", rail_icon_size, ACCENT if _cv_open else "#83aeb8"))
+            self.canvas_button.setIcon(make_icon("canvas", rail_icon_size, "#0c1f18" if _cv_open else "#83aeb8"))
         if hasattr(self, "agent_button"):
             _ag = os.getenv("STACKWIRE_AGENT", "0").strip().lower() not in {"0", "false", "no", "off"}
             self.agent_button.setChecked(_ag)
-            self.agent_button.setIcon(make_icon("agent", rail_icon_size, ACCENT if _ag else "#83aeb8"))
+            self.agent_button.setIcon(make_icon("agent", rail_icon_size, "#0c1f18" if _ag else "#83aeb8"))
+        self._refresh_tool_pills()
         if hasattr(self, "canvas_copy"):
             self.canvas_copy.setIcon(make_icon("copy", icon_size, "#83aeb8"))
             self.canvas_close.setIcon(make_icon("close", icon_size, "#83aeb8"))
@@ -4697,6 +4887,11 @@ class OverlayWindow(QMainWindow):
         has_account = bool(self.authenticated and self.auth_username.strip())
         self.settings_button.setVisible(not has_account)
         self.attach_button.setIcon(make_icon("attach", icon_size, "#83aeb8"))
+        if hasattr(self, "tools_button"):
+            self.tools_button.setIcon(make_icon("tools", icon_size, "#83aeb8"))
+            self.tools_button.setIconSize(QSize(icon_size, icon_size))
+        if hasattr(self, "attach_remove"):
+            self.attach_remove.setIcon(make_icon("close", _px(12), "#9fb0bd"))
         if self._generating:
             self.ask_button.setIcon(make_icon("stop_gen", icon_size, "#10131a"))
             self.ask_button.setToolTip("Stop generation (ESC)")
@@ -4851,10 +5046,10 @@ class OverlayWindow(QMainWindow):
         self.hide()
         QTimer.singleShot(180, self.show_region_selector)
 
-    def _launch_image_analysis(self, image_b64: str, prompt: str, *, creative: bool = False) -> None:
+    def _launch_image_analysis(self, image_b64, prompt: str, *, creative: bool = False) -> None:  # noqa: ANN001
         if self.image_thread is not None:
             return
-        self._last_vision_b64 = image_b64  # pinned as follow-up context once the answer lands
+        self._last_vision_b64 = image_b64[0] if isinstance(image_b64, (list, tuple)) and image_b64 else image_b64  # pin first image
         self._image_generation += 1
         image_generation = self._image_generation
         self._active_image_generation = image_generation
@@ -4985,7 +5180,7 @@ class OverlayWindow(QMainWindow):
         # (e.g. "почему тут ошибка?") and press Enter — or just press Enter with no text
         # for a full automatic analysis. Submission flows through submit_with_attachment().
         self._vision_context_b64 = ""  # fresh capture: drop any prior follow-up context
-        self.pending_attachment = {"kind": "image", "name": "screenshot.png", "data": image_b64}
+        self.pending_attachments.append({"kind": "image", "name": "screenshot.png", "data": image_b64})
         self._refresh_attachment_bar()
         self.status.setText("Скриншот готов — задайте вопрос и Enter, или просто Enter для разбора")
         self.input.setFocus()
@@ -5258,6 +5453,13 @@ class OverlayWindow(QMainWindow):
         popup.move(x, y)
 
     def _insert_slash_command(self, cmd: str) -> None:
+        if cmd in {"/think", "/deepthink", "/agent", "/canvas"}:
+            if getattr(self, "slash_popup", None) is not None:
+                self.slash_popup.hide()
+            self.input.clear()
+            self._apply_slash_command(cmd)
+            self.input.setFocus()
+            return
         self.input.setPlainText(f"{cmd} ")
         cursor = self.input.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -5287,6 +5489,17 @@ class OverlayWindow(QMainWindow):
 
         if cmd == "/clear":
             self.clear_answer()
+            return True, text
+
+        toggles = {
+            "/think": self.toggle_deepthink,
+            "/deepthink": self.toggle_deepthink,
+            "/agent": self.toggle_agent,
+            "/canvas": self.toggle_canvas,
+        }
+        if cmd in toggles:
+            self.input.clear()
+            toggles[cmd]()
             return True, text
 
         # Text-prefix commands: rewrite into a normal prompt and let submit_question continue.
@@ -5340,7 +5553,7 @@ class OverlayWindow(QMainWindow):
 
         question = self.input.toPlainText().strip()
 
-        if self.pending_attachment is not None:
+        if self.pending_attachments:
             self.submit_with_attachment(question)
             return
 
@@ -5458,72 +5671,141 @@ class OverlayWindow(QMainWindow):
         path_str, _ = QFileDialog.getOpenFileName(self, "Attach file", "", "All files (*.*)")
         if not path_str:
             return
-        path = Path(path_str)
+        self._attach_path(Path(path_str))
+
+    def _attach_path(self, path: Path) -> None:
         try:
             raw = path.read_bytes()
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"Could not read file: {_short_error(exc)}")
             return
-        if path.suffix.lower() in self.IMAGE_EXTENSIONS:
-            self.pending_attachment = {"kind": "image", "name": path.name, "data": base64.b64encode(raw).decode("ascii")}
+        suffix = path.suffix.lower()
+        if suffix in self.IMAGE_EXTENSIONS:
+            self.pending_attachments.append({"kind": "image", "name": path.name, "data": base64.b64encode(raw).decode("ascii")})
         else:
-            try:
-                text = raw[: self.MAX_TEXT_FILE_BYTES + 1].decode("utf-8")
-                if len(raw) > self.MAX_TEXT_FILE_BYTES:
-                    text = text[: self.MAX_TEXT_FILE_BYTES] + "\n... (file truncated)"
-                self.pending_attachment = {"kind": "text", "name": path.name, "content": text}
-            except UnicodeDecodeError:
-                self.pending_attachment = {"kind": "binary", "name": path.name}
+            doc_text = _extract_document_text(path) if suffix in _DOCUMENT_EXTENSIONS else None
+            if doc_text:
+                self.pending_attachments.append({"kind": "text", "name": path.name, "content": doc_text})
+            else:
+                try:
+                    text = raw[: self.MAX_TEXT_FILE_BYTES + 1].decode("utf-8")
+                    if len(raw) > self.MAX_TEXT_FILE_BYTES:
+                        text = text[: self.MAX_TEXT_FILE_BYTES] + chr(10) + "... (file truncated)"
+                    self.pending_attachments.append({"kind": "text", "name": path.name, "content": text})
+                except UnicodeDecodeError:
+                    self.pending_attachments.append({"kind": "binary", "name": path.name})
+                    if suffix in _DOCUMENT_EXTENSIONS and not _document_extractor_available(suffix):
+                        self.status.setText(f"Для чтения {suffix} установите парсер: pip install -r requirements.txt")
         self._refresh_attachment_bar()
         self.input.setFocus()
         self.status.setText("File attached. Add text if needed, then press Enter.")
 
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        md = event.mimeData()
+        if md.hasUrls() or md.hasImage():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        md = event.mimeData()
+        if md.hasUrls():
+            for url in md.urls():
+                if url.isLocalFile():
+                    self._attach_path(Path(url.toLocalFile()))
+                    event.acceptProposedAction()
+                    return
+        if md.hasImage():
+            from PySide6.QtGui import QImage
+            qimg = QImage(md.imageData())
+            if not qimg.isNull():
+                b64 = pixmap_to_base64_png(QPixmap.fromImage(qimg))
+                self._on_clipboard_image(b64, "dropped.png")
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+
     def clear_attachment(self) -> None:
-        self.pending_attachment = None
+        self.pending_attachments = []
         self._vision_context_b64 = ""  # also drop pinned screenshot follow-up context
         self._refresh_attachment_bar()
 
     def _refresh_attachment_bar(self) -> None:
-        attachment = self.pending_attachment
-        if attachment:
-            kind_label = {"image": "image", "text": "text", "binary": "file"}.get(attachment["kind"], "file")
-            self.attach_chip.setText(f"{attachment['name']} - {kind_label}")
+        items = self.pending_attachments
+        if items:
+            if len(items) == 1:
+                a = items[0]
+                kind_label = {"image": "image", "text": "text", "binary": "file"}.get(a["kind"], "file")
+                self.attach_chip.setText(f"{a['name']} - {kind_label}")
+            else:
+                names = ", ".join(a["name"] for a in items[:4])
+                more = f" +{len(items) - 4}" if len(items) > 4 else ""
+                self.attach_chip.setText(f"\U0001F4CE {len(items)}: {names}{more}")
             self.attach_bar.setVisible(True)
             return
         if self._vision_context_b64:
-            # A screenshot is pinned in context — follow-up questions ask about it.
-            self.attach_chip.setText("🖼 Скриншот активен — спросите ещё")
+            self.attach_chip.setText("\U0001F5BC Скриншот активен — спросите ещё")
             self.attach_bar.setVisible(True)
             return
         self.attach_bar.setVisible(False)
         self.attach_chip.setText("")
 
-    def submit_with_attachment(self, text: str) -> None:
-        attachment = self.pending_attachment
-        if attachment is None:
+    def _index_documents_async(self, docs) -> None:  # noqa: ANN001
+        """Index attached document text into the local vector store (off the GUI thread)
+        so the model can retrieve from your files across the conversation."""
+        docs = [(name, content) for name, content in docs if content and content.strip()]
+        if not docs:
             return
-        self.pending_attachment = None
+        import threading
+
+        def _worker() -> None:
+            try:
+                from app import vectorstore
+
+                for name, content in docs:
+                    vectorstore.remember_document(name, content)
+            except Exception:
+                LOGGER.debug("document indexing failed", exc_info=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def submit_with_attachment(self, text: str) -> None:
+        items = list(self.pending_attachments)
+        if not items:
+            return
+        self.pending_attachments = []
         self._refresh_attachment_bar()
         self.stop_speech_capture_for_submit()
         self.ask_button.setEnabled(False)
         self.input.clear()
-
-        if attachment["kind"] == "image":
-            user_md = f"[[screenshot:{attachment['data']}]]" + (f"\n\n{text}" if text else "")
+        images = [a for a in items if a["kind"] == "image"]
+        files = [a for a in items if a["kind"] != "image"]
+        self._index_documents_async([(a["name"], a.get("content", "")) for a in files if a["kind"] == "text"])
+        file_parts: list[str] = []
+        for a in files:
+            if a["kind"] == "text":
+                file_parts.append(f'File "{a["name"]}":' + chr(10) + "```" + chr(10) + a["content"] + chr(10) + "```")
+            else:
+                file_parts.append(f'(File "{a["name"]}" is attached, but its contents are not readable as text.)')
+        file_text = (chr(10) + chr(10)).join(file_parts)
+        if images:
+            img_data = [a["data"] for a in images]
+            prompt = text.strip()
+            if file_text:
+                prompt = (prompt + chr(10) + chr(10) + file_text).strip() if prompt else file_text
+            shots = "".join(f"[[screenshot:{d}]]" for d in img_data)
+            extra = (chr(10) + chr(10) + ", ".join(a["name"] for a in files)) if files else ""
+            user_md = shots + ((chr(10) + chr(10) + text) if text else "") + extra
             self.chat_messages.append(("user", user_md))
             self.chat_messages.append(("assistant", "[[thinking:0]]"))
             self._begin_streaming()
             self.status.setText("Analyzing...")
-            self._launch_image_analysis(attachment["data"], text)
+            self._launch_image_analysis(img_data, prompt)
             return
-
-        if attachment["kind"] == "text":
-            instruction = text.strip() or "Analyze this file and explain what it does."
-            question = f"{instruction}\n\nFile \"{attachment['name']}\":\n```\n{attachment['content']}\n```"
-        else:
-            instruction = text.strip() or "What is this file and what is it used for?"
-            question = f"{instruction}\n\n(File \"{attachment['name']}\" is attached, but its contents are not readable as text.)"
-        file_md = f"[[file:{attachment['name']}]]" + (f"\n\n{text}" if text else "")
+        instruction = text.strip() or "Analyze these files and explain what they do."
+        question = instruction + chr(10) + chr(10) + file_text
+        names = ", ".join(a["name"] for a in files)
+        file_md = f"[[file:{names}]]" + ((chr(10) + chr(10) + text) if text else "")
         self.chat_messages.append(("user", file_md))
         self.chat_messages.append(("assistant", "[[thinking:0]]"))
         self._begin_streaming()
@@ -5644,12 +5926,7 @@ class OverlayWindow(QMainWindow):
         del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
         balanced = balance_streaming_markdown(self._stream_buffer)
         markup = markdown_to_html(balanced)
-        _think = getattr(self, "_thinking_buffer", "").strip()
-        if _think:
-            _safe = html.escape(_think).replace(chr(10), "<br>")
-            _block = f'<div class="think-block"><span class="think-label">Размышления</span><br>{_safe}</div>'
-            markup = markup.replace("<body>", "<body>" + _block, 1)
-        # Mint caret at the end while generating (skip when inside a code fence).
+        # Mint caret at the end of the answer while generating (skip inside a code fence).
         if not balanced.rstrip().endswith("```"):
             markup = _with_stream_caret(markup)
         self._stream_row.show_html(markup, final=False)
@@ -5660,7 +5937,12 @@ class OverlayWindow(QMainWindow):
     def on_stream_finished(self, stream_generation: int, result: object) -> None:
         if stream_generation != self._active_stream_generation:
             return
+        _think = getattr(self, "_thinking_buffer", "").strip()
         self._stop_streaming(discard_generation=True)
+        _idx = self._last_assistant_index()
+        if _think and _idx >= 0:
+            self._message_thinking[_idx] = _think
+            self._think_open.discard(_idx)
         self.show_answer(result)
 
     @Slot(int, str)
@@ -6013,7 +6295,7 @@ class OverlayWindow(QMainWindow):
     # ------------------------------------------------------------------ clipboard paste
     def _on_clipboard_image(self, b64: str, name: str) -> None:
         """Handle an image pasted from clipboard (Ctrl+V) into the input field."""
-        self.pending_attachment = {"kind": "image", "name": name, "data": b64}
+        self.pending_attachments.append({"kind": "image", "name": name, "data": b64})
         self._refresh_attachment_bar()
         self.status.setText("Image pasted. Add text if needed, then press Enter.")
         self.input.setFocus()
@@ -6095,6 +6377,7 @@ class OverlayWindow(QMainWindow):
             ("copy:", self.copy_message),
             ("copycode:", self.copy_code_snippet),
             ("togglecode:", self.toggle_code_block),
+            ("togglethink:", self.toggle_think_block),
         ):
             if target.startswith(prefix):
                 try:
@@ -6272,7 +6555,7 @@ class OverlayWindow(QMainWindow):
         self.transcript_lines.clear()
         self.last_question_candidate = ""
         self.current_partial_speech = ""
-        self.pending_attachment = None
+        self.pending_attachments = []
         self._refresh_attachment_bar()
         self.speech_input_locked = False
         self.submit_after_speech_stop = False
@@ -6306,6 +6589,28 @@ class OverlayWindow(QMainWindow):
             f"{question}"
         )
 
+    def _assistant_markup(self, index: int, content: str) -> str:
+        markup = markdown_to_html(content)
+        # Reasoning is hidden by default; the lightbulb icon on the message reveals
+        # it (adds the index to _think_open). Shown only when revealed, after the answer.
+        think = self._message_thinking.get(index)
+        if think and index in self._think_open:
+            safe = html.escape(think).replace(chr(10), "<br>")
+            label = tr("Размышления", "Reasoning")
+            block = f'<div class="think-block"><span class="think-label">{label}</span><br>{safe}</div>'
+            if "</body>" in markup:
+                markup = markup.replace("</body>", block + "</body>", 1)
+            else:
+                markup = markup + block
+        return markup
+
+    def toggle_think_block(self, index: int) -> None:
+        if index in self._think_open:
+            self._think_open.discard(index)
+        else:
+            self._think_open.add(index)
+        self.render_chat()
+
     def replace_last_assistant(self, text: str, *, focus_latest: bool = False) -> None:
         for index in range(len(self.chat_messages) - 1, -1, -1):
             if self.chat_messages[index][0] == "assistant":
@@ -6314,7 +6619,7 @@ class OverlayWindow(QMainWindow):
                 if row is not None and shiboken6.isValid(row):
                     del CODE_SNIPPETS[self._stream_prefix_snippets:]
                     del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
-                    row.show_html(markdown_to_html(text), final=True)
+                    row.show_html(self._assistant_markup(index, text), final=True)
                     self._persist_current_chat()
                     if focus_latest:
                         QTimer.singleShot(0, lambda: self.chat_area.scroll_to_bottom(animated=True))
@@ -6420,13 +6725,16 @@ class OverlayWindow(QMainWindow):
             row = AssistantRow(
                 index, self.on_anchor_clicked, self.copy_message, model_name,
                 on_regenerate=self.regenerate_message,
+                on_reasoning=self.toggle_think_block,
+                has_reasoning=(index in self._message_thinking),
+                reasoning_shown=(index in self._think_open),
             )
             self.chat_area.add_row(row)
             self._assistant_rows[index] = row
             if self._is_thinking(content):
                 row.show_thinking()
             else:
-                row.show_html(markdown_to_html(content), final=True)
+                row.show_html(self._assistant_markup(index, content), final=True)
         if animate:
             _animate_in(row)
         self._message_rows[index] = row
@@ -6655,18 +6963,23 @@ class OverlayWindow(QMainWindow):
             self.auto_ask_timer.start()
 
     def _update_live_panel(self) -> None:
-        """Refresh the live transcript strip (visible only while listening)."""
+        """Refresh the live transcript strip (visible only while listening). Finalized
+        lines render solid; the in-progress partial is dimmer with a live caret so words
+        appear as they are spoken (GhostGPT-style)."""
         panel = getattr(self, "live_panel", None)
         if panel is None:
             return
         if not self._speech_is_running():
             panel.setVisible(False)
             return
-        lines = self.raw_transcript_lines[-4:]
+        rows = [html.escape(line.strip()) for line in self.raw_transcript_lines[-4:] if line.strip()]
         if self.current_partial_speech:
-            lines = [*lines, f"… {self.current_partial_speech}"]
-        text = "\n".join(line.strip() for line in lines if line.strip())
-        panel.setText(text or "Слушаю…")
+            rows.append(
+                '<span style="color:#7f96a2;">'
+                + html.escape(self.current_partial_speech)
+                + '<span style="color:#9ad6bd;">&#9613;</span></span>'
+            )
+        panel.setText("<br>".join(rows) or "Слушаю…")
         panel.setVisible(True)
 
     def refresh_question_candidate(self) -> None:

@@ -152,8 +152,8 @@ DEFAULT_CASES: tuple[EvalCase, ...] = (
     ),
     EvalCase(
         "english_sre_observability",
-        "Explain SLI, SLO, error budget, Prometheus, Grafana and Alertmanager in an SRE interview.",
-        ("SLI", "SLO", "error budget", "Prometheus", "Grafana", "Alertmanager", "SRE"),
+        "Explain SLI, SLO, error budget, Prometheus, Grafana and Alertmanager in observability.",
+        ("SLI", "SLO", "error budget", "Prometheus", "Grafana", "Alertmanager", "observability"),
         "en",
     ),
     EvalCase(

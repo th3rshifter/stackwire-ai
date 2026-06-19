@@ -87,8 +87,8 @@ CATALOG: dict[str, dict[str, str]] = {
     # View tab
     "view_opacity":   {"ru": "Прозрачность окна", "en": "Window opacity"},
     "view_language":  {"ru": "Язык",              "en": "Language"},
-    "view_hidden":    {"ru": "Скрытый режим — невидим для записи экрана и панели задач",
-                       "en": "Hidden mode — invisible to screen capture and the taskbar"},
+    "view_hidden":    {"ru": "Скрытый режим",
+                       "en": "Hidden mode"},
     "view_hint":      {"ru": "Прозрачность и скрытый режим применяются сразу (в mini окно прозрачнее). "
                              "Язык влияет на ответы модели и интерфейс (интерфейс — после перезапуска). "
                              "Всё сохраняется в stackwire.local.env.",

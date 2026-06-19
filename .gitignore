@@ -38,3 +38,4 @@ tests/*
 !tests/test_auth.py
 /gcm-diagnose.log
 .claude/
+kilo.json

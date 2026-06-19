@@ -356,7 +356,8 @@ class ImageAnalysisWorker(QObject):
             self.done.emit()
 
     def _analyze_remote(self) -> str:
-        payload: dict[str, str] = {"image_b64": self.image_b64, "prompt": self.prompt}
+        _img = self.image_b64[0] if isinstance(self.image_b64, (list, tuple)) and self.image_b64 else self.image_b64
+        payload: dict[str, str] = {"image_b64": _img, "prompt": self.prompt}
         response = self.session.post(
             f"{self.api_url}/analyze-image",
             json=cast(Any, payload),

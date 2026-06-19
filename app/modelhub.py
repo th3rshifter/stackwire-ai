@@ -29,7 +29,7 @@ MODELHUB_RECOMMENDED: tuple[ModelRecommendation, ...] = (
     ModelRecommendation("gemma3:4b", "Gemma 3 4B Vision", "4B", "vision", "Installed on this PC; use it for screenshot and image analysis.", 8),
     ModelRecommendation("qwen2.5vl:7b", "Qwen 2.5 VL 7B", "7B", "vision", "Better screenshot/OCR model if your PC can run it.", 16, 8),
     ModelRecommendation("qwen2.5:7b", "Qwen 2.5 7B", "7B", "balanced", "Good Russian/English general answers on common PCs.", 12),
-    ModelRecommendation("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B", "7B", "code", "Best starter choice for code, configs and DevOps tasks.", 12),
+    ModelRecommendation("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B", "7B", "code", "Best starter choice for code and technical tasks.", 12),
     ModelRecommendation("llama3.2:3b", "Llama 3.2 3B", "3B", "fast", "Very fast fallback for weak CPU/RAM.", 8),
     ModelRecommendation("mistral:7b", "Mistral 7B", "7B", "balanced", "Good concise technical answers.", 12),
     ModelRecommendation("deepseek-r1:7b", "DeepSeek R1 7B", "7B", "reasoning", "Reasoning model; slower, useful for deeper analysis.", 16),

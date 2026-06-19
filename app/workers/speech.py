@@ -60,6 +60,10 @@ WHISPER_HOTWORDS = STT_SETTINGS.hotwords
 # default; set STT_TECHNICAL_PROMPT=1 to re-enable tech-term biasing.
 STT_USE_TECH_PROMPT = os.getenv("STT_TECHNICAL_PROMPT", "0").strip().lower() in {"1", "true", "yes", "on"}
 WHISPER_INITIAL_PROMPT = WHISPER_TECHNICAL_PROMPT if STT_USE_TECH_PROMPT else ""
+# Live (real-time) partials: re-transcribe the in-progress buffer every ~0.7s so words
+# appear as they are spoken (GhostGPT-style) instead of only after a full ~3.5s chunk.
+WHISPER_LIVE_PARTIALS = os.getenv("WHISPER_LIVE_PARTIALS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WHISPER_PARTIAL_SECONDS = float(os.getenv("WHISPER_PARTIAL_SECONDS", "0.7") or "0.7")
 
 # Runtime values injected from desktop.py via configure_speech_worker().
 STACKWIRE_API_URL = ""
@@ -85,6 +89,90 @@ def _short_error(exc: BaseException, limit: int = 180) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: limit - 3]}..."
+
+
+# Whisper model is cached at module level so it loads ONCE per process (not on every
+# listen session, which reloaded multiple GB into VRAM each time) and can be preloaded
+# in the background at startup. Inference across the shared model is serialized below.
+STACKWIRE_PRELOAD_STT = os.getenv("STACKWIRE_PRELOAD_STT", "0").strip().lower() not in {"0", "false", "no", "off"}
+_SHARED_WHISPER_MODEL: "Any" = None
+_SHARED_WHISPER_LOAD_LOCK = threading.Lock()
+_SHARED_WHISPER_INFER_LOCK = threading.Lock()
+
+
+def _warmup_model(model: "Any", device: str) -> None:
+    if device != "cuda":
+        return
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    try:
+        segments, _info = model.transcribe(
+            np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32),
+            language="en",
+            task="transcribe",
+            beam_size=1,
+            best_of=1,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            no_speech_threshold=0.95,
+        )
+        list(segments)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("whisper warmup skipped", exc_info=True)
+
+
+def _build_whisper_model(on_status=None) -> "Any":  # noqa: ANN001
+    """Load + warm the WhisperModel per the configured device/compute attempts, caching
+    it at module level so subsequent listen sessions reuse it instantly."""
+    global _SHARED_WHISPER_MODEL
+    if _SHARED_WHISPER_MODEL is not None:
+        return _SHARED_WHISPER_MODEL
+    with _SHARED_WHISPER_LOAD_LOCK:
+        if _SHARED_WHISPER_MODEL is not None:
+            return _SHARED_WHISPER_MODEL
+        from faster_whisper import WhisperModel
+
+        attempts = whisper_model_attempts(STT_SETTINGS)
+        last_exc: "Exception | None" = None
+        for attempt_index, (device, compute_type) in enumerate(attempts):
+            try:
+                if on_status is not None:
+                    on_status("Загружаю модель распознавания…")
+                LOGGER.info("STT backend=whisper model=%s device=%s compute_type=%s", WHISPER_MODEL, device, compute_type)
+                model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
+                _warmup_model(model, device)
+                _SHARED_WHISPER_MODEL = model
+                LOGGER.info("whisper model loaded and cached (device=%s compute=%s)", device, compute_type)
+                return model
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt_index + 1 < len(attempts) and device == "cuda" and _is_cuda_whisper_error(exc):
+                    LOGGER.warning("CUDA Whisper unavailable (%s). Falling back to CPU/int8.", _short_error(exc))
+                    if on_status is not None:
+                        on_status("CUDA недоступна, переключаюсь на CPU…")
+                    continue
+                raise
+        raise RuntimeError(f"Unable to load Whisper model: {last_exc}") from last_exc
+
+
+def preload_whisper_model() -> None:
+    """Warm the Whisper model in a background thread at startup (gated by
+    STACKWIRE_PRELOAD_STT) so the first listen is instant instead of stalling on a
+    multi-GB model load mid-use."""
+    if not STACKWIRE_PRELOAD_STT or STACKWIRE_REMOTE_STT or STT_BACKEND != "whisper":
+        return
+    if _SHARED_WHISPER_MODEL is not None:
+        return
+
+    def _worker() -> None:
+        try:
+            _build_whisper_model()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("whisper preload failed", exc_info=True)
+
+    threading.Thread(target=_worker, daemon=True, name="whisper-preload").start()
 
 
 @dataclass
@@ -119,7 +207,7 @@ class SpeechWorker(QObject):
         self.remote_session.trust_env = False
         # Dual (interview) mode runs two capture loops sharing one Whisper model;
         # transcribe calls are serialized so GPU/CPU inference never interleaves.
-        self._transcribe_lock = threading.Lock()
+        self._transcribe_lock = _SHARED_WHISPER_INFER_LOCK  # shared so the cached model is serialized across sessions
 
     @Slot()
     def stop(self) -> None:
@@ -151,37 +239,8 @@ class SpeechWorker(QObject):
     def _whisper_model_attempts(self) -> list[tuple[str, str]]:
         return whisper_model_attempts(STT_SETTINGS)
 
-    def _load_whisper_model(self, whisper_model_class: Any) -> Any:
-        attempts = self._whisper_model_attempts()
-        last_exc: Exception | None = None
-
-        for attempt_index, (device, compute_type) in enumerate(attempts):
-            try:
-                self.info.emit("Загружаю модель распознавания…")
-                LOGGER.info(
-                    "STT backend=whisper model=%s device=%s compute_type=%s",
-                    WHISPER_MODEL,
-                    device,
-                    compute_type,
-                )
-                candidate_model = whisper_model_class(
-                    WHISPER_MODEL,
-                    device=device,
-                    compute_type=compute_type,
-                )
-                self._warmup_whisper_model(candidate_model, device)
-                return candidate_model
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                has_retry = attempt_index + 1 < len(attempts)
-                if has_retry and device == "cuda" and _is_cuda_whisper_error(exc):
-                    message = f"CUDA Whisper unavailable ({_short_error(exc)}). Falling back to CPU/int8."
-                    LOGGER.warning(message)
-                    self.info.emit(message)
-                    continue
-                raise
-
-        raise RuntimeError(f"Unable to load Whisper model: {last_exc}") from last_exc
+    def _load_whisper_model(self, whisper_model_class: Any) -> Any:  # noqa: ARG002
+        return _build_whisper_model(on_status=self.info.emit)
 
     def _warmup_whisper_model(self, model: Any, device: str) -> None:
         if device != "cuda":
@@ -282,6 +341,8 @@ class SpeechWorker(QObject):
         chunk_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_CHUNK_SECONDS), WHISPER_SAMPLE_RATE)
         buffers: list[object] = []
         buffered_frames = 0
+        last_partial_frames = 0
+        partial_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_PARTIAL_SECONDS), WHISPER_SAMPLE_RATE // 3)
 
         with sd.InputStream(
             samplerate=WHISPER_SAMPLE_RATE,
@@ -305,6 +366,10 @@ class SpeechWorker(QObject):
                 if buffered_frames >= chunk_frames:
                     self._transcribe_whisper_buffers(np, model, buffers, source=source)
                     buffers, buffered_frames = self._keep_overlap_buffers(np, buffers)
+                    last_partial_frames = buffered_frames
+                elif WHISPER_LIVE_PARTIALS and source != "me" and buffered_frames - last_partial_frames >= partial_frames:
+                    self._transcribe_whisper_partial(np, model, buffers, source=source)
+                    last_partial_frames = buffered_frames
 
             if buffered_frames >= WHISPER_SAMPLE_RATE:
                 self._transcribe_whisper_buffers(np, model, buffers, source=source)
@@ -462,6 +527,8 @@ class SpeechWorker(QObject):
         chunk_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_CHUNK_SECONDS), WHISPER_SAMPLE_RATE)
         buffers: list[object] = []
         buffered_frames = 0
+        last_partial_frames = 0
+        partial_frames = max(int(WHISPER_SAMPLE_RATE * WHISPER_PARTIAL_SECONDS), WHISPER_SAMPLE_RATE // 3)
 
         try:
             while self._running:
@@ -479,6 +546,10 @@ class SpeechWorker(QObject):
                 if buffered_frames >= chunk_frames:
                     self._transcribe_whisper_buffers(np, model, buffers, source=source)
                     buffers, buffered_frames = self._keep_overlap_buffers(np, buffers)
+                    last_partial_frames = buffered_frames
+                elif WHISPER_LIVE_PARTIALS and source != "me" and buffered_frames - last_partial_frames >= partial_frames:
+                    self._transcribe_whisper_partial(np, model, buffers, source=source)
+                    last_partial_frames = buffered_frames
 
             if buffered_frames >= WHISPER_SAMPLE_RATE:
                 self._transcribe_whisper_buffers(np, model, buffers, source=source)
@@ -578,6 +649,38 @@ class SpeechWorker(QObject):
             compression_ratio=float(diagnostics.get("compression_ratio") or 0.0),
             rms=rms,
         )
+
+    def _transcribe_whisper_partial(self, np, model, buffers: list[object], *, source: str = "") -> None:  # noqa: ANN001
+        """Emit an interim live transcript of the in-progress buffer so words show up as
+        they are spoken. Fast greedy decode; the authoritative text still comes from the
+        full final pass in _transcribe_whisper_buffers."""
+        if STACKWIRE_REMOTE_STT or model is None or not buffers:
+            return
+        audio = np.concatenate(buffers).astype(np.float32)
+        if len(audio) < WHISPER_SAMPLE_RATE // 2:
+            return
+        signal_threshold = STT_LOOPBACK_SIGNAL_THRESHOLD if self.device.loopback else STT_MIC_SIGNAL_THRESHOLD
+        if float(np.sqrt(np.mean(audio**2))) < signal_threshold:
+            return
+        try:
+            with self._transcribe_lock:
+                segments, _info = model.transcribe(
+                    audio,
+                    language=whisper_language(STT_SETTINGS, locked_language=self.language_lock),
+                    task="transcribe",
+                    beam_size=1,
+                    best_of=1,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    vad_filter=False,
+                    no_speech_threshold=STT_SETTINGS.no_speech_threshold,
+                )
+                text = " ".join(segment.text.strip() for segment in segments).strip()
+        except Exception:  # noqa: BLE001
+            return
+        text = clean_stt_output(text)
+        if text:
+            self.partial.emit(text)
 
     def _transcribe_whisper_buffers(self, np, model, buffers: list[object], *, source: str = "") -> None:  # noqa: ANN001
         if not buffers:

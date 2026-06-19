@@ -45,6 +45,16 @@ def current_llm_provider() -> str:
     return "ollama"
 
 
+def current_vision_provider() -> str:
+    """Provider for screenshot/vision requests. Defaults to local Ollama (where the
+    gemma vision model lives) even when text answers use a remote API without vision
+    (e.g. DeepSeek). Override with STACKWIRE_VISION_PROVIDER."""
+    raw = os.getenv("STACKWIRE_VISION_PROVIDER", "").strip().lower()
+    if raw in {"openai", "openai-compatible", "openai_compatible", "compatible"}:
+        return "openai_compatible"
+    return "ollama"
+
+
 def current_ollama_chat_url() -> str:
     return os.getenv("OLLAMA_URL", OLLAMA_URL).strip() or OLLAMA_URL
 
@@ -82,7 +92,7 @@ def _openai_message_content(data: dict[str, Any]) -> str:
     if not choices or not isinstance(choices[0], dict):
         return ""
     message = choices[0].get("message") or {}
-    return str(message.get("content", "")).strip()
+    return str(message.get("content") or "").strip()
 
 
 ANSWER_MODE = os.getenv("ANSWER_MODE", os.getenv("STACKWIRE_ANSWER_MODE", "normal")).strip().lower()
@@ -390,7 +400,7 @@ def _history_section(question: str, context: list[str] | None) -> str:
         + "\n".join(f"  {line}" for line in lines)
         + "\n\nIMPORTANT about history: if a similar question was already answered above, do NOT repeat the same material. "
         "Briefly acknowledge what was already covered in one short sentence, then add ONLY the new angle, the missing details, "
-        "or the next logical step. The user is often in a live conversation (e.g. a job interview) — repeated identical answers are useless to them."
+        "or the next logical step. The user is often in a live conversation — repeated identical answers are useless to them."
     )
 
 
@@ -425,13 +435,13 @@ EXPAND_MODE_RULES: dict[str, tuple[str, ...]] = {
         "Сравни только с ближайшими релевантными аналогами.",
         "Явно покажи главное отличие.",
         "Объясни когда что использовать.",
-        "Не уходи в unrelated domain и не добавляй YAML.",
+        "Не уходи в нерелевантную тему.",
     ),
     "troubleshoot": (
         "Пиши на русском.",
         "Это troubleshooting mode, не definition mode.",
         "Структура обязательна: 'Причины:', 'Проверки:', 'Fix:'.",
-        "В 'Проверки' дай реальные команды, логи или метрики, если контекст Kubernetes, Linux, CI/CD или Network.",
+        "В 'Проверки' дай реальные команды, проверки, логи, метрики или шаги диагностики, уместные для темы.",
         "Команды держи в fenced Markdown block с language tag.",
         "Не повторяй previous_answer, кроме короткой привязки к симптому.",
     ),
@@ -582,35 +592,56 @@ def _remember_answer(question: str, answer: str, plan: AnswerPlan, *, valid: boo
 
 
 def _format_rag_context(question: str, plan: AnswerPlan) -> str:
-    # Semantic knowledge retrieval via the local vector store, when available.
+    """Hybrid retrieval: fuse semantic (vector) + lexical results with reciprocal-rank
+    fusion, so we get semantic recall AND exact-term precision (commands, flags, paths).
+    Degrades gracefully to whichever source is available."""
+    semantic: list = []
     try:
         from app import vectorstore
 
-        hits = vectorstore.search_knowledge(question, limit=3)
-        if hits:
-            parts: list[str] = []
-            used = 0
-            for hit in hits:
-                text = hit.text.strip()
-                if not text:
-                    continue
-                block = f"[{hit.source} :: {hit.title}]\n{text}"
-                if used + len(block) > 3200:
-                    break
-                parts.append(block)
-                used += len(block)
-            if parts:
-                return "\n\n".join(parts)
+        semantic = vectorstore.search_knowledge(question, limit=5)
     except Exception:
         LOGGER.debug("vector rag retrieval failed", exc_info=True)
-
-    # Fallback: lexical retrieval over the same markdown knowledge.
+    lexical: list = []
     try:
-        chunks = retrieve_knowledge(question, plan, limit=3)
+        lexical = retrieve_knowledge(question, plan, limit=5)
     except Exception:
-        LOGGER.debug("rag retrieval failed", exc_info=True)
+        LOGGER.debug("lexical rag retrieval failed", exc_info=True)
+    fused = _fuse_rag(semantic, lexical, limit=3)
+    if not fused:
         return ""
-    return format_knowledge_chunks(chunks, max_chars=3200)
+    parts: list[str] = []
+    used = 0
+    for title, source, text in fused:
+        header = f"[{source} :: {title}]" if title else f"[{source}]"
+        block = header + chr(10) + text
+        if used + len(block) > 3200:
+            break
+        parts.append(block)
+        used += len(block)
+    return (chr(10) + chr(10)).join(parts)
+
+
+def _fuse_rag(semantic, lexical, *, k: int = 60, limit: int = 3):
+    """Reciprocal-rank fusion of vector hits (VectorHit) and lexical chunks
+    (KnowledgeChunk) into a deduped, re-ranked list of (title, source, text) tuples."""
+    scores: dict[str, float] = {}
+    meta: dict[str, tuple[str, str, str]] = {}
+
+    def _add(items, getter):
+        for rank, item in enumerate(items):
+            title, source, text = getter(item)
+            text = (text or "").strip()
+            if not text:
+                continue
+            key = text[:120].casefold().strip()
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            meta.setdefault(key, (title or "", source or "", text))
+
+    _add(semantic, lambda h: (h.title, h.source, h.text))
+    _add(lexical, lambda c: (c.heading, c.source_file, c.text))
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return [meta[key] for key, _ in ranked]
 
 
 def _question_requests_artifact(question: str) -> bool:
@@ -958,8 +989,8 @@ class OllamaClient:
             LOGGER.debug("storage session creation failed", exc_info=True)
             self.storage_session_id = None
 
-    def _chat(self, messages: list[dict[str, Any]], options: dict[str, Any], *, timeout: int = 300, model: str | None = None) -> str:
-        if current_llm_provider() == "openai_compatible":
+    def _chat(self, messages: list[dict[str, Any]], options: dict[str, Any], *, timeout: int = 300, model: str | None = None, provider: str | None = None) -> str:
+        if (provider or current_llm_provider()) == "openai_compatible":
             payload: dict[str, Any] = {
                 "model": model or current_answer_model(),
                 "messages": messages,
@@ -983,7 +1014,7 @@ class OllamaClient:
         response.raise_for_status()
         data = response.json()
         message = data.get("message") or {}
-        return str(message.get("content", "")).strip()
+        return str(message.get("content") or "").strip()
 
     def _chat_stream(
         self,
@@ -995,8 +1026,9 @@ class OllamaClient:
         model: str | None = None,
         on_thinking: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        provider: str | None = None,
     ) -> str:
-        if current_llm_provider() == "openai_compatible":
+        if (provider or current_llm_provider()) == "openai_compatible":
             payload: dict[str, Any] = {
                 "model": model or current_answer_model(),
                 "messages": messages,
@@ -1023,10 +1055,10 @@ class OllamaClient:
                     if not choices or not isinstance(choices[0], dict):
                         continue
                     delta = choices[0].get("delta") or {}
-                    reasoning = str(delta.get("reasoning_content", "") or delta.get("reasoning", ""))
+                    reasoning = str(delta.get("reasoning_content") or delta.get("reasoning") or "")
                     if reasoning and on_thinking is not None:
                         on_thinking(reasoning)
-                    chunk = str(delta.get("content", ""))
+                    chunk = str(delta.get("content") or "")
                     if chunk:
                         parts.append(chunk)
                         if on_delta is not None:
@@ -1055,10 +1087,10 @@ class OllamaClient:
                 except ValueError:
                     continue
                 message = data.get("message") or {}
-                thinking = str(message.get("thinking", ""))
+                thinking = str(message.get("thinking") or "")
                 if thinking and on_thinking is not None:
                     on_thinking(thinking)
-                chunk = str(message.get("content", ""))
+                chunk = str(message.get("content") or "")
                 if chunk:
                     parts.append(chunk)
                     if on_delta is not None:
@@ -1558,17 +1590,23 @@ class OllamaClient:
             plan_intent=effective_plan.intent,
         )
 
-    def _vision_request(self, image_b64: str, prompt: str | None, *, creative: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
-        """Build the (messages, options) for a vision call, or None if the image is empty."""
-        image_b64 = image_b64.strip()
-        if image_b64.startswith("data:image"):
-            image_b64 = image_b64.split(",", 1)[-1]
-        if not image_b64:
+    def _vision_request(self, image_b64, prompt: str | None, *, creative: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:  # noqa: ANN001
+        """Build the (messages, options) for a vision call. image_b64 may be a single
+        base64 string or a list of them (several attached images). None if none usable."""
+        raw_images = image_b64 if isinstance(image_b64, (list, tuple)) else [image_b64]
+        images: list[str] = []
+        for img in raw_images:
+            img = (img or "").strip()
+            if img.startswith("data:image"):
+                img = img.split(",", 1)[-1]
+            if img:
+                images.append(img)
+        if not images:
             return None
         user_prompt = (prompt or "").strip() or DEFAULT_VISION_USER_PROMPT
         messages = [
             {"role": "system", "content": VISION_SYSTEM_PROMPT + _answer_language_directive()},
-            {"role": "user", "content": user_prompt, "images": [image_b64]},
+            {"role": "user", "content": user_prompt, "images": images},
         ]
         options = {
             "num_ctx": _env_int("OLLAMA_VISION_NUM_CTX", DEFAULT_NUM_CTX),
@@ -1589,7 +1627,7 @@ class OllamaClient:
         if request is None:
             return "Could not read the image."
         messages, options = request
-        answer = self._chat(messages, options, timeout=300, model=current_vision_model())
+        answer = self._chat(messages, options, timeout=300, model=current_vision_model(), provider=current_vision_provider())
         return _strip_model_noise(answer) or "Не удалось распознать содержимое области."
 
     def analyze_image_stream(
@@ -1606,5 +1644,5 @@ class OllamaClient:
         if request is None:
             return "Could not read the image."
         messages, options = request
-        answer = self._chat_stream(messages, options, on_delta, timeout=timeout, model=current_vision_model())
+        answer = self._chat_stream(messages, options, on_delta, timeout=timeout, model=current_vision_model(), provider=current_vision_provider())
         return _strip_model_noise(answer) or "Не удалось распознать содержимое области."

@@ -293,7 +293,7 @@ class ChatMessageBrowser(QTextBrowser):
 class AssistantRow(QWidget):
     """Assistant message: 'РђСЃСЃРёСЃС‚РµРЅС‚' label + content (thinking dots or rich text) + copy."""
 
-    def __init__(self, index: int, on_anchor, on_copy, model_name: str = "", on_regenerate=None) -> None:  # noqa: ANN001
+    def __init__(self, index: int, on_anchor, on_copy, model_name: str = "", on_regenerate=None, on_reasoning=None, has_reasoning: bool = False, reasoning_shown: bool = False) -> None:  # noqa: ANN001
         super().__init__()
         self.index = index
         self._on_anchor = on_anchor
@@ -334,6 +334,10 @@ class AssistantRow(QWidget):
         if on_regenerate is not None:
             self._regen = _flat_icon_button("regen", "Переписать / другой вариант", lambda: on_regenerate(self.index))
             actions.addWidget(self._regen)
+        if has_reasoning and on_reasoning is not None:
+            _tip = "Скрыть размышления" if reasoning_shown else "Показать размышления"
+            self._reasoning = _flat_icon_button("deepthink", _tip, lambda: on_reasoning(self.index))
+            actions.addWidget(self._reasoning)
         actions.addStretch(1)
         self._actions_holder = QWidget()
         self._actions_holder.setLayout(actions)

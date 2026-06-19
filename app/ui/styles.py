@@ -128,6 +128,50 @@ QWidget#railNav {{
     background: transparent;
 }}
 
+QMenu#toolsMenu {{
+    background: {ELEVATED};
+    border: 1px solid rgba(154, 214, 189, 0.18);
+    border-radius: {_px(10, scale)}px;
+    padding: {_px(5, scale)}px;
+    color: {TEXT};
+}}
+QMenu#toolsMenu::item {{
+    padding: {_px(7, scale)}px {_px(26, scale)}px {_px(7, scale)}px {_px(10, scale)}px;
+    border-radius: {_px(7, scale)}px;
+    font-size: {_px(13, scale)}px;
+}}
+QMenu#toolsMenu::item:selected {{ background: rgba(154, 214, 189, 0.14); }}
+QMenu#toolsMenu::item:checked {{ color: {ACCENT}; font-weight: 600; }}
+
+QWidget#composerTools {{ background: transparent; }}
+QPushButton#composerToolPill {{
+    color: #9fb0bd;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(154, 214, 189, 0.16);
+    border-radius: {_px(13, scale)}px;
+    padding: {_px(4, scale)}px {_px(11, scale)}px;
+    font-size: {_px(12, scale)}px;
+    font-weight: 600;
+}}
+QPushButton#composerToolPill:hover {{
+    background: rgba(154, 214, 189, 0.10);
+    color: #d3e7dd;
+}}
+QPushButton#composerToolPill:checked {{
+    color: #0c1f18;
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+QPushButton#composerToolPill:checked:hover {{ background: #abe2cb; }}
+
+QLabel#agentCwdLabel {{ color: #8fa2b0; font-size: {_px(11, scale)}px; }}
+QPushButton#agentCwdButton {{
+    color: #9ad6bd; background: transparent;
+    border: 1px solid rgba(154, 214, 189, 0.20); border-radius: {_px(8, scale)}px;
+    padding: {_px(2, scale)}px {_px(9, scale)}px; font-size: {_px(11, scale)}px;
+}}
+QPushButton#agentCwdButton:hover {{ background: rgba(154, 214, 189, 0.10); }}
+
 QFrame#agentConfirmBar {{
     background: rgba(232, 137, 107, 0.07);
     border: 1px solid rgba(232, 137, 107, 0.28);
@@ -150,6 +194,19 @@ QPushButton#agentDenyButton {{
     border-radius: {_px(10, scale)}px; padding: {_px(6, scale)}px {_px(14, scale)}px;
 }}
 QPushButton#agentDenyButton:hover {{ background: rgba(255, 255, 255, 0.04); }}
+
+QTextBrowser#canvasPreview {{
+    background: #ffffff;
+    color: #14171d;
+    border: 1px solid rgba(154, 214, 189, 0.18);
+    border-radius: {_px(8, scale)}px;
+}}
+QPushButton#canvasPreviewBtn {{
+    color: #9fb0bd; background: transparent;
+    border: 1px solid rgba(154, 214, 189, 0.18); border-radius: {_px(7, scale)}px;
+    padding: {_px(3, scale)}px {_px(10, scale)}px; font-size: {_px(11, scale)}px;
+}}
+QPushButton#canvasPreviewBtn:checked {{ color: #0c1f18; background: {ACCENT}; border: 1px solid {ACCENT}; }}
 
 QFrame#canvasPanel {{
     background: {RAIL};
