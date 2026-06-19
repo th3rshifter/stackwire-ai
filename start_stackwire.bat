@@ -319,7 +319,7 @@ set "all_proxy="
 exit /b 0
 
 :resolve_models
-for /f "tokens=1,* delims==" %%A in ('"%VENV_PYTHON%" -c "from app.llm import MODEL, VISION_MODEL; from app.question_recovery import DEFAULT_MODEL; print('ANSWER_MODEL_RESOLVED=' + MODEL); print('RECOVERY_MODEL_RESOLVED=' + DEFAULT_MODEL); print('VISION_MODEL_RESOLVED=' + VISION_MODEL)"') do (
+for /f "tokens=1,* delims==" %%A in ('"%VENV_PYTHON%" -c "from app.llm import current_answer_model, current_vision_model; from app.question_recovery import current_recovery_model; print('ANSWER_MODEL_RESOLVED=' + current_answer_model()); print('RECOVERY_MODEL_RESOLVED=' + current_recovery_model()); print('VISION_MODEL_RESOLVED=' + current_vision_model())"') do (
   set "%%A=%%B"
 )
 if "%ANSWER_MODEL%"=="" set "ANSWER_MODEL=%ANSWER_MODEL_RESOLVED%"
@@ -373,9 +373,8 @@ if errorlevel 1 (
   echo %REQUIRED_MODEL% is not installed. Pulling model...
   ollama pull "%REQUIRED_MODEL%"
   if errorlevel 1 (
-    echo Failed to pull %REQUIRED_MODEL%.
-    pause
-    exit /b 1
+    echo WARNING: could not pull "%REQUIRED_MODEL%" from Ollama - skipping it.
+    echo   A remote API model via openai_compatible is expected to fail here - that is fine.
   )
 )
 exit /b 0

@@ -5926,8 +5926,15 @@ class OverlayWindow(QMainWindow):
         del CODE_BLOCK_KEYS[self._stream_prefix_snippets:]
         balanced = balance_streaming_markdown(self._stream_buffer)
         markup = markdown_to_html(balanced)
-        # Mint caret at the end of the answer while generating (skip inside a code fence).
-        if not balanced.rstrip().endswith("```"):
+        _has_answer = bool(self._stream_buffer.strip())
+        if not _has_answer and getattr(self, "_thinking_buffer", "").strip():
+            # Reasoner is thinking but no answer text yet — show a subtle "Думаю…"
+            # indicator (NOT the reasoning, which lives behind the lightbulb icon) so the
+            # row doesn't look stuck on a lone caret.
+            _ind = '''<div class="think-block"><span class="think-label">💭 Думаю…</span></div>'''
+            markup = markup.replace("</body>", _ind + "</body>", 1)
+        elif not balanced.rstrip().endswith("```"):
+            # Mint caret at the end of the answer while generating (skip inside a code fence).
             markup = _with_stream_caret(markup)
         self._stream_row.show_html(markup, final=False)
         if follow:
