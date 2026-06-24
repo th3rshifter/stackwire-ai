@@ -1,13 +1,17 @@
 import base64
 import binascii
+import json
 import logging
 import os
+import queue
+import threading
 import time
 from threading import Lock
 from typing import Any
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Depends, FastAPI, Header, HTTPException
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from requests import RequestException
 
@@ -18,7 +22,7 @@ load_local_env()
 
 from app import auth
 from app.answer_planner import build_answer_plan
-from app.llm import ANSWER_MODE, ANSWER_PROMPT_PROFILE, ARTIFACT_ANSWER_NUM_PREDICT, DEFAULT_ANSWER_NUM_PREDICT, EXPAND_ANSWER_NUM_PREDICT, OLLAMA_KEEP_ALIVE, OLLAMA_URL, OllamaClient, current_answer_model, current_vision_model
+from app.llm import ANSWER_MODE, ANSWER_PROMPT_PROFILE, ARTIFACT_ANSWER_NUM_PREDICT, AskResult, DEFAULT_ANSWER_NUM_PREDICT, EXPAND_ANSWER_NUM_PREDICT, OLLAMA_KEEP_ALIVE, OLLAMA_URL, OllamaClient, current_answer_model, current_vision_model
 from app.question_recovery import CONFIDENCE_THRESHOLD, RECOVERY_LOCAL_FAST_PATH, current_recovery_model
 from app.question_recovery import STACKWIRE_MODE
 from app.storage import init_db, log_feedback, save_good_answer
@@ -27,6 +31,7 @@ from app.transcript_repair import clean_stt_output, is_probable_stt_hallucinatio
 
 
 app = FastAPI(title=APP_NAME)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 LOGGER = logging.getLogger(__name__)
 client = OllamaClient()
 init_db()
@@ -391,10 +396,99 @@ def ask(question: Question, user: auth.AuthUser = Depends(require_user)):
             "answer_id": result.answer_id,
             "plan_domain": result.plan_domain,
             "plan_intent": result.plan_intent,
+            "answer_model": result.answer_model or current_answer_model(),
         }
         return JSONResponse(
             content=payload,
             media_type="application/json; charset=utf-8",
+        )
+    except RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_request_error_detail(exc),
+        ) from exc
+
+
+@app.post("/ask/stream")
+def ask_stream(question: Question, user: auth.AuthUser = Depends(require_user)):
+    try:
+        def generate():
+            chunk_queue: queue.Queue[str | None] = queue.Queue()
+            done_event = threading.Event()
+            result_holder: list[AskResult | None] = [None]
+
+            def on_recovery(text: str) -> None:
+                chunk_queue.put(json.dumps({'type': 'recovery', 'content': text}, ensure_ascii=False))
+
+            def on_delta(chunk: str) -> None:
+                # Stream the whole chunk token-by-token (json.dumps escapes newlines, so
+                # SSE framing stays valid). Splitting per line made the client render in
+                # jerky line-blocks instead of the smooth token flow the desktop shows.
+                chunk_queue.put(json.dumps({'type': 'delta', 'content': chunk}, ensure_ascii=False))
+
+            def on_thinking(chunk: str) -> None:
+                chunk_queue.put(json.dumps({'type': 'thinking', 'content': chunk}, ensure_ascii=False))
+
+            def worker() -> None:
+                try:
+                    result = client.ask_stream(
+                        question.text,
+                        question.context,
+                        trusted_text=question.trusted_text,
+                        on_recovery=on_recovery,
+                        on_delta=on_delta,
+                        on_thinking=on_thinking,
+                    )
+                    result_holder[0] = result
+                finally:
+                    chunk_queue.put(None)
+                    done_event.set()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+            on_recovery(question.text)
+
+            while True:
+                item = chunk_queue.get()
+                if item is None:
+                    break
+                yield f"data: {item}\n\n"
+
+            done_event.wait(timeout=30)
+            result = result_holder[0]
+            if result is not None:
+                yield f"data: {json.dumps({
+                    'type': 'done',
+                    'answered': result.answered,
+                    'raw_text': result.raw_text,
+                    'recovery': {
+                        'confidence': result.recovery.confidence,
+                        'recovered_question': result.recovery.recovered_question,
+                        'detected_topic': result.recovery.detected_topic,
+                        'technical_entities': result.recovery.technical_entities,
+                        'ambiguities': result.recovery.ambiguities,
+                        'needs_manual_fix': result.recovery.needs_manual_fix,
+                        'candidate_questions': result.recovery.candidate_questions,
+                        'candidate_quality': result.recovery.candidate_quality,
+                        'candidate_details': result.recovery.candidate_details,
+                        'reason': result.recovery.reason,
+                    },
+                    'recovery_latency': result.recovery_latency,
+                    'answer_latency': result.answer_latency,
+                    'total_latency': result.total_latency,
+                    'question_id': result.question_id,
+                    'answer_id': result.answer_id,
+                    'plan_domain': result.plan_domain,
+                    'plan_intent': result.plan_intent,
+                    'answer_model': result.answer_model or current_answer_model(),
+                }, ensure_ascii=False)}\n\n"""
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            # Defeat proxy/uvicorn response buffering so each token reaches the client
+            # immediately instead of arriving in one batch at the end.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
     except RequestException as exc:
         raise HTTPException(
@@ -416,6 +510,7 @@ def expand(request: ExpandRequest, user: auth.AuthUser = Depends(require_user)):
                 "answer_id": result.answer_id,
                 "plan_domain": result.plan_domain,
                 "plan_intent": result.plan_intent,
+                "answer_model": result.answer_model or current_answer_model(),
             },
             media_type="application/json; charset=utf-8",
         )

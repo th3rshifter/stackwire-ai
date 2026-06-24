@@ -49,6 +49,43 @@ def _remote_request_error(prefix: str, api_url: str, exc: RequestException) -> s
     return _remote_request_error_func(prefix, api_url, exc)
 
 
+def _parse_recovery_result(data: dict[str, Any], _as_float, _as_int) -> RecoveryResult:
+    recovery_payload = data.get("recovery") or {}
+    technical_entities = recovery_payload.get("technical_entities") or []
+    ambiguities = recovery_payload.get("ambiguities") or []
+    candidate_questions = recovery_payload.get("candidate_questions") or []
+    candidate_details = recovery_payload.get("candidate_details") or []
+    return RecoveryResult(
+        confidence=_as_float(recovery_payload.get("confidence"), 0.0),
+        recovered_question=str(recovery_payload.get("recovered_question", "")),
+        detected_topic=str(recovery_payload.get("detected_topic", "NEED_CLARIFICATION")),
+        reason=str(recovery_payload.get("reason", "")),
+        technical_entities=[str(item) for item in technical_entities if str(item).strip()],
+        ambiguities=[str(item) for item in ambiguities if str(item).strip()],
+        needs_manual_fix=bool(recovery_payload.get("needs_manual_fix", False)),
+        candidate_questions=[str(item) for item in candidate_questions if str(item).strip()],
+        candidate_quality=str(recovery_payload.get("candidate_quality", "unclear")),
+        candidate_details=[item for item in candidate_details if isinstance(item, dict)],
+    )
+
+
+def _build_ask_result(data: dict[str, Any], raw_text: str, recovery: RecoveryResult, _as_float, _as_int) -> AskResult:
+    return AskResult(
+        raw_text=str(data.get("raw_text", raw_text)),
+        recovery=recovery,
+        answer=str(data.get("answer", "")),
+        answered=bool(data.get("answered", False)),
+        recovery_latency=_as_float(data.get("recovery_latency"), 0.0),
+        answer_latency=_as_float(data.get("answer_latency"), 0.0),
+        total_latency=_as_float(data.get("total_latency"), 0.0),
+        question_id=_as_int(data.get("question_id")),
+        answer_id=_as_int(data.get("answer_id")),
+        plan_domain=str(data.get("plan_domain") or "") or None,
+        plan_intent=str(data.get("plan_intent") or "") or None,
+        answer_model=str(data.get("answer_model", "") or ""),
+    )
+
+
 class AskWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -92,36 +129,8 @@ class AskWorker(QObject):
         )
         self._raise_for_status(response, "/ask")
         data = response.json()
-        recovery_payload = data.get("recovery") or {}
-        technical_entities = recovery_payload.get("technical_entities") or []
-        ambiguities = recovery_payload.get("ambiguities") or []
-        candidate_questions = recovery_payload.get("candidate_questions") or []
-        candidate_details = recovery_payload.get("candidate_details") or []
-        recovery = RecoveryResult(
-            confidence=self._as_float(recovery_payload.get("confidence"), 0.0),
-            recovered_question=str(recovery_payload.get("recovered_question", "")),
-            detected_topic=str(recovery_payload.get("detected_topic", "NEED_CLARIFICATION")),
-            reason=str(recovery_payload.get("reason", "")),
-            technical_entities=[str(item) for item in technical_entities if str(item).strip()],
-            ambiguities=[str(item) for item in ambiguities if str(item).strip()],
-            needs_manual_fix=bool(recovery_payload.get("needs_manual_fix", False)),
-            candidate_questions=[str(item) for item in candidate_questions if str(item).strip()],
-            candidate_quality=str(recovery_payload.get("candidate_quality", "unclear")),
-            candidate_details=[item for item in candidate_details if isinstance(item, dict)],
-        )
-        return AskResult(
-            raw_text=str(data.get("raw_text", self.raw_text)),
-            recovery=recovery,
-            answer=str(data.get("answer", "")),
-            answered=bool(data.get("answered", False)),
-            recovery_latency=self._as_float(data.get("recovery_latency"), 0.0),
-            answer_latency=self._as_float(data.get("answer_latency"), 0.0),
-            total_latency=self._as_float(data.get("total_latency"), 0.0),
-            question_id=self._as_int(data.get("question_id")),
-            answer_id=self._as_int(data.get("answer_id")),
-            plan_domain=str(data.get("plan_domain") or "") or None,
-            plan_intent=str(data.get("plan_intent") or "") or None,
-        )
+        recovery = _parse_recovery_result(data, self._as_float, self._as_int)
+        return _build_ask_result(data, self.raw_text, recovery, self._as_float, self._as_int)
 
     def _as_int(self, value: object) -> int | None:
         if value is None:
@@ -197,11 +206,7 @@ class AskStreamWorker(QObject):
     def run(self) -> None:
         try:
             if self.api_url:
-                remote = AskWorker(self.raw_text, self.context, trusted_text=self.trusted_text, storage_session_id=self.storage_session_id)
-                result = remote._ask_remote()
-                if result.answer:
-                    self._emit_delta(result.answer)
-                self.finished.emit(self.stream_generation, result)
+                self._ask_remote_stream()
                 return
             if self.client is None:
                 raise RuntimeError("Local Ollama client is not initialized")
@@ -216,6 +221,55 @@ class AskStreamWorker(QObject):
                 creative=self.creative,
             )
             self.finished.emit(self.stream_generation, result)
+        except RequestException as exc:
+            self.failed.emit(self.stream_generation, _remote_request_error("Processing request failed", self.api_url, exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self.stream_generation, str(exc))
+        finally:
+            self.done.emit()
+
+    def _ask_remote_stream(self) -> None:
+        """Read SSE from the server's /ask/stream endpoint, emitting deltas live."""
+        import json as _json
+
+        payload = _json.dumps(
+            {"text": self.raw_text, "context": self.context, "trusted_text": self.trusted_text},
+            ensure_ascii=False,
+        )
+        try:
+            with self.session.post(
+                f"{self.api_url}/ask/stream",
+                data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8", **_auth_headers()},
+                timeout=(STACKWIRE_API_CONNECT_TIMEOUT, STACKWIRE_API_TIMEOUT),
+                stream=True,
+            ) as response:
+                self._raise_for_status(response, "/ask/stream")
+                result_data: dict[str, Any] = {}
+                for line in response.iter_lines(decode_unicode=True):
+                    if QThread.currentThread().isInterruptionRequested():
+                        break
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        msg = _json.loads(line[6:])
+                    except _json.JSONDecodeError:
+                        continue
+                    msg_type = msg.get("type", "")
+                    if msg_type == "delta":
+                        self._emit_delta(str(msg.get("content", "")))
+                    elif msg_type == "thinking":
+                        self.thinking.emit(self.stream_generation, str(msg.get("content", "")))
+                    elif msg_type == "recovery":
+                        self.recovered.emit(str(msg.get("content", "")))
+                    elif msg_type == "done":
+                        result_data = msg
+                if result_data:
+                    recovery = _parse_recovery_result(result_data, self._as_float, self._as_int)
+                    result = _build_ask_result(result_data, self.raw_text, recovery, self._as_float, self._as_int)
+                    self.finished.emit(self.stream_generation, result)
+                else:
+                    self.failed.emit(self.stream_generation, "Server returned no response")
         except RequestException as exc:
             self.failed.emit(self.stream_generation, _remote_request_error("Processing request failed", self.api_url, exc))
         except Exception as exc:  # noqa: BLE001
@@ -277,6 +331,7 @@ class ExpandWorker(QObject):
             answer_id=self._as_int(data.get("answer_id")),
             plan_domain=str(data.get("plan_domain") or "") or None,
             plan_intent=str(data.get("plan_intent") or "") or None,
+            answer_model=str(data.get("answer_model", "") or ""),
         )
 
     def _as_int(self, value: object) -> int | None:

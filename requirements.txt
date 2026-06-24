@@ -34,8 +34,8 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.7.0
 uvicorn==0.46.0
+ruff==0.6.0
 vosk==0.3.45
-# document attachment parsing (PDF / Word / Excel)
 pypdf
 python-docx
 openpyxl

@@ -14,6 +14,12 @@ test:
 check:
 	$(PYTHON) -m compileall app tests
 
+lint:
+	$(PYTHON) -m ruff check app tests
+
+format:
+	$(PYTHON) -m ruff format app tests
+
 desktop:
 	$(PYTHON) -m app.desktop
 

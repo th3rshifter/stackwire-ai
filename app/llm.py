@@ -201,7 +201,16 @@ def _answer_system_prompt() -> str:
     # The base prompt is language-neutral; one clean line up front sets the language.
     lang = os.getenv("STACKWIRE_ANSWER_LANGUAGE", "ru").strip().lower()
     language = "Reply ONLY in English." if lang == "en" else "Reply in Russian."
-    return f"{language}\n\n{ANSWER_SYSTEM_PROMPT}"
+    # Optional user "custom instructions" (style/tone/role) — appended so they steer the
+    # response without overriding accuracy/safety. Empty by default.
+    custom = os.getenv("STACKWIRE_CUSTOM_INSTRUCTIONS", "").strip()
+    custom_block = (
+        "\n\nUser's custom instructions (follow them as long as they don't conflict with "
+        f"accuracy or safety):\n{custom}"
+        if custom
+        else ""
+    )
+    return f"{language}\n\n{ANSWER_SYSTEM_PROMPT}{custom_block}"
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,7 @@ class AskResult:
     answer_id: int | None = None
     plan_domain: str | None = None
     plan_intent: str | None = None
+    answer_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -230,6 +240,7 @@ class ExpandResult:
     answer_id: int | None = None
     plan_domain: str | None = None
     plan_intent: str | None = None
+    answer_model: str = ""
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1300,6 +1311,7 @@ class OllamaClient:
             answer_id=answer_id,
             plan_domain=plan.domain,
             plan_intent=plan.intent,
+            answer_model=current_answer_model(),
         )
 
     def expand_answer(self, question: str, previous_answer: str, mode: str) -> str:
@@ -1399,6 +1411,7 @@ class OllamaClient:
                 answer_id=answer_id,
                 plan_domain=plan.domain if plan else None,
                 plan_intent=plan.intent if plan else None,
+                answer_model=current_answer_model(),
             )
 
         recovery_started = time.perf_counter()
@@ -1418,6 +1431,7 @@ class OllamaClient:
                 recovery_latency=recovery_latency,
                 answer_latency=0.0,
                 total_latency=time.perf_counter() - pipeline_started,
+                answer_model=current_answer_model(),
             )
         if recovery.confidence < CONFIDENCE_THRESHOLD:
             LOGGER.info(
@@ -1466,6 +1480,7 @@ class OllamaClient:
             answer_id=answer_id,
             plan_domain=plan.domain if plan else None,
             plan_intent=plan.intent if plan else None,
+            answer_model=current_answer_model(),
         )
 
     def ask_stream(
@@ -1515,6 +1530,7 @@ class OllamaClient:
                     recovery_latency=recovery_latency,
                     answer_latency=0.0,
                     total_latency=time.perf_counter() - pipeline_started,
+                    answer_model=current_answer_model(),
                 )
             if recovery.confidence < CONFIDENCE_THRESHOLD:
                 LOGGER.info(
@@ -1535,6 +1551,7 @@ class OllamaClient:
                 recovery_latency=recovery_latency,
                 answer_latency=0.0,
                 total_latency=time.perf_counter() - pipeline_started,
+                answer_model=current_answer_model(),
             )
 
         if on_recovery is not None:
@@ -1588,6 +1605,7 @@ class OllamaClient:
             answer_id=answer_id,
             plan_domain=effective_plan.domain,
             plan_intent=effective_plan.intent,
+            answer_model=current_answer_model(),
         )
 
     def _vision_request(self, image_b64, prompt: str | None, *, creative: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:  # noqa: ANN001

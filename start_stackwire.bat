@@ -319,7 +319,7 @@ set "all_proxy="
 exit /b 0
 
 :resolve_models
-for /f "tokens=1,* delims==" %%A in ('"%VENV_PYTHON%" -c "from app.llm import current_answer_model, current_vision_model; from app.question_recovery import current_recovery_model; print('ANSWER_MODEL_RESOLVED=' + current_answer_model()); print('RECOVERY_MODEL_RESOLVED=' + current_recovery_model()); print('VISION_MODEL_RESOLVED=' + current_vision_model())"') do (
+for /f "tokens=1,* delims==" %%A in ('"%VENV_PYTHON%" -c "from app.config import load_local_env; load_local_env(); from app.llm import current_answer_model, current_vision_model; from app.question_recovery import current_recovery_model; print('ANSWER_MODEL_RESOLVED=' + current_answer_model()); print('RECOVERY_MODEL_RESOLVED=' + current_recovery_model()); print('VISION_MODEL_RESOLVED=' + current_vision_model())"') do (
   set "%%A=%%B"
 )
 if "%ANSWER_MODEL%"=="" set "ANSWER_MODEL=%ANSWER_MODEL_RESOLVED%"
@@ -356,6 +356,10 @@ exit /b 0
 
 :wait_for_ollama
 echo.
+if /i "%STACKWIRE_LLM_PROVIDER%"=="openai_compatible" (
+  echo Provider is openai_compatible - remote API. Skipping local Ollama.
+  exit /b 0
+)
 echo Checking Ollama on 127.0.0.1:11434...
 curl.exe --noproxy "*" -s http://127.0.0.1:11434/api/tags >nul
 if errorlevel 1 (
@@ -366,6 +370,7 @@ if errorlevel 1 (
 exit /b 0
 
 :ensure_ollama_model
+if /i "%STACKWIRE_LLM_PROVIDER%"=="openai_compatible" exit /b 0
 set "REQUIRED_MODEL=%~1"
 if "%REQUIRED_MODEL%"=="" exit /b 0
 ollama list | findstr /i /l /c:"%REQUIRED_MODEL%" >nul

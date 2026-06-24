@@ -2578,6 +2578,16 @@ class SettingsDialog(QDialog):
         self.view_hidden.setChecked(os.getenv("STACKWIRE_HIDE_FROM_CAPTURE", "0").strip().lower() in {"1", "true", "yes", "on"})
         form.addRow("", self.view_hidden)
 
+        # Custom instructions: how the assistant should respond (style/tone/role), like
+        # ChatGPT/Claude. Appended to the answer system prompt where the answer is
+        # generated (this machine, or the server in client mode).
+        self.view_custom_instructions = QPlainTextEdit()
+        self.view_custom_instructions.setObjectName("settingsCombo")
+        self.view_custom_instructions.setPlaceholderText("Как отвечать: стиль, тон, роль. Напр.: коротко, по делу, с примерами кода.")
+        self.view_custom_instructions.setPlainText(os.getenv("STACKWIRE_CUSTOM_INSTRUCTIONS", "").strip())
+        self.view_custom_instructions.setFixedHeight(_px(72))
+        form.addRow("Инструкции", self.view_custom_instructions)
+
         hint = QLabel(
             "Optionally."
         )
@@ -2611,6 +2621,7 @@ class SettingsDialog(QDialog):
             "STACKWIRE_UI_LANGUAGE": "en" if self.view_language.currentText() == "English" else "ru",
             "STACKWIRE_HIDE_FROM_CAPTURE": "1" if self.view_hidden.isChecked() else "0",
             "STACKWIRE_HIDE_TASKBAR": "1" if self.view_hidden.isChecked() else "0",
+            "STACKWIRE_CUSTOM_INSTRUCTIONS": self.view_custom_instructions.toPlainText().strip(),
         }
 
 
@@ -3076,6 +3087,7 @@ class OverlayWindow(QMainWindow):
         self._generating = False          # True while LLM is producing tokens
         self._message_thinking: dict[int, str] = {}   # finalized reasoning per assistant index
         self._think_open: set[int] = set()            # which reasoning blocks are expanded
+        self._message_model: dict[int, str] = {}      # server/answer model per assistant index (remote badge)
         self.setAcceptDrops(True)            # drag & drop files / images onto the window
         self.typing_timer = QTimer(self)
         self.typing_timer.setInterval(60)
@@ -3285,6 +3297,11 @@ class OverlayWindow(QMainWindow):
             self.apply_icons()
 
     def _warm_vector_store(self) -> None:
+        # Client/remote mode: RAG runs on the server, so don't load the local embedding
+        # model (~120MB ONNX) or index anything here — keeps a thin client (e.g. a laptop)
+        # light instead of stalling on startup work it never uses.
+        if STACKWIRE_API_URL:
+            return
         try:
             from app import vectorstore
 
@@ -6170,6 +6187,7 @@ class OverlayWindow(QMainWindow):
                 self.last_answer_id = None
                 self.last_answer_domain = None
                 self.last_answer_intent = None
+                self.last_answer_model = ""
             else:
                 self.last_answer_question = recovered_question or result.raw_text
                 self.last_answer_text = cleaned
@@ -6177,6 +6195,11 @@ class OverlayWindow(QMainWindow):
                 self.last_answer_id = result.answer_id
                 self.last_answer_domain = result.plan_domain
                 self.last_answer_intent = result.plan_intent
+                self.last_answer_model = result.answer_model or ""
+                if self.last_answer_model:
+                    _midx = self._last_assistant_index()
+                    if _midx >= 0:
+                        self._message_model[_midx] = self.last_answer_model
         else:
             cleaned = str(result).strip()
             if not cleaned:
@@ -6450,6 +6473,7 @@ class OverlayWindow(QMainWindow):
         self.last_answer_id = None
         self.last_answer_domain = None
         self.last_answer_intent = None
+        self.last_answer_model = ""
         self.input.setPlainText(text)
         self.input.moveCursor(QTextCursor.MoveOperation.End)
         self.input.setFocus()
@@ -6576,6 +6600,7 @@ class OverlayWindow(QMainWindow):
         self.last_answer_id = None
         self.last_answer_domain = None
         self.last_answer_intent = None
+        self.last_answer_model = ""
         self.question_count = 0
         self.render_chat()
         self.update_answer_actions()
@@ -6728,7 +6753,10 @@ class OverlayWindow(QMainWindow):
             self.chat_area.add_row(row)
         else:
             previous_content = self.chat_messages[index - 1][1] if index > 0 and self.chat_messages[index - 1][0] == "user" else ""
-            model_name = current_vision_model() if "[[screenshot:" in previous_content else current_answer_model()
+            # Stored server/answer model (remote mode), else the local fallback.
+            model_name = self._message_model.get(index) or (
+                current_vision_model() if "[[screenshot:" in previous_content else current_answer_model()
+            )
             row = AssistantRow(
                 index, self.on_anchor_clicked, self.copy_message, model_name,
                 on_regenerate=self.regenerate_message,
@@ -6747,6 +6775,9 @@ class OverlayWindow(QMainWindow):
         self._message_rows[index] = row
 
     def render_chat(self, focus_latest_assistant: bool = False, animate_from: int = -1) -> None:
+        # Defensive: keep chat_messages uniform 2-tuples (role, content). A stale 3-tuple
+        # from an older build would crash the (role, content) unpack loops below.
+        self.chat_messages = [m if len(m) == 2 else (m[0], m[1]) for m in self.chat_messages]
         CODE_SNIPPETS.clear()
         CODE_BLOCK_KEYS.clear()
         _GENERATED_IMAGES.clear()
